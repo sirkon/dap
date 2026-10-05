@@ -99,12 +99,12 @@ pub const HelpHighlight = struct {
 
     const color = HelpHighlight{
         .usage = .{
-            .app_name = "\x1b[1m",
+            .app_name = "\x1b[36m\x1b[1m",
             .required_flags = .{
                 .name = "\x1b[36m\x1b[1m",
                 .value = "\x1b[36m",
             },
-            .optionals = "\x1b[36m",
+            .optionals = "\x1b[36m\x1b[3m",
             .arguments = "\x1b[36m",
         },
         .groups = "\x1b[32m\x1b[1m",
