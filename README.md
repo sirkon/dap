@@ -2,21 +2,28 @@
 
 Declarative command-line parser for Zig (0.16.0).
 
-Describe your program's options and arguments with a struct-based DSL;
-`dap.generate` builds both a value representation and a parser from that
+Describe your program's flags and arguments with a struct-based DSL;
+`dap.generate` builds both a parser and a strongly-typed view from that
 declaration.
 
 ```zig
 const dap = @import("dap");
 
 const def = .{
-    .login = dap.Option([]const u8){
+    .login = dap.Flag([]const u8){
         .short = "l",
         .default = dap.Default(dap.String){ .env = "USER" },
         .validation = dap.Validate.stringNotEmpty,
         .help = "User login.",
     },
-    .verbosity = dap.Option(u8){
+    .password = dap.Flag([]const u8){
+        .short = "p",
+        .help = "User password.",
+        .default = .{
+            .env = "API_PASSWORD",
+        },
+    },
+    .verbosity = dap.Flag(u8){
         .short = "V",
         .validation = dap.Validate.intNotZero(u8),
         .help = "Verbosity level.",
@@ -45,19 +52,49 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   name already removed (`os.argv[1..]`).
 - **Verbatim names.** Field names are wire names verbatim (`dry_run` ->
   `--dry_run`). A dash-spelled name requires an explicit `.long`.
-- **Derived `required`.** An option or argument is required iff it has no
-  default. This is uniform, `bool` included: a required flag must be passed
-  (as `--flag`, `--flag=true` or `--flag=false`).
+- **Derived `required`.** A flag or argument is required iff it has no
+  default. Boolean flags are the exception: they are always optional (an
+  omitted bool flag is `false`), a `true` default is a compile error (use a
+  negative `.long` name defaulting to `false`), and an optional bool renders
+  bracketed (`[--flag]`) in the usage header.
 - **Defaults.** Env defaults (`Default(T){ .env = "NAME" }`) take precedence
   over direct defaults (`Default(T){ .direct = v }`). A default is allowed
   only on the last declared argument.
+- **Optional flags.** Wrap a flag in `dap.Optional(...)` (or write
+  `@as(?Flag(T), Flag(T){...})`) and the View field becomes `?T`, `null` when
+  the flag is absent. Optional flags must not declare defaults and their
+  validation skips a `null` value.
 - **Subcommand handoff.** A positional token equal to a registered command name
   terminates the current parse and calls that subcommand's `parse` with the
   payload after the command token. The result is a `?Union` the caller switches
   over manually; `--` disables handoff so command-like literals can be passed.
-- **Ownership.** Strings stored in `Values` are allocated with the parser's
+- **Exclusive groups.** An `Alt` field declares branches of mutually exclusive
+  flags. A branch activates when any of its members is seen; only flags are
+  allowed inside branches and defaults are forbidden. The generated field is a
+  `?Union` (`null` when no branch was seen); passing flags from two branches of
+  the same `Alt` is a `ConflictingAlt` parse error. Each branch becomes a help
+  group named after its field or its `VariantNamed` override.
+- **Ownership.** Strings stored in the `View` are allocated with the parser's
   allocator; an arena is the intended lifetime. `Diag.deinit` frees only the
   diagnostic `message`.
+
+## Optional flags
+
+An optional flag is a flag declared with an optional type. Both spellings
+store a genuine `?Flag(T)` in the declaration:
+
+```zig
+const def = .{
+    .jobs = dap.Optional(dap.Flag(u32){ .short = "j" }),
+    .label = @as(?dap.Flag([]const u8), dap.Flag([]const u8){ .long = "label" }),
+};
+```
+
+The generated field is `?T` and is `null` when the flag is absent from
+`argv`; a present value decodes and validates as usual, while `null` skips
+validation. Optional flags must not declare a default, optional
+`Argument`s are rejected, and optional flags are not allowed inside `Alt`
+branches.
 
 ## Custom value types
 
@@ -100,14 +137,31 @@ Group
   -v, --value=1    Value of items.
 ```
 
-Short and long option names occupy their own aligned columns; the value
+Short and long flag names occupy their own aligned columns; the value
 placeholder is `=DEFAULT` for defaults and `=NAME` (upper-cased) otherwise.
-Option groups are ordered by name with the ungrouped bucket first.
+Flag groups are ordered by name with the ungrouped bucket first.
+
+Alternative (`Alt`) flags are not listed individually in the usage line.
+Instead each `Alt` contributes one parenthesized alternation clause, one
+branch per `VariantNamed` tag (or field name), with the branch's member flags
+joined by spaces and the branches separated by `|`:
+
+```text
+Usage: dap-example (--file=FILE | --url=URL) <string> [flags]
+```
+
+`HelpData` exposes this structure directly as `usage_alts`, a slice of
+`HelpData.Usage` (one per `Alt`), each holding its branches as slices of
+`HelpData.Flag` referencing the entries also present in `flag_groups`.
 
 Highlighting follows `App.help_renderer.highlight` (`HelpRendererHighlight`):
 `flat` emits plain text, `bold` (the default) and `color` apply the matching
-ready `HelpHighlight` profiles, and `custom` carries a user scheme. Column
-widths are measured on the raw text, so the codes never disturb alignment.
+ready `HelpHighlight` profiles, and `custom` carries a user scheme. The scheme
+is nested: a usage header block (app name, required flag name/value, optional
+tokens, arguments) plus `groups`, `args` and `flags` (name/value) tokens for
+the sections. Brackets stay inside their highlight blocks and the flag list
+wraps each short/long name separately. Column widths are measured on the raw
+text, so the codes never disturb alignment.
 
 ## Building and testing
 

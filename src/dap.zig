@@ -1,8 +1,10 @@
 //! Declarative command-line parser.
 //!
-//! You describe your program's options and arguments through a struct-based
-//! DSL; `generate` produces both a value representation (`Values`) and a
-//! parser (`parse`) from that declaration.
+//! You describe your program's flags and arguments through a struct-based
+//! DSL; `generate` produces a *parser* (`parse`) and a strongly-typed *view*
+//! (the generated `View` struct) from that declaration. The parser consumes
+//! the wire arguments; the view is the resulting data structure the program
+//! reads.
 //!
 //! Builtin value types are supported out of the box: `bool`, the integer types
 //! (`uXXX`, `iXXX`, `usize`, `isize`), the floats (`f16` ... `f128`, including
@@ -20,10 +22,11 @@ const std = @import("std");
 
 /// Kind of a declaration field.
 pub const Kind = enum {
-    option,
+    flag,
     argument,
     group,
     command,
+    alt,
 };
 
 /// Renderer style selection: `.compact` renders the builtin kong-style
@@ -57,30 +60,59 @@ pub const App = struct {
 
 // Help text highlighting definition and ready schemes.
 pub const HelpHighlight = struct {
-    app_name: []const u8 = "",
-    option_name: []const u8 = "",
-    arg_name: []const u8 = "",
-    group_name: []const u8 = "",
-    help_text: []const u8 = "",
+    pub const Flag = struct {
+        name: []const u8 = "",
+        value: []const u8 = "",
+    };
+
+    usage: struct {
+        app_name: []const u8 = "",
+        required_flags: HelpHighlight.Flag = .{},
+        optionals: []const u8 = "",
+        arguments: []const u8 = "",
+    } = .{},
+    groups: []const u8 = "",
+    args: []const u8 = "",
+    flags: HelpHighlight.Flag = .{},
     reset: []const u8 = "",
 
     const flat = HelpHighlight{};
 
     const bold = HelpHighlight{
-        .app_name = "\x1b[1m",
-        .option_name = "\x1b[1m",
-        .arg_name = "\x1b[1m",
-        .group_name = "\x1b[1m",
-        .help_text = "",
+        .usage = .{
+            .app_name = "\x1b[1m",
+            .required_flags = .{
+                .name = "\x1b[1m",
+                .value = "",
+            },
+            .optionals = "\x1b[3m",
+            .arguments = "\x1b[1m",
+        },
+        .groups = "\x1b[1m",
+        .args = "\x1b[1m",
+        .flags = .{
+            .name = "\x1b[1m",
+            .value = "\x1b[1m",
+        },
         .reset = "\x1b[0m",
     };
 
     const color = HelpHighlight{
-        .app_name = "\x1b[1m\x1b[32m",
-        .option_name = "\x1b[32m",
-        .arg_name = "\x1b[36m",
-        .group_name = "\x1b[1m\x1b[34m",
-        .help_text = "",
+        .usage = .{
+            .app_name = "\x1b[1m",
+            .required_flags = .{
+                .name = "\x1b[36m\x1b[1m",
+                .value = "\x1b[36m",
+            },
+            .optionals = "\x1b[36m",
+            .arguments = "\x1b[36m",
+        },
+        .groups = "\x1b[32m\x1b[1m",
+        .args = "\x1b[36m",
+        .flags = .{
+            .name = "\x1b[36m\x1b[1m",
+            .value = "\x1b[36m",
+        },
         .reset = "\x1b[0m",
     };
 
@@ -114,16 +146,21 @@ pub fn defaultValue(comptime T: type, vT: T) Default(T) {
     return .{ .direct = vT };
 }
 
-/// Declaration form for options.
-pub fn Option(comptime T: type) type {
+/// Declaration form for flags.
+/// Wrap the value in [`Optional`] to make the generated field optional.
+///
+/// Boolean flags are always optional: an omitted bool flag is `false` and a
+/// `true` direct default is a compile error. Use a negative long name
+/// defaulting to `false` (`--no-something`) to express "on by default".
+pub fn Flag(comptime T: type) type {
     return struct {
-        pub const dap_kind: Kind = .option;
+        pub const dap_kind: Kind = .flag;
         pub const dap_value_type = T;
 
-        /// Long option name. Optional. Can be derived from an anonymous field name.
+        /// Long flag name. Optional. Can be derived from an anonymous field name.
         long: ?String = null,
 
-        /// Short option name, optional (meh).
+        /// Short flag name, optional (meh).
         short: ?String = null,
 
         /// Default value, must be the value of the type above.
@@ -141,7 +178,23 @@ pub fn Option(comptime T: type) type {
     };
 }
 
-/// A purely declarative thing to group options and/or arguments together in the help output.
+/// Mark a flag declaration as optional: the generated `View` field is `?T`,
+/// `null` when the flag is absent from argv. Optional flags must not declare
+/// a default; a present value is validated as usual, a `null` value skips
+/// validation.
+///
+/// ```
+/// .flag = dap.Optional(dap.Flag(u32){ .short = "f", .help = "..." }),
+/// ```
+pub fn Optional(comptime flag: anytype) ?@TypeOf(flag) {
+    const T = @TypeOf(flag);
+    if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "dap_kind") or T.dap_kind != .flag) {
+        @compileError("dap.Optional expects a dap.Flag(...) value");
+    }
+    return flag;
+}
+
+/// A purely declarative thing to group flags and/or arguments together in the help output.
 /// Does not reflect into the placeholder.
 pub fn Group(comptime def: anytype, comptime name: String) type {
     return struct {
@@ -152,7 +205,7 @@ pub fn Group(comptime def: anytype, comptime name: String) type {
 }
 
 /// Declaration form for arguments.
-/// Unlike options, arguments are always required. This can be avoided with default values in case
+/// Unlike flags, arguments are always required. This can be avoided with default values in case
 /// of the single argument with a default value. There's a limitation: only the last argument can have
 /// a default value.
 pub fn Argument(comptime T: type) type {
@@ -339,7 +392,7 @@ pub fn Commands(comptime T: anytype) type {
 
         pub const sub_types = blk: {
             var ts: [cmd_names.len]type = undefined;
-            for (fields, 0..) |f, i| ts[i] = Sub(@field(T, f.name)).Values;
+            for (fields, 0..) |f, i| ts[i] = Sub(@field(T, f.name)).View;
             break :blk ts;
         };
 
@@ -376,7 +429,130 @@ pub fn Command(comptime meta: CommandMeta, comptime def: anytype) type {
     };
 }
 
-/// Ready to use validation helpers to plug into `Option`/`Argument` declarations.
+/// Declaration form for a single branch of a [`Alt`] that overrides the branch
+/// (tag) name. Mirrors `Command`: a type-level node carrying the override plus
+/// the raw branch declaration, an anonymous struct of flags.
+///
+/// ```
+/// .alt2 = dap.VariantNamed("fancy-alt2", .{
+///     .opt2 = dap.Flag([]const u8){},
+/// }),
+/// ```
+pub fn VariantNamed(comptime name: String, comptime branch: anytype) type {
+    return struct {
+        pub const dap_variant_name = name;
+        pub const dap_variant_def = branch;
+    };
+}
+
+/// Exclusive groups of parameters. The API:
+/// ```
+/// .alt = dap.Alt(.{
+///     .alt1 = .{
+///         .opt1 = dap.Flag(someType){...},
+///     },
+///     .alt2 = dap.VariantNamed("fancy-alt2", .{
+///         .opt2 = dap.Flag(someOtherType){...},
+///     }),
+/// }),
+/// ```
+/// Only flags are allowed inside branches; defaults are forbidden (a
+/// default implies implicit branch activation). Branches implicitly create
+/// help groups named after the field name or the `VariantNamed` string.
+///
+/// The generated `View` field is a `?Union` (the same shape used for
+/// `Commands`): it is `null` until a member of a branch is seen on the wire,
+/// after which it holds the activated branch's payload struct. Two branches of
+/// the same `Alt` cannot be active at once; doing so is a `ConflictingAlt`
+/// parse error. Consume it with `switch (cli.alt orelse return) { ... }`.
+pub fn Alt(comptime T: anytype) type {
+    const fields = @typeInfo(@TypeOf(T)).@"struct".fields;
+    if (fields.len == 0) {
+        @compileError("Alt must declare at least one branch");
+    }
+
+    const bnames: [fields.len]String = blk: {
+        var a: [fields.len]String = undefined;
+        for (fields, 0..) |f, i| a[i] = f.name;
+        break :blk a;
+    };
+
+    const tnames: [fields.len]String = blk: {
+        var a: [fields.len]String = undefined;
+        for (fields, 0..) |f, i| {
+            const Bv = @field(T, f.name);
+            if (@TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_name")) {
+                a[i] = Bv.dap_variant_name;
+            } else {
+                a[i] = f.name;
+            }
+        }
+        break :blk a;
+    };
+
+    for (tnames, 0..) |tn, i| {
+        for (tnames[0..i]) |pn| {
+            if (std.mem.eql(u8, tn, pn)) {
+                @compileError("duplicate Alt branch name '" ++ tn ++ "'");
+            }
+        }
+    }
+
+    const btypes: [fields.len]type = blk: {
+        var a: [fields.len]type = undefined;
+        for (fields, 0..) |f, i| {
+            const Bv = @field(T, f.name);
+            const Bdef = if (@TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_def"))
+                Bv.dap_variant_def
+            else
+                Bv;
+            if (@TypeOf(Bdef) == type) {
+                @compileError("Alt branch '" ++ f.name ++ "' must be a struct of flags or a VariantNamed");
+            }
+            if (@typeInfo(@TypeOf(Bdef)) != .@"struct") {
+                @compileError("Alt branch '" ++ f.name ++ "' must be a struct of flags or a VariantNamed");
+            }
+            const bf = @typeInfo(@TypeOf(Bdef)).@"struct".fields;
+            var nm: [bf.len]String = undefined;
+            var ts: [bf.len]type = undefined;
+            var at: [bf.len]std.builtin.Type.StructField.Attributes = undefined;
+            for (bf, 0..) |bfld, bi| {
+                nm[bi] = bfld.name;
+                const ft = if (@typeInfo(bfld.type) == .optional) @typeInfo(bfld.type).optional.child else bfld.type;
+                ts[bi] = ft.dap_value_type;
+                at[bi] = .{};
+            }
+            a[i] = @Struct(.auto, null, &nm, &ts, &at);
+        }
+        break :blk a;
+    };
+
+    const TagInt = std.math.IntFittingRange(0, tnames.len - 1);
+    const Tag = @Enum(TagInt, .exhaustive, &tnames, tg: {
+        var a: [tnames.len]TagInt = undefined;
+        for (0..tnames.len) |i| a[i] = @intCast(i);
+        const arr: [tnames.len]TagInt = a;
+        break :tg &arr;
+    });
+
+    const PayloadUnion = @Union(.auto, Tag, &tnames, &btypes, blk: {
+        var a: [tnames.len]std.builtin.Type.UnionField.Attributes = undefined;
+        for (0..tnames.len) |i| a[i] = .{};
+        const arr: [tnames.len]std.builtin.Type.UnionField.Attributes = a;
+        break :blk &arr;
+    });
+
+    return struct {
+        pub const dap_kind: Kind = .alt;
+        pub const alt_def = T;
+        pub const branch_names = bnames;
+        pub const tag_names = tnames;
+        pub const branch_types = btypes;
+        pub const Union = PayloadUnion;
+    };
+}
+
+/// Ready to use validation helpers to plug into `Flag`/`Argument` declarations.
 pub const Validate = struct {
     /// Ready to use helper checking if a string is not empty.
     pub fn stringNotEmpty(allocator: std.mem.Allocator, v: String) std.mem.Allocator.Error!?String {
@@ -419,14 +595,16 @@ pub const DecodeError = error{
 /// Errors reported by `parse`. Decode failures (`InvalidWire`/`InvalidValue`)
 /// are folded in, so a caller can handle both layers through one error set.
 pub const ParseError = error{
-    /// A long or short option token matched no declaration.
-    UnknownOption,
-    /// A non-bool option was given without a value.
+    /// A long or short flag token matched no declaration.
+    UnknownFlag,
+    /// A non-bool flag was given without a value.
     MissingValue,
-    /// A required option/argument was never provided.
+    /// A required flag/argument was never provided.
     MissingRequired,
     /// A positional token found every argument slot already filled.
     TooManyArguments,
+    /// Two branches of the same `Alt` were activated at once.
+    ConflictingAlt,
     /// An environment variable value was not valid WTF-8.
     InvalidWtf8,
 } || std.mem.Allocator.Error || DecodeError;
@@ -452,19 +630,30 @@ pub const Diag = struct {
 pub const HelpData = struct {
     const Self = @This();
 
-    /// A single option entry.
-    pub const Option = struct {
+    /// A single flag entry.
+    pub const Flag = struct {
         /// Long wire name, e.g. `dry_run` or an explicit `.long`.
         name: String,
         /// Short wire name, without the dash.
         short: ?String,
         /// Help string.
         help: String,
-        /// Rendered default value, `null` when the option is required.
+        /// Rendered default value, `null` when the flag is required.
         default: ?String,
-        /// Whether the option consumes a value (`<value>` in help); `false`
+        /// Whether the flag consumes a value (`<value>` in help); `false`
         /// for boolean flags.
         takes_value: bool,
+        /// When the flag belongs to an `Alt`, the declaration field name of
+        /// that `Alt`; `null` for ordinary flags. Usage rendering skips
+        /// these in favour of the `Alt`'s alternation clause.
+        alt: ?String = null,
+        /// When the flag belongs to an `Alt`, the tag name of its branch;
+        /// `null` for ordinary flags.
+        alt_branch: ?String = null,
+        /// Whether the flag was declared optional (`?Flag(T)` / `dap.Optional`).
+        /// Usage rendering omits optional flags; custom renderers can inspect
+        /// this to decorate them.
+        optional: bool = false,
     };
 
     /// A single positional argument entry.
@@ -477,10 +666,10 @@ pub const HelpData = struct {
         default: ?String,
     };
 
-    /// Options sharing a `Group` name, or the ungrouped options (`name == null`).
-    pub const OptionGroup = struct {
+    /// Flags sharing a `Group` name, or the ungrouped flags (`name == null`).
+    pub const FlagGroup = struct {
         name: ?String,
-        options: []Self.Option,
+        flags: []Self.Flag,
     };
 
     /// Arguments sharing a `Group` name, or the ungrouped arguments (`name == null`).
@@ -495,14 +684,25 @@ pub const HelpData = struct {
         help: String,
     };
 
+    /// An exclusive-parameter clause of the usage line: the branches of one
+    /// `Alt`, each a set of alternative flags. Rendered as a parenthesized
+    /// alternation `(-a | -b | ...)`. The inner flag slices reference entries
+    /// owned by `flag_groups`; only the outer arrays are released by
+    /// `deinit`.
+    pub const Usage = struct {
+        branches: [][]Self.Flag,
+    };
+
     /// `App.name`.
     name: String,
     /// `App.help`.
     info: String,
-    /// Option groups; ungrouped options first, then named groups in declaration order.
-    option_groups: []OptionGroup,
+    /// Flag groups; ungrouped flags first, then named groups in declaration order.
+    flag_groups: []FlagGroup,
     /// Argument groups; ungrouped arguments first, then named groups in declaration order.
     arg_groups: []ArgGroup,
+    /// Exclusive-parameter group clauses (one per `Alt`) for the usage line.
+    usage_alts: []Usage = &.{},
     /// Subcommands in declaration order.
     commands: []CommandInfo,
     /// Highlight scheme `renderCompact` applies. Filled from
@@ -514,17 +714,19 @@ pub const HelpData = struct {
         allocator.free(self.name);
         allocator.free(self.info);
 
-        for (self.option_groups) |g| {
+        for (self.flag_groups) |g| {
             if (g.name) |n| allocator.free(n);
-            for (g.options) |o| {
+            for (g.flags) |o| {
                 allocator.free(o.name);
                 if (o.short) |sh| allocator.free(sh);
                 allocator.free(o.help);
                 if (o.default) |dv| allocator.free(dv);
+                if (o.alt) |av| allocator.free(av);
+                if (o.alt_branch) |bv| allocator.free(bv);
             }
-            allocator.free(g.options);
+            allocator.free(g.flags);
         }
-        allocator.free(self.option_groups);
+        allocator.free(self.flag_groups);
 
         for (self.arg_groups) |g| {
             if (g.name) |n| allocator.free(n);
@@ -537,6 +739,12 @@ pub const HelpData = struct {
         }
         allocator.free(self.arg_groups);
 
+        for (self.usage_alts) |u| {
+            for (u.branches) |br| allocator.free(br);
+            allocator.free(u.branches);
+        }
+        allocator.free(self.usage_alts);
+
         for (self.commands) |c| {
             allocator.free(c.name);
             allocator.free(c.help);
@@ -546,16 +754,21 @@ pub const HelpData = struct {
 
     /// Render a compact, two-column help view of this description into a freshly
     /// allocated string, mirroring the layout of `kong`'s help renderer. The
-    /// option/argument specs occupy the left column (short and long names aligned
+    /// flag/argument specs occupy the left column (short and long names aligned
     /// into their own sub-columns) and the help text the right; groups are
     /// ordered by name with the ungrouped bucket first.
     ///
     /// Every fragment is wrapped in the scheme carried by `highlight` (resolved
-    /// from `App.help_renderer.highlight`): the app name, option names, argument
-    /// names, group headings and help text each get their own codes. Widths are
-    /// measured on the raw text before any codes are emitted, so highlighting
-    /// never disturbs the column alignment. The caller owns the returned string
-    /// and frees it with the same allocator.
+    /// from `App.help_renderer.highlight`): the usage header distinguishes the
+    /// app name, required flags (name and value), optional tokens and
+    /// arguments, while the grouped sections use the `groups`, `args` and
+    /// `flags` (name and value) tokens. Delimiters join their token: the
+    /// argument list wraps the whole `[<name>]`/`<name>` including brackets,
+    /// each flag name carries its own leading dashes and trailing `=`, and the
+    /// flag list keeps the `, ` separator uncolored. Widths are measured on the
+    /// raw text before any codes are emitted, so highlighting never disturbs
+    /// the column alignment. The caller owns the returned string and frees it
+    /// with the same allocator.
     pub fn renderCompact(self: *const HelpData, allocator: std.mem.Allocator) std.mem.Allocator.Error!String {
         const indent = "  ";
         const column_padding = 4;
@@ -571,7 +784,7 @@ pub const HelpData = struct {
         // The scheme is resolved once; every fragment is emitted through it.
         const hl = HelpHighlight.resolve(self.highlight);
 
-        // Order option and argument groups by name, the ungrouped bucket
+        // Order flag and argument groups by name, the ungrouped bucket
         // (`null`) first.
         const Order = struct {
             fn lessName(a: ?String, b: ?String) bool {
@@ -597,48 +810,85 @@ pub const HelpData = struct {
             }
         };
 
-        const opt_order = try Order.of(OptionGroup, arena, self.option_groups);
+        const flag_order = try Order.of(FlagGroup, arena, self.flag_groups);
         const arg_order = try Order.of(ArgGroup, arena, self.arg_groups);
 
-        // Usage line: required options, then positionals, then `[flags]`.
+        // Usage line: required flags, then bracketed optional bools, then
+        // positionals, then `[flags]`. Brackets stay inside their highlight
+        // block: the whole `[--flag]` token carries `.usage.optionals`, the
+        // whole `<arg>`/`[<arg>]` token carries `.usage.arguments`.
         try out.appendSlice(allocator, "Usage: ");
-        try appendHelpStyled(&out, allocator, hl, .app_name, self.name);
-        for (opt_order) |gi| {
-            for (self.option_groups[gi].options) |o| {
-                if (o.default != null) continue;
+        try appendHelpStyled(&out, allocator, hl, .usage_app_name, self.name);
+        for (flag_order) |gi| {
+            for (self.flag_groups[gi].flags) |o| {
+                // Boolean flags are always optional: with no default they
+                // implicitly default to `false` and render bracketed in the
+                // usage header, e.g. `[--flag]`.
+                const bool_flag = !o.takes_value and o.default == null;
+                if (o.default != null and !bool_flag) continue;
+                if (o.alt != null) continue;
+                if (o.optional) continue;
                 try out.append(allocator, ' ');
-                try out.appendSlice(allocator, "--");
-                try appendHelpStyled(&out, allocator, hl, .option_name, o.name);
+                if (bool_flag) {
+                    const token = try std.fmt.allocPrint(arena, "[--{s}]", .{o.name});
+                    try appendHelpStyled(&out, allocator, hl, .usage_optional, token);
+                    continue;
+                }
+                // The dashes and the assignment sign stay inside the name
+                // token so the whole `--flag=` run is highlighted continuously.
+                const name_token = if (o.takes_value)
+                    try std.fmt.allocPrint(arena, "--{s}=", .{o.name})
+                else
+                    try std.fmt.allocPrint(arena, "--{s}", .{o.name});
+                try appendHelpStyled(&out, allocator, hl, .usage_required_name, name_token);
                 if (o.takes_value) {
-                    try out.append(allocator, '=');
-                    try appendHelpStyled(&out, allocator, hl, .plain, try upperDup(arena, o.name));
+                    try appendHelpStyled(&out, allocator, hl, .usage_required_value, try upperDup(arena, o.name));
                 }
             }
+        }
+        // Exclusive-parameter groups: `(branch | branch | ...)`, each branch a
+        // space-separated set of its member flags. The parentheses are emitted
+        // as their own highlighted blocks so the brackets never sit outside the
+        // scheme codes.
+        for (self.usage_alts) |u| {
+            try out.append(allocator, ' ');
+            try appendHelpStyled(&out, allocator, hl, .usage_required_name, "(");
+            for (u.branches, 0..) |branch, bi| {
+                if (bi != 0) try appendHelpStyled(&out, allocator, hl, .usage_required_name, " | ");
+                for (branch, 0..) |o, oi| {
+                    if (oi != 0) try out.append(allocator, ' ');
+                    try appendFlagUsage(&out, allocator, arena, hl, o);
+                }
+            }
+            try appendHelpStyled(&out, allocator, hl, .usage_required_name, ")");
         }
         for (arg_order) |gi| {
             for (self.arg_groups[gi].args) |a| {
                 try out.append(allocator, ' ');
-                const open: []const u8 = if (a.default == null) "<" else "[<";
-                const close: []const u8 = if (a.default == null) ">" else ">]";
-                try out.appendSlice(allocator, open);
-                try appendHelpStyled(&out, allocator, hl, .arg_name, a.name);
-                try out.appendSlice(allocator, close);
+                const token = if (a.default == null)
+                    try std.fmt.allocPrint(arena, "<{s}>", .{a.name})
+                else
+                    try std.fmt.allocPrint(arena, "[<{s}>]", .{a.name});
+                try appendHelpStyled(&out, allocator, hl, .usage_argument, token);
             }
         }
-        var has_option = false;
-        var has_optional = false;
-        for (self.option_groups) |g| {
-            for (g.options) |o| {
-                has_option = true;
-                if (o.default != null) has_optional = true;
+        var has_flag = false;
+        var has_default = false;
+        for (self.flag_groups) |g| {
+            for (g.flags) |o| {
+                has_flag = true;
+                if (o.default != null) has_default = true;
             }
         }
-        if (has_option and has_optional) try out.appendSlice(allocator, " [flags]");
+        if (has_flag and has_default) {
+            try out.append(allocator, ' ');
+            try appendHelpStyled(&out, allocator, hl, .usage_optional, "[flags]");
+        }
         try out.append(allocator, '\n');
 
         if (self.info.len > 0) {
             try out.append(allocator, '\n');
-            try appendHelpStyled(&out, allocator, hl, .help_text, self.info);
+            try appendHelpStyled(&out, allocator, hl, .plain, self.info);
             try out.append(allocator, '\n');
         }
 
@@ -647,11 +897,11 @@ pub const HelpData = struct {
         // never leak into the column arithmetic.
         var arg_count: usize = 0;
         for (self.arg_groups) |g| arg_count += g.args.len;
-        var n_opt_sections: usize = 0;
-        for (self.option_groups) |g| {
-            if (g.options.len > 0) n_opt_sections += 1;
+        var n_flag_sections: usize = 0;
+        for (self.flag_groups) |g| {
+            if (g.flags.len > 0) n_flag_sections += 1;
         }
-        var section_count = n_opt_sections;
+        var section_count = n_flag_sections;
         if (arg_count > 0) section_count += 1;
         if (self.commands.len > 0) section_count += 1;
 
@@ -664,11 +914,11 @@ pub const HelpData = struct {
             for (arg_order) |gi| {
                 for (self.arg_groups[gi].args) |a| {
                     var left: std.ArrayList(HelpSegment) = .empty;
-                    const open: []const u8 = if (a.default == null) "<" else "[<";
-                    const close: []const u8 = if (a.default == null) ">" else ">]";
-                    try left.append(arena, .{ .text = open, .style = .plain });
-                    try left.append(arena, .{ .text = a.name, .style = .arg_name });
-                    try left.append(arena, .{ .text = close, .style = .plain });
+                    const token = if (a.default == null)
+                        try std.fmt.allocPrint(arena, "<{s}>", .{a.name})
+                    else
+                        try std.fmt.allocPrint(arena, "[<{s}>]", .{a.name});
+                    try left.append(arena, .{ .text = token, .style = .args });
                     rows[ri] = .{ .left = left.items, .help = a.help };
                     ri += 1;
                 }
@@ -677,34 +927,37 @@ pub const HelpData = struct {
             si += 1;
         }
 
-        for (opt_order) |gi| {
-            const group = self.option_groups[gi];
-            if (group.options.len == 0) continue;
+        for (flag_order) |gi| {
+            const group = self.flag_groups[gi];
+            if (group.flags.len == 0) continue;
             var have_short = false;
-            for (group.options) |o| {
+            for (group.flags) |o| {
                 if (o.short != null) {
                     have_short = true;
                     break;
                 }
             }
-            const rows = try arena.alloc(HelpRow, group.options.len);
-            for (group.options, 0..) |o, ri| {
+            const rows = try arena.alloc(HelpRow, group.flags.len);
+            for (group.flags, 0..) |o, ri| {
                 var left: std.ArrayList(HelpSegment) = .empty;
                 if (o.short) |sh| {
-                    try left.append(arena, .{ .text = "-", .style = .plain });
-                    try left.append(arena, .{ .text = sh, .style = .option_name });
+                    try left.append(arena, .{ .text = try std.fmt.allocPrint(arena, "-{s}", .{sh}), .style = .flags_name });
                     try left.append(arena, .{ .text = ", ", .style = .plain });
                 } else if (have_short) {
                     try left.append(arena, .{ .text = "    ", .style = .plain });
                 }
-                try left.append(arena, .{ .text = "--", .style = .plain });
-                try left.append(arena, .{ .text = o.name, .style = .option_name });
+                // The dashes and the assignment sign are part of the name
+                // token so the whole `--name=` run is colored continuously.
+                const long_token = if (o.takes_value)
+                    try std.fmt.allocPrint(arena, "--{s}=", .{o.name})
+                else
+                    try std.fmt.allocPrint(arena, "--{s}", .{o.name});
+                try left.append(arena, .{ .text = long_token, .style = .flags_name });
                 if (o.takes_value) {
-                    try left.append(arena, .{ .text = "=", .style = .plain });
                     if (o.default) |d| {
-                        try left.append(arena, .{ .text = d, .style = .plain });
+                        try left.append(arena, .{ .text = d, .style = .flags_value });
                     } else {
-                        try left.append(arena, .{ .text = try upperDup(arena, o.name), .style = .plain });
+                        try left.append(arena, .{ .text = try upperDup(arena, o.name), .style = .flags_value });
                     }
                 }
                 rows[ri] = .{ .left = left.items, .help = o.help };
@@ -717,7 +970,7 @@ pub const HelpData = struct {
             const rows = try arena.alloc(HelpRow, self.commands.len);
             for (self.commands, 0..) |c, ri| {
                 var left: std.ArrayList(HelpSegment) = .empty;
-                try left.append(arena, .{ .text = c.name, .style = .option_name });
+                try left.append(arena, .{ .text = c.name, .style = .flags_name });
                 rows[ri] = .{ .left = left.items, .help = c.help };
             }
             sections[si] = .{ .heading = "Commands:", .rows = rows };
@@ -726,7 +979,7 @@ pub const HelpData = struct {
 
         for (sections) |section| {
             try out.append(allocator, '\n');
-            try appendHelpStyled(&out, allocator, hl, .group_name, section.heading);
+            try appendHelpStyled(&out, allocator, hl, .groups, section.heading);
             try out.append(allocator, '\n');
             var left_size: usize = 0;
             for (section.rows) |r| {
@@ -741,14 +994,14 @@ pub const HelpData = struct {
                     if (r.help.len > 0) {
                         var pad = left_size - left_w + column_padding;
                         while (pad > 0) : (pad -= 1) try out.append(allocator, ' ');
-                        try appendHelpStyled(&out, allocator, hl, .help_text, r.help);
+                        try appendHelpStyled(&out, allocator, hl, .plain, r.help);
                     }
                 } else if (r.help.len > 0) {
                     try out.append(allocator, '\n');
                     try out.appendSlice(allocator, indent);
                     var pad = left_size + column_padding;
                     while (pad > 0) : (pad -= 1) try out.append(allocator, ' ');
-                    try appendHelpStyled(&out, allocator, hl, .help_text, r.help);
+                    try appendHelpStyled(&out, allocator, hl, .plain, r.help);
                 }
                 try out.append(allocator, '\n');
             }
@@ -759,7 +1012,18 @@ pub const HelpData = struct {
 };
 
 /// Highlight category a compact-help fragment belongs to.
-const HelpStyle = enum { plain, app_name, option_name, arg_name, group_name, help_text };
+const HelpStyle = enum {
+    plain,
+    usage_app_name,
+    usage_required_name,
+    usage_required_value,
+    usage_optional,
+    usage_argument,
+    groups,
+    args,
+    flags_name,
+    flags_value,
+};
 
 /// A run of compact-help text carrying a single highlight category.
 const HelpSegment = struct {
@@ -784,11 +1048,15 @@ const HelpSection = struct {
 fn helpStyleCode(hl: HelpHighlight, style: HelpStyle) []const u8 {
     return switch (style) {
         .plain => "",
-        .app_name => hl.app_name,
-        .option_name => hl.option_name,
-        .arg_name => hl.arg_name,
-        .group_name => hl.group_name,
-        .help_text => hl.help_text,
+        .usage_app_name => hl.usage.app_name,
+        .usage_required_name => hl.usage.required_flags.name,
+        .usage_required_value => hl.usage.required_flags.value,
+        .usage_optional => hl.usage.optionals,
+        .usage_argument => hl.usage.arguments,
+        .groups => hl.groups,
+        .args => hl.args,
+        .flags_name => hl.flags.name,
+        .flags_value => hl.flags.value,
     };
 }
 
@@ -830,21 +1098,45 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
     return buf;
 }
 
-/// Generate a parser for a declaration, together with the value type it
-/// produces. `generate` returns a namespace wrapper exposing:
+/// Append one flag's usage fragment, `--name` or `--name=VALUE`, to `out`
+/// with the name/value segments highlighted using the usage required-flag
+/// tokens. The dashes and the assignment sign are folded into the name token
+/// so the whole `--name=` run is colored continuously.
+fn appendFlagUsage(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    hl: HelpHighlight,
+    o: HelpData.Flag,
+) std.mem.Allocator.Error!void {
+    const name_token = if (o.takes_value)
+        try std.fmt.allocPrint(arena, "--{s}=", .{o.name})
+    else
+        try std.fmt.allocPrint(arena, "--{s}", .{o.name});
+    try appendHelpStyled(out, allocator, hl, .usage_required_name, name_token);
+    if (o.takes_value) {
+        try appendHelpStyled(out, allocator, hl, .usage_required_value, try upperDup(arena, o.name));
+    }
+}
+
+/// Generate the *parser* and the *view* type for a declaration. `generate`
+/// returns a namespace wrapper exposing:
 ///
-/// - `pub const Values` — a struct with one field per declaration field (in
-///   declaration order, with the injected `builtin_help: bool` first), plus a
-///   trailing optional tagged union when the declaration carries a `Commands`
-///   field;
-/// - `pub fn parse(allocator, environ, args, diag) ParseError!Values`;
+/// - `pub const View` — the strongly-typed view, a struct with one field per
+///   declaration field (in declaration order, with the injected
+///   `builtin_help: bool` first), plus a trailing optional tagged union when
+///   the declaration carries a `Commands` field;
+/// - `pub fn parse(allocator, environ, args, diag) ParseError!View`;
 /// - `app_meta`, `specs`, `commands` metadata;
 /// - `pub fn helpData(allocator) !HelpData` — runtime-filled description;
 /// - `pub fn helpText(allocator) !String` — render `helpData` with the
 ///   renderer configured in `app.help_renderer.style` (`.compact` by default,
 ///   or a user-provided function via `.custom`).
 ///
-/// A `-h, --help` option is injected at the very beginning of every
+/// An `Alt` declaration contributes one `?Union` field to `View` (before any
+/// trailing `Commands` field), `null` until one of its branch flags is seen.
+///
+/// A `-h, --help` flag is injected at the very beginning of every
 /// declaration. When `parse` sees it, it bypasses all required checks and
 /// validations, prints the rendered help text to stdout and exits with code
 /// `0`. Any syntax, decode, required or validation failure prints the
@@ -858,7 +1150,7 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
 ///
 /// ```
 /// const def = .{
-///     .login = dap.Option([]const u8){
+///     .login = dap.Flag([]const u8){
 ///         .short = "l",
 ///         .default = dap.Default(dap.String){
 ///             .env = "USER",
@@ -866,12 +1158,12 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
 ///         .validation = dap.Validate.stringNotEmpty,
 ///         .help = "User login.",
 ///     },
-///     .password = dap.Option([]const u8){
+///     .password = dap.Flag([]const u8){
 ///         .short = "p",
 ///         .validation = dap.Validate.stringNotEmpty,
 ///         .help = "Password for the given login.",
 ///     },
-///     .verbosity = dap.Option(u8){
+///     .verbosity = dap.Flag(u8){
 ///          .short = "V",
 ///          .validation = dap.Validate.intNotZero(u8),
 ///          .default = dap.defaultValue(u8)(0),
@@ -896,7 +1188,7 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
 /// defer diag.deinit(allocator);
 /// ```
 ///
-/// `Values` is a plain struct (`cli.login`, `cli.path`, ...) whose strings are
+/// `View` is a plain struct (`cli.login`, `cli.path`, ...) whose strings are
 /// allocated with the passed allocator. No name transformation is applied:
 /// field names are wire names verbatim (`dry_run` → `--dry_run`), and a
 /// dash-spelled name requires an explicit `.long`.
@@ -909,7 +1201,7 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
 ///
 /// ```
 /// const def = .{
-///     .verbose = dap.Option(bool){
+///     .verbose = dap.Flag(bool){
 ///         .default = dap.Default(bool){ .direct = false },
 ///     },
 ///     .command = dap.Commands(.{
@@ -928,6 +1220,55 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
 /// };
 /// ```
 ///
+/// An `Alt` field declares exclusive groups of parameters: a branch becomes
+/// active once any of its flags is seen on the wire, and only one branch of
+/// an `Alt` may be active. The generated field is a `?Union` (like
+/// `Commands`): `null` when no branch was seen, otherwise the active branch's
+/// payload struct. Each branch becomes a help group named after its field or
+/// its `VariantNamed` override:
+///
+/// ```
+/// const def = .{
+///     .mode = dap.Alt(.{
+///         .alt1 = .{
+///             .opt1 = dap.Flag(u32){},
+///         },
+///         .alt2 = dap.VariantNamed("fancy-alt2", .{
+///             .opt2 = dap.Flag([]const u8){},
+///         }),
+///     }),
+/// };
+///
+/// const CLI = dap.generate(dap.App{ .name = "m", .help = "Mode." }, def);
+/// var cli = try CLI.parse(allocator, environ, args, &diag);
+/// switch (cli.mode orelse return) {
+///     .alt1 => |p| try run(p.opt1),
+///     .@"fancy-alt2" => |p| try fancy(p.opt2),
+/// }
+/// ```
+///
+/// Only flags are allowed inside branches and defaults are forbidden (a
+/// default would imply implicit activation). Flag names, including short
+/// aliases, must be unique across all branches and against the parent
+/// declaration; a violation is a compile error. Passing flags from two
+/// branches of the same `Alt` is a `ConflictingAlt` parse error.
+///
+/// A flag wrapped in `Optional(...)` (or written as a raw optional value,
+/// `@as(?Flag(T), Flag(T){...})`) is *optional*: the generated field becomes
+/// `?T` and is `null` when the flag is absent from `argv`, instead of failing
+/// the required check. Optional flags must not declare a default (direct or
+/// env), and their validation is skipped for a `null` value:
+///
+/// ```
+/// const def = .{
+///     .jobs = dap.Optional(dap.Flag(u32){ .short = "j" }),
+/// };
+///
+/// const CLI = dap.generate(dap.App{ .name = "build", .help = "Build." }, def);
+/// var cli = try CLI.parse(allocator, environ, args, &diag);
+/// const jobs = cli.jobs orelse 1;
+/// ```
+///
 /// Custom value types are supported when they expose
 ///
 /// ```
@@ -941,10 +1282,10 @@ fn upperDup(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error
 /// Name of the builtin help flag injected into every declaration.
 const builtin_help_field = "builtin_help";
 
-/// The `-h, --help` option specification injected at the very beginning of
+/// The `-h, --help` flag specification injected at the very beginning of
 /// every declaration before normalization, so `helpData` naturally sees it
 /// via `inline for` and renders it in the flags section.
-const BuiltinHelp = Option(bool){
+const BuiltinHelp = Flag(bool){
     .long = "help",
     .short = "h",
     .help = "Show context-sensitive help.",
@@ -1021,16 +1362,19 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     const norm = normalize(merged);
     const all_specs = norm.specs;
     const cmd = norm.commands;
+    const alts = norm.alts;
 
     const field_names = blk: {
         var names: []const String = &.{};
         for (all_specs) |s| names = names ++ &[_]String{s.name};
+        for (alts) |a| names = names ++ &[_]String{a.field};
         if (cmd) |cl| names = names ++ &[_]String{cl.field};
         break :blk names;
     };
     const field_types = blk: {
         var ts: []const type = &.{};
-        for (all_specs) |s| ts = ts ++ &[_]type{s.vtype};
+        for (all_specs) |s| ts = ts ++ &[_]type{specViewType(s)};
+        for (alts) |a| ts = ts ++ &[_]type{?a.AT.Union};
         if (cmd) |cl| ts = ts ++ &[_]type{?cl.CT.Union};
         break :blk ts;
     };
@@ -1070,8 +1414,8 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         break :blk n;
     };
 
-    // Distinct group names per kind, in first-seen declaration order. Options
-    // and arguments are grouped independently so an option-only group does not
+    // Distinct group names per kind, in first-seen declaration order. Flags
+    // and arguments are grouped independently so an flag-only group does not
     // introduce an empty argument bucket.
     const group_names_of = struct {
         fn of(comptime kind: Kind) []const String {
@@ -1089,17 +1433,17 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return names;
         }
     }.of;
-    const option_group_names: []const String = group_names_of(.option);
+    const flag_group_names: []const String = group_names_of(.flag);
     const arg_group_names: []const String = group_names_of(.argument);
 
     // Specs partitioned by group; first entry is the ungrouped bucket. Drives
     // `helpData` ordering without runtime scans.
-    const option_specs: [1 + option_group_names.len][]const Spec = blk: {
-        var buckets: [1 + option_group_names.len][]const Spec = @splat(&.{});
+    const flag_specs: [1 + flag_group_names.len][]const Spec = blk: {
+        var buckets: [1 + flag_group_names.len][]const Spec = @splat(&.{});
         for (all_specs) |s| {
-            if (s.kind != .option) continue;
+            if (s.kind != .flag) continue;
             const bi: usize = if (s.group) |g| blk2: {
-                for (option_group_names, 0..) |nm, gi| {
+                for (flag_group_names, 0..) |nm, gi| {
                     if (std.mem.eql(u8, nm, g)) break :blk2 gi + 1;
                 }
                 unreachable;
@@ -1128,7 +1472,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         pub const app_meta = app;
         pub const specs = all_specs;
         pub const commands = cmd;
-        pub const Values = @Struct(.auto, null, &Names, &Types, &Attrs);
+        pub const View = @Struct(.auto, null, &Names, &Types, &Attrs);
 
         /// Fill a runtime [`HelpData`] description of this declaration. Every
         /// string and slice is allocated with `allocator`; release them with
@@ -1140,28 +1484,28 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             const info = try allocator.dupe(u8, app.help);
             errdefer allocator.free(info);
 
-            // Option groups: entry 0 is the ungrouped bucket, the rest follow
-            // `option_group_names` in first-seen declaration order.
-            const option_groups = try allocator.alloc(HelpData.OptionGroup, 1 + option_group_names.len);
+            // Flag groups: entry 0 is the ungrouped bucket, the rest follow
+            // `flag_group_names` in first-seen declaration order.
+            const flag_groups = try allocator.alloc(HelpData.FlagGroup, 1 + flag_group_names.len);
             var og_filled: usize = 0;
             errdefer {
-                freeOptionGroups(allocator, option_groups[0..og_filled]);
-                allocator.free(option_groups);
+                freeFlagGroups(allocator, flag_groups[0..og_filled]);
+                allocator.free(flag_groups);
             }
 
-            inline for (option_specs, 0..) |bucket, bi| {
-                const list = try allocator.alloc(HelpData.Option, bucket.len);
+            inline for (flag_specs, 0..) |bucket, bi| {
+                const list = try allocator.alloc(HelpData.Flag, bucket.len);
                 var filled: usize = 0;
                 errdefer {
-                    freeOptions(allocator, list[0..filled]);
+                    freeFlags(allocator, list[0..filled]);
                     allocator.free(list);
                 }
                 inline for (bucket) |s| {
-                    list[filled] = try fillOption(allocator, s);
+                    list[filled] = try fillFlag(allocator, s);
                     filled += 1;
                 }
-                const gname: ?String = if (bi == 0) null else try allocator.dupe(u8, option_group_names[bi - 1]);
-                option_groups[bi] = .{ .name = gname, .options = list };
+                const gname: ?String = if (bi == 0) null else try allocator.dupe(u8, flag_group_names[bi - 1]);
+                flag_groups[bi] = .{ .name = gname, .flags = list };
                 og_filled += 1;
             }
 
@@ -1206,11 +1550,64 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 }
             }
 
+            // Usage alternations: one clause per `Alt`, one branch-list per
+            // tag. The branch lists reference the flag entries owned by
+            // `flag_groups` (matched by `alt` field + `alt_branch` tag), so
+            // only the outer arrays are owned here.
+            const usage_alts = try allocator.alloc(HelpData.Usage, alts.len);
+            var ua_filled: usize = 0;
+            errdefer {
+                for (usage_alts[0..ua_filled]) |u| {
+                    for (u.branches) |br| allocator.free(br);
+                    allocator.free(u.branches);
+                }
+                allocator.free(usage_alts);
+            }
+            inline for (alts, 0..) |a, ai| {
+                const branches = try allocator.alloc([]HelpData.Flag, a.AT.tag_names.len);
+                usage_alts[ai] = .{ .branches = branches };
+                ua_filled += 1;
+                var br_filled: usize = 0;
+                errdefer for (branches[0..br_filled]) |br| allocator.free(br);
+                inline for (a.AT.tag_names, 0..) |tag, bi| {
+                    const matches = struct {
+                        fn of(o: HelpData.Flag, field: String, t: String) bool {
+                            if (o.alt) |av| {
+                                if (!std.mem.eql(u8, av, field)) return false;
+                            } else return false;
+                            if (o.alt_branch) |bv| {
+                                if (!std.mem.eql(u8, bv, t)) return false;
+                            } else return false;
+                            return true;
+                        }
+                    }.of;
+                    var n: usize = 0;
+                    for (flag_groups) |g| {
+                        for (g.flags) |o| {
+                            if (matches(o, a.field, tag)) n += 1;
+                        }
+                    }
+                    const list = try allocator.alloc(HelpData.Flag, n);
+                    branches[bi] = list;
+                    br_filled += 1;
+                    var fi: usize = 0;
+                    for (flag_groups) |g| {
+                        for (g.flags) |o| {
+                            if (matches(o, a.field, tag)) {
+                                list[fi] = o;
+                                fi += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
             return .{
                 .name = name,
                 .info = info,
-                .option_groups = option_groups,
+                .flag_groups = flag_groups,
                 .arg_groups = arg_groups,
+                .usage_alts = usage_alts,
                 .commands = cmd_infos,
                 .highlight = app.help_renderer.highlight,
             };
@@ -1224,8 +1621,8 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return try helpTextWithStyle(allocator);
         }
 
-        /// Render one option entry into `HelpData`, duplicating every string.
-        fn fillOption(allocator: std.mem.Allocator, comptime s: Spec) std.mem.Allocator.Error!HelpData.Option {
+        /// Render one flag entry into `HelpData`, duplicating every string.
+        fn fillFlag(allocator: std.mem.Allocator, comptime s: Spec) std.mem.Allocator.Error!HelpData.Flag {
             const oname = try allocator.dupe(u8, s.long);
             errdefer allocator.free(oname);
             const ohelp = try allocator.dupe(u8, s.help);
@@ -1236,7 +1633,13 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             var odefault: ?String = null;
             errdefer if (odefault) |dv| allocator.free(dv);
             odefault = try renderDefault(allocator, s);
-            return .{ .name = oname, .short = oshort, .help = ohelp, .default = odefault, .takes_value = s.vtype != bool };
+            var oalt: ?String = null;
+            errdefer if (oalt) |av| allocator.free(av);
+            if (s.alt) |av| oalt = try allocator.dupe(u8, av);
+            var obranch: ?String = null;
+            errdefer if (obranch) |bv| allocator.free(bv);
+            if (s.alt_branch) |bv| obranch = try allocator.dupe(u8, bv);
+            return .{ .name = oname, .short = oshort, .help = ohelp, .default = odefault, .takes_value = s.vtype != bool, .alt = oalt, .alt_branch = obranch, .optional = s.optional };
         }
 
         /// Render one positional argument entry into `HelpData`.
@@ -1263,20 +1666,22 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return try std.fmt.allocPrint(allocator, "{}", .{d.get(s.vtype)});
         }
 
-        fn freeOptions(allocator: std.mem.Allocator, opts: []HelpData.Option) void {
-            for (opts) |o| {
+        fn freeFlags(allocator: std.mem.Allocator, flags: []HelpData.Flag) void {
+            for (flags) |o| {
                 allocator.free(o.name);
                 if (o.short) |sh| allocator.free(sh);
                 allocator.free(o.help);
                 if (o.default) |dv| allocator.free(dv);
+                if (o.alt) |av| allocator.free(av);
+                if (o.alt_branch) |bv| allocator.free(bv);
             }
         }
 
-        fn freeOptionGroups(allocator: std.mem.Allocator, groups: []HelpData.OptionGroup) void {
+        fn freeFlagGroups(allocator: std.mem.Allocator, groups: []HelpData.FlagGroup) void {
             for (groups) |g| {
                 if (g.name) |n| allocator.free(n);
-                freeOptions(allocator, g.options);
-                allocator.free(g.options);
+                freeFlags(allocator, g.flags);
+                allocator.free(g.flags);
             }
         }
 
@@ -1329,7 +1734,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return try renderHelpWithStyle(app.help_renderer.style, allocator, &data);
         }
 
-        pub fn parse(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!Values {
+        pub fn parse(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!View {
             const result = parseInner(allocator, environ, args, diag) catch {
                 printFailureExit(allocator, diag);
             };
@@ -1358,18 +1763,20 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// Errors propagate to the caller together with a filled `diag`;
         /// `parse` turns them into stderr diagnostics plus help text and a
         /// nonzero exit.
-        fn parseInner(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!Values {
+        fn parseInner(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!View {
             if (diag) |d| d.* = .{};
 
-            var v: Values = undefined;
+            var v: View = undefined;
             var seen: [all_specs.len]bool = @splat(false);
             var pos: usize = 0;
             var handed_off = false;
 
             // Phase 0: INIT. The builtin help flag starts false so the
             // post-loop intercept below can read it even when no wire token
-            // mentioned it.
+            // mentioned it. Every Alt field starts `null` (no branch active);
+            // a branch is materialized only when one of its members is seen.
             v.builtin_help = false;
+            inline for (alts) |a| @field(v, a.field) = null;
             if (cmd) |cl| @field(v, cl.field) = null;
 
             // Phase 1: SCAN
@@ -1388,9 +1795,9 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 }
 
                 if (std.mem.startsWith(u8, tok, "--")) {
-                    try consumeLongOption(allocator, &v, &seen, args, &i, diag);
+                    try consumeLongFlag(allocator, &v, &seen, args, &i, diag);
                 } else if (tok.len > 1 and tok[0] == '-') {
-                    try consumeShortOption(allocator, &v, &seen, args, &i, diag);
+                    try consumeShortFlag(allocator, &v, &seen, args, &i, diag);
                 } else if (cmd) |cl| {
                     // HANDOFF: a positional token equal to a registered
                     // command name is checked before POSITIONAL. The
@@ -1420,10 +1827,22 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 return v;
             }
 
+            // Phase 1.5: ALT. For every Alt whose union was materialized (a
+            // member was seen), require every member of the active branch and
+            // run its validations. An untouched Alt stays `null` and is left
+            // alone; exclusivity is enforced inside `assignValue`.
+            inline for (alts) |a| {
+                if (@field(v, a.field) != null) {
+                    try validateAlt(all_specs, a.field, allocator, &v, &seen, diag);
+                }
+            }
+
             // Phase 3: POST-PASS. For every spec not seen during the scan, in
             // declaration order: env default, then direct default, then the
-            // uniform required check, then a zero value.
+            // uniform required check, then a zero value. Alt members are
+            // handled by Phase 1.5 and skipped here.
             inline for (all_specs, 0..) |s, si| {
+                if (s.alt != null) continue;
                 if (!seen[si]) {
                     try resolveAbsent(s, allocator, environ, &v, diag);
                 }
@@ -1432,11 +1851,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // Phase 4: VALIDATE. Run each spec's validation fn over the final
             // value, regardless of whether it came from the wire, an env value
             // or a direct default. A non-null allocated message is stored in
-            // `diag.message` (owned there) and reported as InvalidValue.
+            // `diag.message` (owned there) and reported as InvalidValue. Alt
+            // members are validated by Phase 1.5.
             inline for (all_specs) |s| {
+                if (s.alt != null) continue;
                 if (s.validation) |vp| {
                     const vf: *const fn (std.mem.Allocator, s.vtype) std.mem.Allocator.Error!?String = @ptrCast(@alignCast(vp));
-                    const msg = try vf(allocator, @field(v, s.name));
+                    const maybe: ?s.vtype = if (comptime s.optional) @field(v, s.name) else @field(v, s.name);
+                    const msg = if (maybe) |value| try vf(allocator, value) else null;
                     if (msg) |m| {
                         if (diag) |d| {
                             d.field = s.name;
@@ -1452,7 +1874,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return v;
         }
 
-        fn consumeLongOption(allocator: std.mem.Allocator, v: *Values, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag) ParseError!void {
+        fn consumeLongFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag) ParseError!void {
             const tok = args[i.*];
             const body = tok[2..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
@@ -1460,28 +1882,28 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             const eqv: ?[]const u8 = if (eq) |e| body[e + 1 ..] else null;
 
             inline for (all_specs, 0..) |s, si| {
-                if (s.kind == .option and std.mem.eql(u8, s.long, name)) {
+                if (s.kind == .flag and std.mem.eql(u8, s.long, name)) {
                     if (s.vtype == bool) {
-                        try assignValue(s, Values, allocator, v, seen, si, eqv orelse "true", diag);
+                        try assignValue(s, View, allocator, v, seen, si, eqv orelse "true", diag);
                     } else if (eqv) |iv| {
-                        try assignValue(s, Values, allocator, v, seen, si, iv, diag);
+                        try assignValue(s, View, allocator, v, seen, si, iv, diag);
                     } else {
                         if (i.* + 1 >= args.len) {
                             if (diag) |d| d.token = tok;
                             return error.MissingValue;
                         }
                         i.* += 1;
-                        try assignValue(s, Values, allocator, v, seen, si, args[i.*], diag);
+                        try assignValue(s, View, allocator, v, seen, si, args[i.*], diag);
                     }
                     return;
                 }
             }
 
             if (diag) |d| d.token = tok;
-            return error.UnknownOption;
+            return error.UnknownFlag;
         }
 
-        fn consumeShortOption(allocator: std.mem.Allocator, v: *Values, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag) ParseError!void {
+        fn consumeShortFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag) ParseError!void {
             const tok = args[i.*];
             const body = tok[1..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
@@ -1489,20 +1911,20 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             const eqv: ?[]const u8 = if (eq) |e| body[e + 1 ..] else null;
 
             inline for (all_specs, 0..) |s, si| {
-                if (s.kind == .option) {
+                if (s.kind == .flag) {
                     if (s.short) |sh| {
                         if (std.mem.eql(u8, sh, name)) {
                             if (s.vtype == bool) {
-                                try assignValue(s, Values, allocator, v, seen, si, eqv orelse "true", diag);
+                                try assignValue(s, View, allocator, v, seen, si, eqv orelse "true", diag);
                             } else if (eqv) |iv| {
-                                try assignValue(s, Values, allocator, v, seen, si, iv, diag);
+                                try assignValue(s, View, allocator, v, seen, si, iv, diag);
                             } else {
                                 if (i.* + 1 >= args.len) {
                                     if (diag) |d| d.token = tok;
                                     return error.MissingValue;
                                 }
                                 i.* += 1;
-                                try assignValue(s, Values, allocator, v, seen, si, args[i.*], diag);
+                                try assignValue(s, View, allocator, v, seen, si, args[i.*], diag);
                             }
                             return;
                         }
@@ -1511,17 +1933,17 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             }
 
             if (diag) |d| d.token = tok;
-            return error.UnknownOption;
+            return error.UnknownFlag;
         }
 
-        fn assignPositional(allocator: std.mem.Allocator, v: *Values, seen: *[all_specs.len]bool, pos: *usize, tok: []const u8, diag: ?*Diag) ParseError!void {
+        fn assignPositional(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, pos: *usize, tok: []const u8, diag: ?*Diag) ParseError!void {
             if (pos.* >= arg_count) {
                 if (diag) |d| d.token = tok;
                 return error.TooManyArguments;
             }
             inline for (all_specs, 0..) |s, si| {
                 if (s.kind == .argument and args_before[si] == pos.* and !seen[si]) {
-                    try assignValue(s, Values, allocator, v, seen, si, tok, diag);
+                    try assignValue(s, View, allocator, v, seen, si, tok, diag);
                     pos.* += 1;
                     return;
                 }
@@ -1532,13 +1954,13 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     };
 }
 
-/// Wrapper generated for a single command. Provides `Values` (fields generated
+/// Wrapper generated for a single command. Provides `View` (fields generated
 /// from the command's declaration) and the symmetric `parse` entry point.
 fn Sub(comptime Cmd: type) type {
     return generate(App{ .name = "", .help = Cmd.cmd_meta.help }, Cmd.cmd_def);
 }
 
-/// Normalized, comptime-only description of a single option or argument.
+/// Normalized, comptime-only description of a single flag or argument.
 const Spec = struct {
     name: String,
     kind: Kind,
@@ -1547,12 +1969,19 @@ const Spec = struct {
     short: ?String,
     arg_name: ?String = null,
     required: bool,
+    optional: bool = false,
     default: ?DefaultRepr,
     default_env: ?String,
     validation: ?*const anyopaque,
     help: String,
     i18n: ?String,
     group: ?String,
+    /// When this spec is a member of an `Alt`, the *declaration field name* of
+    /// the owning Alt. `null` for ordinary specs.
+    alt: ?String = null,
+    /// When this spec is a member of an `Alt`, the tag name of its branch.
+    /// `null` for ordinary specs.
+    alt_branch: ?String = null,
 };
 
 /// A type-erased pointer to a comptime default value. Recover the value with `get`.
@@ -1570,9 +1999,17 @@ const CommandLevel = struct {
     CT: type,
 };
 
+/// An `Alt` declaration found at a given level. `field` is the declaration
+/// field name; `AT` is the type returned by `Alt(...)`.
+const AltLevel = struct {
+    field: String,
+    AT: type,
+};
+
 const NormResult = struct {
     specs: []const Spec,
     commands: ?CommandLevel,
+    alts: []const AltLevel,
 };
 
 fn reprOf(comptime v: anytype) DefaultRepr {
@@ -1595,6 +2032,14 @@ fn typeOfField(comptime f: std.builtin.Type.StructField) type {
 
 fn instValue(comptime f: std.builtin.Type.StructField) *const f.type {
     return @ptrCast(@alignCast(f.default_value_ptr.?));
+}
+
+/// The inner (non-optional) declaration value of an optional-typed field.
+fn instValueOpt(comptime f: std.builtin.Type.StructField, comptime I: type) *const I {
+    const Holder = struct {
+        const value: I = @as(*const f.type, @ptrCast(@alignCast(f.default_value_ptr.?))).*.?;
+    };
+    return &Holder.value;
 }
 
 fn declLong(comptime T: type, inst: *const T) ?String {
@@ -1687,6 +2132,11 @@ fn zeroValue(comptime T: type) T {
     return std.mem.zeroes(T);
 }
 
+/// The `View` field type for a spec: `?vtype` for optional specs, `vtype` otherwise.
+fn specViewType(comptime s: Spec) type {
+    return if (s.optional) ?s.vtype else s.vtype;
+}
+
 /// Assign a normalized direct (comptime) default to `out`. String slices are
 /// copied with the caller's allocator so ownership stays uniform with values
 /// decoded from the wire.
@@ -1705,6 +2155,11 @@ fn assignDirectDefault(comptime T: type, allocator: std.mem.Allocator, d: Defaul
 
 /// Decode `val` into the field named by comptime spec `s`, marking it seen.
 /// Decode failures set `diag.field` and propagate.
+///
+/// For a member of an `Alt` the value is decoded into the active branch of the
+/// owning `?Union` field: the union is materialized on the first member seen
+/// (`@unionInit`) and a member from a different branch reported as
+/// `ConflictingAlt`.
 fn assignValue(
     comptime s: Spec,
     comptime V: type,
@@ -1715,6 +2170,39 @@ fn assignValue(
     val: []const u8,
     diag: ?*Diag,
 ) ParseError!void {
+    if (s.alt) |afield| {
+        const MaybeUnion = @FieldType(V, afield);
+        const UU = @typeInfo(MaybeUnion).optional.child;
+        const TE = @typeInfo(UU).@"union".tag_type.?;
+        const tag = @field(TE, s.alt_branch.?);
+        if (@field(v.*, afield)) |*cur| {
+            if (std.meta.activeTag(cur.*) != tag) {
+                if (diag) |d| d.field = afield;
+                return error.ConflictingAlt;
+            }
+        } else {
+            @field(v.*, afield) = @unionInit(UU, s.alt_branch.?, undefined);
+        }
+        const slot: *UU = &@field(v.*, afield).?;
+        decodeInto(s.vtype, allocator, val, &@field(@field(slot.*, s.alt_branch.?), s.name)) catch |e| {
+            if (diag) |d| d.field = s.name;
+            return e;
+        };
+        seen[si] = true;
+        return;
+    }
+
+    if (s.optional) {
+        var tmp: s.vtype = undefined;
+        decodeInto(s.vtype, allocator, val, &tmp) catch |e| {
+            if (diag) |d| d.field = s.name;
+            return e;
+        };
+        @field(v.*, s.name) = tmp;
+        seen[si] = true;
+        return;
+    }
+
     decodeInto(s.vtype, allocator, val, &@field(v.*, s.name)) catch |e| {
         if (diag) |d| d.field = s.name;
         return e;
@@ -1722,12 +2210,57 @@ fn assignValue(
     seen[si] = true;
 }
 
+/// Validation of the active branch of one `Alt` after the wire scan. Every
+/// member of the seen branches must be present (defaults are banned, so an
+/// unseen member of an active branch is `MissingRequired`); each member's
+/// validation fn then runs over the decoded value.
+fn validateAlt(
+    comptime specs: []const Spec,
+    comptime afield: String,
+    allocator: std.mem.Allocator,
+    v: anytype,
+    seen: []const bool,
+    diag: ?*Diag,
+) ParseError!void {
+    const MaybeUnion = @FieldType(@TypeOf(v.*), afield);
+    const UU = @typeInfo(MaybeUnion).optional.child;
+    const TE = @typeInfo(UU).@"union".tag_type.?;
+    const slot: *UU = &@field(v, afield).?;
+    const active = std.meta.activeTag(slot.*);
+
+    inline for (specs, 0..) |s, si| {
+        const same_alt = comptime (s.alt != null and std.mem.eql(u8, s.alt.?, afield));
+        if (comptime same_alt) {
+            if (active == @field(TE, s.alt_branch.?)) {
+                if (seen[si]) {
+                    if (s.validation) |vp| {
+                        const vf: *const fn (std.mem.Allocator, s.vtype) std.mem.Allocator.Error!?String = @ptrCast(@alignCast(vp));
+                        const msg = try vf(allocator, @field(@field(slot.*, s.alt_branch.?), s.name));
+                        if (msg) |m| {
+                            if (diag) |d| {
+                                d.field = s.name;
+                                d.message = m;
+                            } else {
+                                allocator.free(m);
+                            }
+                            return error.InvalidValue;
+                        }
+                    }
+                } else {
+                    if (diag) |d| d.field = s.name;
+                    return error.MissingRequired;
+                }
+            }
+        }
+    }
+}
+
 /// Errors the post-pass may report for an absent spec.
 const ResolveAbsentError = error{ MissingRequired, InvalidWtf8 } || std.mem.Allocator.Error || DecodeError;
 
 /// Runs the post-pass for a spec that no wire token filled, in declaration
 /// order: an environment default, then a direct default, then the uniform
-/// required check (option/argument required iff it has no default), then a
+/// required check (flag/argument required iff it has no default), then a
 /// zero value. On failure `diag.field` is set to the spec name.
 fn resolveAbsent(
     comptime s: Spec,
@@ -1762,27 +2295,51 @@ fn resolveAbsent(
         if (diag) |d| d.field = s.name;
         return error.MissingRequired;
     }
-    @field(v, s.name) = zeroValue(s.vtype);
+    @field(v, s.name) = zeroValue(specViewType(s));
 }
 
 fn specFromField(comptime f: std.builtin.Type.StructField) Spec {
-    const T = f.type;
+    const Raw = f.type;
+    const is_opt = @typeInfo(Raw) == .optional;
+    const T = if (is_opt) @typeInfo(Raw).optional.child else Raw;
 
     if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "dap_kind")) {
-        @compileError("declaration field '" ++ f.name ++ "' must be an Option or Argument");
+        @compileError("declaration field '" ++ f.name ++ "' must be a Flag or Argument");
     }
 
     const K = T.dap_kind;
-    if (K != .option and K != .argument) {
-        @compileError("declaration field '" ++ f.name ++ "' must be an Option or Argument");
+    if (K != .flag and K != .argument) {
+        @compileError("declaration field '" ++ f.name ++ "' must be a Flag or Argument");
+    }
+
+    if (is_opt and K != .flag) {
+        @compileError("declaration field '" ++ f.name ++
+            "': only flags can be optional (?Argument is not supported)");
     }
 
     const V = T.dap_value_type;
     if (!isDecodable(V)) {
         @compileError("value type of declaration field '" ++ f.name ++ "' is not decodable (needs decode/encode methods)");
     }
-    const inst = instValue(f);
+    const inst = if (is_opt) instValueOpt(f, T) else instValue(f);
     const defpair = declDefault(T, inst);
+    if (is_opt and defpair != null) {
+        @compileError("optional flag '" ++ f.name ++ "' must not declare a default");
+    }
+    // Boolean flags are semantically always optional: they implicitly default
+    // to `false`, so a `true` direct default is meaningless and rejected. Use a
+    // negative flag name defaulting to `false` instead.
+    const bool_flag = K == .flag and V == bool;
+    if (bool_flag) {
+        if (defpair) |d| {
+            if (d.direct) |dv| {
+                if (dv == true) {
+                    @compileError("Boolean flags cannot have a default value of 'true'. Use negative flag names (e.g., --no-something) defaulting to false instead.");
+                }
+            }
+        }
+    }
+
     const direct: ?DefaultRepr = if (defpair) |d| (if (d.direct) |dv| reprOf(dv) else null) else null;
     const env: ?String = if (defpair) |d| d.env else null;
     const vp: ?*const anyopaque = if (declValidation(T, inst)) |vf| fnToPtr(vf) else null;
@@ -1791,10 +2348,11 @@ fn specFromField(comptime f: std.builtin.Type.StructField) Spec {
         .name = f.name,
         .kind = K,
         .vtype = V,
-        .long = if (K == .option) (declLong(T, inst) orelse f.name) else f.name,
-        .short = if (K == .option) declShort(T, inst) else null,
+        .long = if (K == .flag) (declLong(T, inst) orelse f.name) else f.name,
+        .short = if (K == .flag) declShort(T, inst) else null,
         .arg_name = if (K == .argument) declArgName(T, inst) else null,
-        .required = (direct == null and env == null),
+        .required = (!bool_flag and !is_opt and direct == null and env == null),
+        .optional = is_opt,
         .default = direct,
         .default_env = env,
         .validation = vp,
@@ -1817,6 +2375,44 @@ fn groupSpecs(comptime gdef: anytype, comptime gname: String) []const Spec {
     return out;
 }
 
+/// Normalize every branch of an `Alt` into a flat spec list. Each member spec
+/// keeps its branch's tag name as its help group and records the owning Alt
+/// field plus its branch tag. Only flags are allowed and defaults are
+/// forbidden (a default would imply implicit branch activation).
+fn altSpecs(comptime AT: type, comptime field_name: String) []const Spec {
+    var out: []const Spec = &.{};
+    inline for (@typeInfo(@TypeOf(AT.alt_def)).@"struct".fields) |bf| {
+        const Bv = @field(AT.alt_def, bf.name);
+        const Bdef = if (@TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_def"))
+            Bv.dap_variant_def
+        else
+            Bv;
+        const tag = if (@TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_name"))
+            Bv.dap_variant_name
+        else
+            bf.name;
+
+        inline for (@typeInfo(@TypeOf(Bdef)).@"struct".fields) |mf| {
+            var s = specFromField(mf);
+            if (s.kind != .flag) {
+                @compileError("Alt branch '" ++ bf.name ++ "' allows only flags; '" ++ mf.name ++ "' is not a Flag");
+            }
+            if (s.optional) {
+                @compileError("Alt branch '" ++ bf.name ++ "' does not allow optional flags; '" ++
+                    mf.name ++ "' is optional");
+            }
+            if (s.default != null or s.default_env != null) {
+                @compileError("Alt flag '" ++ mf.name ++ "' must not declare a default");
+            }
+            s.group = tag;
+            s.alt = field_name;
+            s.alt_branch = tag;
+            out = out ++ &[_]Spec{s};
+        }
+    }
+    return out;
+}
+
 fn commandNames(comptime CT: type) []const String {
     return &CT.names;
 }
@@ -1824,18 +2420,18 @@ fn commandNames(comptime CT: type) []const String {
 fn checkDuplicates(comptime specs: []const Spec) void {
     comptime {
         for (specs, 0..) |a, i| {
-            if (a.kind != .option) continue;
+            if (a.kind != .flag) continue;
             for (specs[i + 1 ..]) |b| {
-                if (b.kind != .option) continue;
+                if (b.kind != .flag) continue;
                 if (std.mem.eql(u8, a.long, b.long)) {
-                    @compileError("duplicate long option '--" ++ a.long ++ "' on fields '" ++ a.name ++ "' and '" ++ b.name ++ "'");
+                    @compileError("duplicate long flag '--" ++ a.long ++ "' on fields '" ++ a.name ++ "' and '" ++ b.name ++ "'");
                 }
             }
             if (a.short) |sa| {
                 for (specs[i + 1 ..]) |b| {
                     if (b.short) |sb| {
                         if (std.mem.eql(u8, sa, sb)) {
-                            @compileError("duplicate short option '-" ++ sa ++ "' on fields '" ++ a.name ++ "' and '" ++ b.name ++ "'");
+                            @compileError("duplicate short flag '-" ++ sa ++ "' on fields '" ++ a.name ++ "' and '" ++ b.name ++ "'");
                         }
                     }
                 }
@@ -1871,9 +2467,29 @@ fn checkArgumentDefaults(comptime specs: []const Spec) void {
     }
 }
 
+/// Reject two group declarations that share a name. Groups are introduced by a
+/// `Group` field (one name) or by an `Alt` (one name per branch tag). Members
+/// of the same group legitimately share the name, so the check runs over the
+/// distinct declaration names, not over the flattened specs. Arguments live in
+/// a separate namespace and are not considered.
+fn checkGroupDefs(comptime names: []const String) void {
+    comptime {
+        for (names, 0..) |a, i| {
+            if (a.len == 0) continue;
+            for (names[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a, b)) {
+                    @compileError("duplicate group name '" ++ a ++ "'");
+                }
+            }
+        }
+    }
+}
+
 fn normalize(comptime def: anytype) NormResult {
     var specs: []const Spec = &.{};
     var commands: ?CommandLevel = null;
+    var alts: []const AltLevel = &.{};
+    var group_names: []const String = &.{};
 
     inline for (@typeInfo(@TypeOf(def)).@"struct".fields) |f| {
         if (f.type == type) {
@@ -1885,6 +2501,11 @@ fn normalize(comptime def: anytype) NormResult {
                 commands = .{ .field = f.name, .CT = V };
             } else if (@hasDecl(V, "dap_kind") and V.dap_kind == .group) {
                 specs = specs ++ groupSpecs(V.group_def, V.group_name);
+                group_names = group_names ++ &[_]String{V.group_name};
+            } else if (@hasDecl(V, "dap_kind") and V.dap_kind == .alt) {
+                specs = specs ++ altSpecs(V, f.name);
+                alts = alts ++ &[_]AltLevel{.{ .field = f.name, .AT = V }};
+                inline for (V.tag_names) |tn| group_names = group_names ++ &[_]String{tn};
             } else {
                 @compileError("unknown type-valued declaration field '" ++ f.name ++ "'");
             }
@@ -1899,13 +2520,14 @@ fn normalize(comptime def: anytype) NormResult {
     checkDuplicates(specs);
     checkFieldNames(specs);
     checkArgumentDefaults(specs);
+    checkGroupDefs(group_names);
 
-    return .{ .specs = specs, .commands = commands };
+    return .{ .specs = specs, .commands = commands, .alts = alts };
 }
 
 test "doc example declaration compiles" {
     const def = .{
-        .login = Option([]const u8){
+        .login = Flag([]const u8){
             .short = "l",
             .default = Default(String){
                 .env = "USER",
@@ -1913,12 +2535,12 @@ test "doc example declaration compiles" {
             .validation = Validate.stringNotEmpty,
             .help = "User login.",
         },
-        .password = Option([]const u8){
+        .password = Flag([]const u8){
             .short = "p",
             .validation = Validate.stringNotEmpty,
             .help = "Password for the given login.",
         },
-        .verbosity = Option(u8){
+        .verbosity = Flag(u8){
             .short = "V",
             .validation = Validate.intNotZero(u8),
             .help = "Verbosity level.",
@@ -1939,16 +2561,16 @@ test "doc example declaration compiles" {
     _ = CLI;
 }
 
-test "option field defaults" {
-    const o = Option(u8){ .help = "x" };
+test "flag field defaults" {
+    const o = Flag(u8){ .help = "x" };
     try std.testing.expect(o.long == null);
     try std.testing.expect(o.short == null);
     try std.testing.expect(o.default == null);
     try std.testing.expect(o.validation == null);
     try std.testing.expect(o.i18n == null);
     try std.testing.expectEqualStrings("x", o.help);
-    try std.testing.expect(Option(u8).dap_kind == .option);
-    try std.testing.expect(Option(u8).dap_value_type == u8);
+    try std.testing.expect(Flag(u8).dap_kind == .flag);
+    try std.testing.expect(Flag(u8).dap_value_type == u8);
 }
 
 test "argument field defaults" {
@@ -1977,9 +2599,9 @@ test "default fields default" {
 
 test "group and commands declarations compile" {
     const def = .{
-        .host = Option([]const u8){ .help = "Host" },
+        .host = Flag([]const u8){ .help = "Host" },
         .server = Group(.{
-            .port = Option(u16){ .help = "Port" },
+            .port = Flag(u16){ .help = "Port" },
         }, "Server"),
         .command = Commands(.{
             .start = Command(CommandMeta{ .help = "Start" }, .{
@@ -1991,6 +2613,26 @@ test "group and commands declarations compile" {
     try std.testing.expect(Group(.{}, "G").dap_kind == .group);
     try std.testing.expect(Commands(.{ .a = Command(CommandMeta{}, .{}) }).dap_commands);
     try std.testing.expect(Command(CommandMeta{}, .{}).dap_kind == .command);
+}
+
+test "alt declaration compiles" {
+    const def = .{
+        .mode = Alt(.{
+            .alt1 = .{
+                .opt1 = Flag([]const u8){ .help = "First flag." },
+            },
+            .alt2 = VariantNamed("fancy-alt2", .{
+                .opt2 = Flag(u32){ .help = "Second flag." },
+            }),
+        }),
+    };
+    _ = def;
+    const A = Alt(.{ .a = .{ .x = Flag(u8){} } });
+    try std.testing.expect(A.dap_kind == .alt);
+    try std.testing.expectEqualStrings("a", A.tag_names[0]);
+    try std.testing.expectEqualStrings("a", A.branch_names[0]);
+    try std.testing.expectEqualStrings("x", @typeInfo(A.branch_types[0]).@"struct".fields[0].name);
+    try std.testing.expectEqualStrings("fancy-alt2", VariantNamed("fancy-alt2", .{}).dap_variant_name);
 }
 
 test "enumeration and enum defaults" {
@@ -2030,32 +2672,32 @@ test "validate helpers" {
 }
 
 const M1Def = .{
-    .login = Option([]const u8){
+    .login = Flag([]const u8){
         .short = "l",
         .default = Default(String){ .env = "USER" },
         .validation = Validate.stringNotEmpty,
         .help = "User login.",
     },
-    .password = Option([]const u8){
+    .password = Flag([]const u8){
         .short = "p",
         .validation = Validate.stringNotEmpty,
         .help = "Password.",
     },
-    .verbosity = Option(u8){
+    .verbosity = Flag(u8){
         .short = "V",
         .default = Default(u8){ .direct = 3 },
         .help = "Verbosity.",
     },
-    .dry_run = Option(bool){
+    .dry_run = Flag(bool){
         .long = "dry-run",
         .default = Default(bool){ .direct = false },
     },
     .server = Group(.{
-        .port = Option(u16){
+        .port = Flag(u16){
             .short = "P",
             .default = Default(u16){ .direct = 8080 },
         },
-        .host = Option([]const u8){ .help = "Host." },
+        .host = Flag([]const u8){ .help = "Host." },
     }, "Server"),
     .path = Argument([]const u8){
         .validation = Validate.stringNotEmpty,
@@ -2080,7 +2722,7 @@ test "M1: normalize spec contents" {
 
     // builtin_help: injected at the very front of every declaration.
     try std.testing.expectEqualStrings("builtin_help", specs[0].name);
-    try std.testing.expect(specs[0].kind == .option);
+    try std.testing.expect(specs[0].kind == .flag);
     try std.testing.expect(specs[0].vtype == bool);
     try std.testing.expectEqualStrings("help", specs[0].long);
     try std.testing.expectEqualStrings("h", specs[0].short.?);
@@ -2091,7 +2733,7 @@ test "M1: normalize spec contents" {
 
     // login: env default, required derived false, verbatim long from field.
     try std.testing.expectEqualStrings("login", specs[1].name);
-    try std.testing.expect(specs[1].kind == .option);
+    try std.testing.expect(specs[1].kind == .flag);
     try std.testing.expect(specs[1].vtype == []const u8);
     try std.testing.expectEqualStrings("login", specs[1].long);
     try std.testing.expectEqualStrings("l", specs[1].short.?);
@@ -2147,7 +2789,7 @@ test "M1: commands level detected" {
 
 test "M1: def without commands reports null" {
     const C = generate(App{ .name = "app", .help = "help" }, .{
-        .x = Option(u8){ .default = Default(u8){ .direct = 0 } },
+        .x = Flag(u8){ .default = Default(u8){ .direct = 0 } },
     });
     try std.testing.expect(C.commands == null);
     try std.testing.expectEqual(@as(usize, 2), C.specs.len);
@@ -2170,8 +2812,8 @@ test "M1: validation pointer round-trips" {
 test "M1: duplicate long names are a compile error" {
     if (false) {
         const Bad = .{
-            .a = Option(u8){ .long = "same" },
-            .b = Option(u8){ .long = "same" },
+            .a = Flag(u8){ .long = "same" },
+            .b = Flag(u8){ .long = "same" },
         };
         _ = normalize(Bad);
     }
@@ -2180,8 +2822,8 @@ test "M1: duplicate long names are a compile error" {
 test "M1: duplicate short names are a compile error" {
     if (false) {
         const Bad = .{
-            .a = Option(u8){ .short = "s" },
-            .b = Option(u8){ .short = "s" },
+            .a = Flag(u8){ .short = "s" },
+            .b = Flag(u8){ .short = "s" },
         };
         _ = normalize(Bad);
     }
@@ -2229,15 +2871,15 @@ test "M1: argument default not last is a compile error" {
 test "M1: undecodable value type is a compile error" {
     if (false) {
         const Bad = .{
-            .x = Option(struct { z: u8 }){},
+            .x = Flag(struct { z: u8 }){},
         };
         _ = normalize(Bad);
     }
 }
 
-test "M2: Values field order and types" {
+test "M2: View field order and types" {
     const C = generate(App{ .name = "app", .help = "help" }, M1Def);
-    const V = C.Values;
+    const V = C.View;
     const fields = @typeInfo(V).@"struct".fields;
 
     // 9 specs (builtin_help injected first) + 1 commands field.
@@ -2272,7 +2914,7 @@ test "M2: Values field order and types" {
 
 test "M2: @FieldType matches specs" {
     const C = generate(App{ .name = "app", .help = "help" }, M1Def);
-    const V = C.Values;
+    const V = C.View;
 
     inline for (C.specs) |s| {
         try std.testing.expectEqual(@as(type, s.vtype), @FieldType(V, s.name));
@@ -2280,12 +2922,12 @@ test "M2: @FieldType matches specs" {
     try std.testing.expectEqual(@as(type, ?C.commands.?.CT.Union), @FieldType(V, "command"));
 }
 
-test "M2: Values without commands has only spec fields" {
+test "M2: View without commands has only spec fields" {
     const C = generate(App{ .name = "app", .help = "help" }, .{
-        .a = Option(u8){ .default = Default(u8){ .direct = 0 } },
+        .a = Flag(u8){ .default = Default(u8){ .direct = 0 } },
         .b = Argument([]const u8){},
     });
-    const fields = @typeInfo(C.Values).@"struct".fields;
+    const fields = @typeInfo(C.View).@"struct".fields;
     try std.testing.expectEqual(@as(usize, 3), fields.len);
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqual(@as(type, bool), fields[0].type);
@@ -2295,7 +2937,7 @@ test "M2: Values without commands has only spec fields" {
     try std.testing.expectEqual(@as(type, []const u8), fields[2].type);
 }
 
-test "M2: commands field type is the union of subcommand Values" {
+test "M2: commands field type is the union of subcommand View" {
     const C = generate(App{ .name = "app", .help = "help" }, M1Def);
     const CT = C.commands.?.CT;
     const U = CT.Union;
@@ -2305,7 +2947,7 @@ test "M2: commands field type is the union of subcommand Values" {
     try std.testing.expectEqualStrings("start", ufields[0].name);
     try std.testing.expectEqualStrings("halt", ufields[1].name);
 
-    // each union payload is the command's generated Values struct; the
+    // each union payload is the command's generated View struct; the
     // injected builtin_help field occupies the first slot of every sub.
     const StartSub = ufields[0].type;
     const start_fields = @typeInfo(StartSub).@"struct".fields;
@@ -2320,9 +2962,9 @@ test "M2: commands field type is the union of subcommand Values" {
     try std.testing.expect(CT.wrappers[1].commands == null);
 }
 
-test "M2: Values is a fully usable struct" {
+test "M2: View is a fully usable struct" {
     const C = generate(App{ .name = "app", .help = "help" }, M1Def);
-    var v: C.Values = undefined;
+    var v: C.View = undefined;
     v.builtin_help = false;
     v.login = "bob";
     v.password = "pw";
@@ -2459,23 +3101,23 @@ test "M3: allocation failure propagates OutOfMemory" {
 }
 
 const M4Def = .{
-    .verbose = Option(bool){
+    .verbose = Flag(bool){
         .short = "v",
         .default = Default(bool){ .direct = false },
     },
-    .name = Option([]const u8){
+    .name = Flag([]const u8){
         .short = "n",
         .default = Default([]const u8){ .direct = "anon" },
     },
-    .level = Option(u8){
+    .level = Flag(u8){
         .long = "level",
         .default = Default(u8){ .direct = 1 },
     },
-    .dry_run = Option(bool){
+    .dry_run = Flag(bool){
         .long = "dry-run",
         .default = Default(bool){ .direct = false },
     },
-    .mode = Option([]const u8){
+    .mode = Flag([]const u8){
         .long = "mode",
         .default = Default([]const u8){ .direct = "fast" },
     },
@@ -2485,14 +3127,14 @@ const M4Def = .{
     },
 };
 
-fn m4Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M4Values {
+fn m4Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M4View {
     return M4.parseInner(arena.allocator(), std.process.Environ.empty, args, diag);
 }
 
 const M4 = generate(App{ .name = "m4", .help = "m4" }, M4Def);
-const M4Values = M4.Values;
+const M4View = M4.View;
 
-test "M4: long option inline and separate value" {
+test "M4: long flag inline and separate value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
@@ -2505,7 +3147,7 @@ test "M4: long option inline and separate value" {
     try std.testing.expectEqual(@as(u8, 9), b.level);
 }
 
-test "M4: short option separate, inline and eq forms" {
+test "M4: short flag separate, inline and eq forms" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
@@ -2564,19 +3206,19 @@ test "M4: terminator treats the rest as literal positionals" {
     try std.testing.expectEqualStrings("--level=99", a.dir);
 }
 
-test "M4: unknown long option reports token" {
+test "M4: unknown long flag reports token" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
-    try std.testing.expectError(error.UnknownOption, m4Parse(&arena, &.{ "--nope", "f" }, &diag));
+    try std.testing.expectError(error.UnknownFlag, m4Parse(&arena, &.{ "--nope", "f" }, &diag));
     try std.testing.expectEqualStrings("--nope", diag.token.?);
 }
 
-test "M4: unknown short option reports token" {
+test "M4: unknown short flag reports token" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
-    try std.testing.expectError(error.UnknownOption, m4Parse(&arena, &.{ "-z", "f" }, &diag));
+    try std.testing.expectError(error.UnknownFlag, m4Parse(&arena, &.{ "-z", "f" }, &diag));
     try std.testing.expectEqualStrings("-z", diag.token.?);
 }
 
@@ -2624,20 +3266,20 @@ test "M4: optional fields fall back to direct defaults" {
 // --- M5: post-pass (env/direct precedence, uniform required rule) ---
 
 const M5Def = .{
-    .user = Option([]const u8){
+    .user = Flag([]const u8){
         .short = "u",
         .default = Default([]const u8){ .env = "DAP_USER" },
     },
-    .port = Option(u16){
+    .port = Flag(u16){
         .default = Default(u16){ .env = "DAP_PORT", .direct = 4242 },
     },
-    .host = Option([]const u8){
+    .host = Flag([]const u8){
         .default = Default([]const u8){ .direct = "localhost" },
     },
-    .loud = Option(bool){
+    .loud = Flag(bool){
         .default = Default(bool){ .direct = false },
     },
-    .needed = Option(bool){},
+    .needed = Flag(bool){},
     .file = Argument([]const u8){},
     .dir = Argument([]const u8){
         .default = Default([]const u8){ .direct = "." },
@@ -2645,13 +3287,13 @@ const M5Def = .{
 };
 
 const M5 = generate(App{ .name = "m5", .help = "m5" }, M5Def);
-const M5Values = M5.Values;
+const M5View = M5.View;
 
 fn makeEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
     return .{ .block = .{ .slice = (entries ++ &[_]?[*:0]const u8{null})[0..entries.len :null] } };
 }
 
-fn m5Parse(environ: std.process.Environ, arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M5Values {
+fn m5Parse(environ: std.process.Environ, arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M5View {
     return M5.parseInner(arena.allocator(), environ, args, diag);
 }
 
@@ -2711,18 +3353,22 @@ test "M5: env override supplies typed value" {
     try std.testing.expectEqual(@as(u16, 31337), a.port);
 }
 
-test "M5: required bool must be passed; optional bool honoured" {
+test "M5: bool flags are never required; optional bool honoured" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
 
-    try std.testing.expectError(error.MissingRequired, m5Parse(std.process.Environ.empty, &arena, &.{"f"}, &diag));
-    try std.testing.expectEqualStrings("needed", diag.field.?);
-
-    // Presence of the flag satisfies a required bool even as `false`.
-    const a = try m5Parse(std.process.Environ.empty, &arena, &.{ "--needed=false", "f" }, &diag);
+    // A boolean flag with no default implicitly defaults to `false`, so an
+    // omitted `--needed` is never a missing-required error.
+    const a = try m5Parse(std.process.Environ.empty, &arena, &.{"f"}, &diag);
     try std.testing.expect(!a.needed);
     try std.testing.expect(!a.loud); // optional bool via explicit default
+
+    const b = try m5Parse(std.process.Environ.empty, &arena, &.{ "--needed=false", "f" }, &diag);
+    try std.testing.expect(!b.needed);
+
+    const c = try m5Parse(std.process.Environ.empty, &arena, &.{ "--needed", "f" }, &diag);
+    try std.testing.expect(c.needed);
 }
 
 test "M5: required error carries diag.field for env/direct-less spec" {
@@ -2733,6 +3379,26 @@ test "M5: required error carries diag.field for env/direct-less spec" {
     // `--needed` is satisfied, but the required `file` argument is absent.
     try std.testing.expectError(error.MissingRequired, m5Parse(std.process.Environ.empty, &arena, &.{"--needed"}, &diag));
     try std.testing.expectEqualStrings("file", diag.field.?);
+}
+
+test "M5: bool flag with a direct true default is a compile error" {
+    if (false) {
+        const Bad = .{ .x = Flag(bool){ .default = Default(bool){ .direct = true } } };
+        _ = normalize(Bad);
+    }
+}
+
+test "M5: bool flag usage header is bracketed" {
+    const def = .{
+        .flag = Flag(bool){ .help = "A boolean flag." },
+        .opt = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "A defaulted bool." },
+    };
+    const CLI = generate(App{ .name = "b", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, def);
+    const h = try CLI.helpText(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    const usage_end = std.mem.indexOf(u8, h, "\n").?;
+    const usage = h[0..usage_end];
+    try std.testing.expect(std.mem.startsWith(u8, usage, "Usage: b [--flag] [flags]"));
 }
 
 test "M5: bad env value reports InvalidWire with field" {
@@ -2751,12 +3417,12 @@ test "M5: bad env value reports InvalidWire with field" {
 // --- M6: validation (Phase 3 over all assignment paths) ---
 
 const M6Def = .{
-    .user = Option([]const u8){
+    .user = Flag([]const u8){
         .short = "u",
         .validation = Validate.stringNotEmpty,
         .default = Default([]const u8){ .env = "DAP_USER" },
     },
-    .level = Option(u8){
+    .level = Flag(u8){
         .long = "level",
         .validation = Validate.intNotZero(u8),
         .default = Default(u8){ .direct = 1 },
@@ -2767,9 +3433,9 @@ const M6Def = .{
 };
 
 const M6 = generate(App{ .name = "m6", .help = "m6" }, M6Def);
-const M6Values = M6.Values;
+const M6View = M6.View;
 
-fn m6Parse(environ: std.process.Environ, arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: ?*Diag) !M6Values {
+fn m6Parse(environ: std.process.Environ, arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: ?*Diag) !M6View {
     return M6.parseInner(arena.allocator(), environ, args, diag);
 }
 
@@ -2804,7 +3470,7 @@ test "M6: validation failure on direct default is reported" {
 
     // level defaults to 1 (valid); prove the path via a zero direct default.
     const Bad = generate(App{ .name = "bad", .help = "bad" }, .{
-        .level = Option(u8){
+        .level = Flag(u8){
             .validation = Validate.intNotZero(u8),
             .default = Default(u8){ .direct = 0 },
         },
@@ -2835,7 +3501,7 @@ test "M6: validation message is freed when diag is null" {
     // passing the testing allocator directly proves parse frees it on the
     // null-diag path (a leak would fail the test).
     const Bad = generate(App{ .name = "bad", .help = "bad" }, .{
-        .level = Option(u8){
+        .level = Flag(u8){
             .validation = Validate.intNotZero(u8),
             .default = Default(u8){ .direct = 0 },
         },
@@ -2858,15 +3524,15 @@ test "M6: passing validation leaves no diag message" {
 // --- M7: handoff (Commands integration in the loop) ---
 
 const M7Def = .{
-    .verbose = Option(bool){
+    .verbose = Flag(bool){
         .long = "verbose",
         .default = Default(bool){ .direct = false },
     },
-    .needed = Option([]const u8){ .long = "needed" },
+    .needed = Flag([]const u8){ .long = "needed" },
     .command = Commands(.{
         .start = Command(CommandMeta{ .help = "Start." }, .{
             .name = Argument([]const u8){},
-            .force = Option(bool){
+            .force = Flag(bool){
                 .long = "force",
                 .default = Default(bool){ .direct = false },
             },
@@ -2883,13 +3549,13 @@ const M7Def = .{
 };
 
 const M7 = generate(App{ .name = "m7", .help = "m7" }, M7Def);
-const M7Values = M7.Values;
+const M7View = M7.View;
 
-fn m7Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M7Values {
+fn m7Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M7View {
     return M7.parseInner(arena.allocator(), std.process.Environ.empty, args, diag);
 }
 
-test "M7: root options then command handoff" {
+test "M7: root flags then command handoff" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
@@ -2921,12 +3587,12 @@ test "M7: named command via CommandMeta" {
     try std.testing.expect(std.meta.activeTag(a.command.?) == .halt);
 }
 
-test "M7: options after the command are scoped to the sub" {
+test "M7: flags after the command are scoped to the sub" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
 
-    // `--force` is a start-scoped option; the root never sees it.
+    // `--force` is a start-scoped flag; the root never sees it.
     const a = try m7Parse(&arena, &.{ "--needed", "v", "start", "--force", "file" }, &diag);
     try std.testing.expect(std.meta.activeTag(a.command.?) == .start);
     try std.testing.expect(a.command.?.start.force);
@@ -3006,9 +3672,9 @@ test "M8: enumeration round-trips wire names through decode/encode" {
     try std.testing.expectEqual(Mode.EnumView.fast, m.view);
 }
 
-test "M8: enumeration works as an option value type" {
+test "M8: enumeration works as an flag value type" {
     const def = .{
-        .mode = Option(Mode){
+        .mode = Flag(Mode){
             .long = "mode",
             .default = Default(Mode){ .direct = .{} },
         },
@@ -3066,22 +3732,22 @@ test "M8: empty enumeration is a decodable value type that rejects everything" {
 // --- M9: help text ---
 
 const M9Def = .{
-    .verbose = Option(bool){
+    .verbose = Flag(bool){
         .short = "v",
         .default = Default(bool){ .direct = false },
         .help = "Verbose output.",
     },
-    .dry_run = Option(bool){
+    .dry_run = Flag(bool){
         .long = "dry-run",
         .help = "Dry run.",
     },
-    .port = Option(u16){
+    .port = Flag(u16){
         .short = "P",
         .default = Default(u16){ .direct = 8080 },
         .help = "Port.",
     },
     .server = Group(.{
-        .host = Option([]const u8){
+        .host = Flag([]const u8){
             .help = "Host.",
             .i18n = "server.host",
         },
@@ -3109,7 +3775,7 @@ const M9 = generate(
 
 test "M9: help text renders header, sections, commands and arguments" {
     const expected =
-        \\Usage: app --dry-run --host=HOST <path> <TARGET> [flags]
+        \\Usage: app [--dry-run] --host=HOST <path> <TARGET> [flags]
         \\
         \\Do things.
         \\
@@ -3155,7 +3821,7 @@ test "M9: i18n references are carried verbatim in specs but stay inert" {
 
 test "M9: help text with no help header, no commands and no arguments" {
     const def = .{
-        .flag = Option(bool){ .default = Default(bool){ .direct = false } },
+        .flag = Flag(bool){ .default = Default(bool){ .direct = false } },
     };
     const CLI = generate(App{ .name = "bare", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, def);
     const expected =
@@ -3197,15 +3863,15 @@ test "M9: helpData fills groups, defaults and commands" {
     try std.testing.expectEqualStrings("app", data.name);
     try std.testing.expectEqualStrings("Do things.", data.info);
 
-    // Ungrouped options first, then the named group.
-    try std.testing.expectEqual(@as(usize, 2), data.option_groups.len);
-    try std.testing.expect(data.option_groups[0].name == null);
-    try std.testing.expectEqualStrings("Server settings", data.option_groups[1].name.?);
+    // Ungrouped flags first, then the named group.
+    try std.testing.expectEqual(@as(usize, 2), data.flag_groups.len);
+    try std.testing.expect(data.flag_groups[0].name == null);
+    try std.testing.expectEqualStrings("Server settings", data.flag_groups[1].name.?);
 
-    const ungrouped = data.option_groups[0].options;
+    const ungrouped = data.flag_groups[0].flags;
     try std.testing.expectEqual(@as(usize, 4), ungrouped.len);
 
-    // Injected builtin help flag comes first, before every user option.
+    // Injected builtin help flag comes first, before every user flag.
     try std.testing.expectEqualStrings("help", ungrouped[0].name);
     try std.testing.expectEqualStrings("h", ungrouped[0].short.?);
     try std.testing.expectEqualStrings("false", ungrouped[0].default.?);
@@ -3216,7 +3882,7 @@ test "M9: helpData fills groups, defaults and commands" {
     try std.testing.expectEqualStrings("false", ungrouped[1].default.?);
     try std.testing.expect(!ungrouped[1].takes_value);
 
-    // Required option: no default, no short.
+    // Required flag: no default, no short.
     try std.testing.expectEqualStrings("dry-run", ungrouped[2].name);
     try std.testing.expect(ungrouped[2].short == null);
     try std.testing.expect(ungrouped[2].default == null);
@@ -3225,8 +3891,8 @@ test "M9: helpData fills groups, defaults and commands" {
     try std.testing.expectEqualStrings("8080", ungrouped[3].default.?);
     try std.testing.expect(ungrouped[3].takes_value);
 
-    try std.testing.expectEqual(@as(usize, 1), data.option_groups[1].options.len);
-    try std.testing.expectEqualStrings("host", data.option_groups[1].options[0].name);
+    try std.testing.expectEqual(@as(usize, 1), data.flag_groups[1].flags.len);
+    try std.testing.expectEqualStrings("host", data.flag_groups[1].flags[0].name);
 
     try std.testing.expectEqual(@as(usize, 2), data.commands.len);
     try std.testing.expectEqualStrings("start", data.commands[0].name);
@@ -3249,7 +3915,7 @@ test "M9: helpData groups arguments and renders custom defaults" {
         .slow = Enum{},
     });
     const def = .{
-        .mode = Option(HMode){
+        .mode = Flag(HMode){
             .default = Default(HMode){ .direct = HMode{ .view = .slow } },
             .help = "Mode.",
         },
@@ -3263,9 +3929,9 @@ test "M9: helpData groups arguments and renders custom defaults" {
     defer data.deinit(std.testing.allocator);
 
     // Custom struct default renders through `encode`; the injected help flag
-    // occupies slot 0 of the ungrouped options.
-    try std.testing.expectEqualStrings("help", data.option_groups[0].options[0].name);
-    try std.testing.expectEqualStrings("slow", data.option_groups[0].options[1].default.?);
+    // occupies slot 0 of the ungrouped flags.
+    try std.testing.expectEqualStrings("help", data.flag_groups[0].flags[0].name);
+    try std.testing.expectEqualStrings("slow", data.flag_groups[0].flags[1].default.?);
 
     // Ungrouped argument first, grouped argument after.
     try std.testing.expectEqual(@as(usize, 2), data.arg_groups.len);
@@ -3302,21 +3968,21 @@ test "M9: helpData frees everything when an allocation fails" {
 
 test "M9: helpData.renderCompact matches the reference layout" {
     const def = .{
-        .source = Option([]const u8){
+        .source = Flag([]const u8){
             .default = Default([]const u8){ .direct = "." },
             .help = "Source directory.",
         },
-        .last = Option(bool){
+        .last = Flag(bool){
             .short = "l",
             .default = Default(bool){ .direct = false },
             .help = "Show last modification.",
         },
         .grp = Group(.{
-            .count = Option(isize){
+            .count = Flag(isize){
                 .default = Default(isize){ .direct = 1 },
                 .help = "Number of items.",
             },
-            .value = Option(isize){
+            .value = Flag(isize){
                 .short = "v",
                 .default = Default(isize){ .direct = 1 },
                 .help = "Value of items.",
@@ -3358,12 +4024,12 @@ test "M9: helpData.renderCompact matches the reference layout" {
 test "M9: renderCompact orders groups by name with ungrouped first" {
     const def = .{
         .zeta = Group(.{
-            .z = Option(bool){ .default = Default(bool){ .direct = false }, .help = "Z." },
+            .z = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "Z." },
         }, "zeta"),
         .alpha = Group(.{
-            .a = Option(bool){ .default = Default(bool){ .direct = false }, .help = "A." },
+            .a = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "A." },
         }, "alpha"),
-        .plain = Option(bool){ .default = Default(bool){ .direct = false }, .help = "Plain." },
+        .plain = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "Plain." },
     };
     const CLI = generate(App{ .name = "g", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, def);
     const expected =
@@ -3388,15 +4054,15 @@ test "M9: renderCompact orders groups by name with ungrouped first" {
     try std.testing.expectEqualStrings(expected, h);
 }
 
-test "M9: renderCompact lists commands and marks required options in usage" {
+test "M9: renderCompact lists commands and marks required flags in usage" {
     const def = .{
-        .needed = Option([]const u8){
+        .needed = Flag([]const u8){
             .short = "n",
             .help = "Required.",
         },
-        .opt = Option(u8){
+        .extra = Flag(u8){
             .default = Default(u8){ .direct = 3 },
-            .help = "Optional.",
+            .help = "Extra.",
         },
         .cmd = Commands(.{
             .start = Command(CommandMeta{ .help = "Start." }, .{}),
@@ -3411,7 +4077,7 @@ test "M9: renderCompact lists commands and marks required options in usage" {
         \\Flags:
         \\  -h, --help             Show context-sensitive help.
         \\  -n, --needed=NEEDED    Required.
-        \\      --opt=3            Optional.
+        \\      --extra=3          Extra.
         \\
         \\Commands:
         \\  start    Start.
@@ -3462,12 +4128,12 @@ test "M9: renderCompact frees everything when an allocation fails" {
 // --- M10: builtin help injection, help priority, renderer switch ---
 
 const M10Def = .{
-    .verbose = Option(bool){
+    .verbose = Flag(bool){
         .short = "v",
         .default = Default(bool){ .direct = false },
         .help = "Verbose output.",
     },
-    .needed = Option([]const u8){ .help = "Required." },
+    .needed = Flag([]const u8){ .help = "Required." },
     .path = Argument([]const u8){ .help = "Path." },
 };
 
@@ -3477,7 +4143,7 @@ fn m10RenderMinimal(_: *const HelpData, allocator: std.mem.Allocator) std.mem.Al
     return try allocator.dupe(u8, "custom renderer");
 }
 
-test "M10: builtin help flag parses like a plain bool option" {
+test "M10: builtin help flag parses like a plain bool flag" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: Diag = .{};
@@ -3501,13 +4167,13 @@ test "M10: builtin help flag parses like a plain bool option" {
     try std.testing.expect(!d.builtin_help);
 
     var diag2: Diag = .{};
-    try std.testing.expectError(error.UnknownOption, M10.parseInner(arena.allocator(), std.process.Environ.empty, &.{"--nope"}, &diag2));
+    try std.testing.expectError(error.UnknownFlag, M10.parseInner(arena.allocator(), std.process.Environ.empty, &.{"--nope"}, &diag2));
 }
 
 test "M10: a user-declared --help clashes with the injected builtin" {
     if (false) {
         const Bad = .{
-            .help = Option(bool){ .long = "help" },
+            .help = Flag(bool){ .long = "help" },
         };
         _ = normalize(withBuiltinHelp(Bad));
     }
@@ -3516,8 +4182,9 @@ test "M10: a user-declared --help clashes with the injected builtin" {
 test "M10: helpText follows the compact renderer by default" {
     const h = try M10.helpText(std.testing.allocator);
     defer std.testing.allocator.free(h);
-    // The default highlight is `.bold`, so names carry the bold/reset codes.
-    try std.testing.expect(std.mem.indexOf(u8, h, "-\x1b[1mh\x1b[0m, --\x1b[1mhelp\x1b[0m") != null);
+    // The default highlight is `.bold`, so names carry the bold/reset codes;
+    // the dashes are part of each name token.
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1m-h\x1b[0m, \x1b[1m--help\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "Usage: \x1b[1mm10\x1b[0m") != null);
 }
 
@@ -3535,7 +4202,7 @@ test "M10: builtin help flag is rendered first in the flags section" {
     var data = try M10.helpData(std.testing.allocator);
     defer data.deinit(std.testing.allocator);
 
-    const ungrouped = data.option_groups[0].options;
+    const ungrouped = data.flag_groups[0].flags;
     try std.testing.expectEqual(@as(usize, 3), ungrouped.len);
     try std.testing.expectEqualStrings("help", ungrouped[0].name);
     try std.testing.expectEqualStrings("h", ungrouped[0].short.?);
@@ -3596,48 +4263,622 @@ test "M11: highlighting leaves the column widths untouched" {
     }
 }
 
-test "M11: bold wraps app, option and argument names" {
+test "M11: bold wraps app, flag and argument names" {
     const h = try renderWithHighlight(.{ .bold = {} }, std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, h, "Usage: \x1b[1mapp\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "--\x1b[1mhelp\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1m--help\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1mServer settings\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "<\x1b[1mpath\x1b[0m>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1m<path>\x1b[0m") != null);
+}
+
+test "M11: usage brackets stay inside their highlight blocks" {
+    const bold = try renderWithHighlight(.{ .bold = {} }, std.testing.allocator);
+    defer std.testing.allocator.free(bold);
+    // The optional-flag and `[flags]` tokens carry the brackets inside the
+    // `.usage.optionals` block.
+    try std.testing.expect(std.mem.indexOf(u8, bold, "\x1b[3m[--dry-run]\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bold, "\x1b[3m[flags]\x1b[0m") != null);
+    // The required flag's dashes and `=` ride inside the name token.
+    try std.testing.expect(std.mem.indexOf(u8, bold, "\x1b[1m--host=\x1b[0m") != null);
+    // Positional tokens carry their own `<...>` / `[<...>]` brackets.
+    try std.testing.expect(std.mem.indexOf(u8, bold, "\x1b[1m<path>\x1b[0m") != null);
+
+    const color = try renderWithHighlight(.{ .color = {} }, std.testing.allocator);
+    defer std.testing.allocator.free(color);
+    try std.testing.expect(std.mem.indexOf(u8, color, "\x1b[36m[--dry-run]\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, color, "\x1b[36m<path>\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, color, "\x1b[36m\x1b[1m--host=\x1b[0m") != null);
+}
+
+test "M11: flag list highlights dashes and assign sign with the name" {
+    const h = try renderWithHighlight(.{ .bold = {} }, std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    // Each flag name token carries its own dashes and, for value flags, the
+    // `=` sign; only the `, ` separator stays uncolored.
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1m-h\x1b[0m, \x1b[1m--help\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1m-P\x1b[0m, \x1b[1m--port=\x1b[0m\x1b[1m8080\x1b[0m") != null);
 }
 
 test "M11: color uses the per-category codes" {
     const h = try renderWithHighlight(.{ .color = {} }, std.testing.allocator);
     defer std.testing.allocator.free(h);
-    // App name: bold + green; option name: green; argument name: cyan; group:
-    // bold + blue.
-    try std.testing.expect(std.mem.indexOf(u8, h, "Usage: \x1b[1m\x1b[32mapp\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "--\x1b[32mhelp\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[1m\x1b[34mServer settings\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "<\x1b[36mpath\x1b[0m>") != null);
+    // App name: bold; required flag name: cyan + bold; value: cyan; argument
+    // name: cyan; group: green + bold.
+    try std.testing.expect(std.mem.indexOf(u8, h, "Usage: \x1b[1mapp\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[36m\x1b[1m--host=\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[32m\x1b[1mServer settings\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "\x1b[36m<path>\x1b[0m") != null);
 }
 
 test "M11: a custom highlight scheme is used verbatim" {
     const custom = HelpHighlight{
-        .app_name = "<a>",
-        .option_name = "<o>",
-        .arg_name = "<g>",
-        .group_name = "<G>",
-        .help_text = "<h>",
+        .usage = .{
+            .app_name = "<a>",
+            .required_flags = .{ .name = "<n>", .value = "<v>" },
+            .optionals = "<o>",
+            .arguments = "<g>",
+        },
+        .groups = "<G>",
+        .args = "<A>",
+        .flags = .{ .name = "<f>", .value = "<V>" },
         .reset = "</>",
     };
     const h = try renderWithHighlight(.{ .custom = custom }, std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, h, "Usage: <a>app</>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "<o>help</>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "<o>[--dry-run]</>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "<n>--host=</><v>HOST</>") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "<G>Server settings</>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "<g>path</>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, h, "<h>Host.</>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "<A><path></>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "<f>-h</>, <f>--help</>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "<f>--port=</><V>8080</>") != null);
 }
 
 test "M11: HelpHighlight.resolve maps the ready profiles" {
-    try std.testing.expectEqualStrings("", HelpHighlight.resolve(.{ .flat = {} }).option_name);
-    try std.testing.expectEqualStrings("\x1b[1m", HelpHighlight.resolve(.{ .bold = {} }).option_name);
-    try std.testing.expectEqualStrings("\x1b[32m", HelpHighlight.resolve(.{ .color = {} }).option_name);
-    const c = HelpHighlight{ .option_name = "X" };
-    try std.testing.expectEqualStrings("X", HelpHighlight.resolve(.{ .custom = c }).option_name);
+    try std.testing.expectEqualStrings("", HelpHighlight.resolve(.{ .flat = {} }).flags.name);
+    try std.testing.expectEqualStrings("\x1b[1m", HelpHighlight.resolve(.{ .bold = {} }).flags.name);
+    try std.testing.expectEqualStrings("\x1b[36m\x1b[1m", HelpHighlight.resolve(.{ .color = {} }).flags.name);
+    try std.testing.expectEqualStrings("\x1b[36m", HelpHighlight.resolve(.{ .color = {} }).usage.required_flags.value);
+    const c = HelpHighlight{ .flags = .{ .name = "X" } };
+    try std.testing.expectEqualStrings("X", HelpHighlight.resolve(.{ .custom = c }).flags.name);
+}
+
+// ---------------------------------------------------------------------------
+// M12: exclusive parameter groups (`Alt` / `VariantNamed`).
+// ---------------------------------------------------------------------------
+
+const M12Alt = Alt(.{
+    .alt1 = .{
+        .opt1 = Flag(u32){ .short = "1", .help = "First flag." },
+        .flag1 = Flag(bool){ .help = "First flag." },
+    },
+    .alt2 = VariantNamed("fancy-alt2", .{
+        .opt2 = Flag([]const u8){ .short = "2", .validation = Validate.stringNotEmpty, .help = "Second flag." },
+    }),
+});
+
+const M12Def = .{
+    .host = Flag([]const u8){ .default = Default([]const u8){ .direct = "localhost" } },
+    .mode = M12Alt,
+};
+
+const M12 = generate(App{ .name = "m12", .help = "m12" }, M12Def);
+const M12View = M12.View;
+
+test "M12: Alt declaration metadata" {
+    try std.testing.expect(M12Alt.dap_kind == .alt);
+    try std.testing.expectEqual(@as(usize, 2), M12Alt.branch_names.len);
+    try std.testing.expectEqualStrings("alt1", M12Alt.branch_names[0]);
+    try std.testing.expectEqualStrings("alt2", M12Alt.branch_names[1]);
+    try std.testing.expectEqualStrings("alt1", M12Alt.tag_names[0]);
+    try std.testing.expectEqualStrings("fancy-alt2", M12Alt.tag_names[1]);
+    try std.testing.expectEqualStrings("opt1", @typeInfo(M12Alt.branch_types[0]).@"struct".fields[0].name);
+    try std.testing.expectEqualStrings("opt2", @typeInfo(M12Alt.branch_types[1]).@"struct".fields[0].name);
+}
+
+test "M12: normalization flattens branches with group tags" {
+    const specs = M12.specs;
+    var seen_member1 = false;
+    var seen_member2 = false;
+    inline for (specs) |s| {
+        if (comptime std.mem.eql(u8, s.name, "opt1")) {
+            seen_member1 = true;
+            try std.testing.expectEqualStrings("alt1", s.group.?);
+            try std.testing.expectEqualStrings("mode", s.alt.?);
+            try std.testing.expectEqualStrings("alt1", s.alt_branch.?);
+            try std.testing.expect(s.default == null);
+            try std.testing.expect(s.required);
+        }
+        if (comptime std.mem.eql(u8, s.name, "opt2")) {
+            seen_member2 = true;
+            try std.testing.expectEqualStrings("fancy-alt2", s.group.?);
+            try std.testing.expectEqualStrings("fancy-alt2", s.alt_branch.?);
+        }
+    }
+    try std.testing.expect(seen_member1 and seen_member2);
+}
+
+test "M12: View carries an optional union field before commands" {
+    const fields = @typeInfo(M12View).@"struct".fields;
+    const last = fields[fields.len - 1];
+    try std.testing.expectEqualStrings("mode", last.name);
+    const MaybeUnion = last.type;
+    try std.testing.expect(@typeInfo(MaybeUnion) == .optional);
+    const UU = @typeInfo(MaybeUnion).optional.child;
+    try std.testing.expect(@typeInfo(UU) == .@"union");
+    var seen1 = false;
+    var seen2 = false;
+    inline for (@typeInfo(UU).@"union".fields) |uf| {
+        if (std.mem.eql(u8, uf.name, "alt1")) seen1 = true;
+        if (std.mem.eql(u8, uf.name, "fancy-alt2")) seen2 = true;
+    }
+    try std.testing.expect(seen1 and seen2);
+}
+
+fn m12Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M12View {
+    return M12.parseInner(arena.allocator(), std.process.Environ.empty, args, diag);
+}
+
+test "M12: no branch flag leaves the union null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m12Parse(&arena, &.{}, &diag);
+    try std.testing.expect(v.mode == null);
+    try std.testing.expectEqualStrings("localhost", v.host);
+}
+
+test "M12: a single member activates its branch and fills the payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m12Parse(&arena, &.{ "--opt1=42", "--flag1" }, &diag);
+    try std.testing.expect(v.mode != null);
+    switch (v.mode.?) {
+        .alt1 => |p| {
+            try std.testing.expectEqual(@as(u32, 42), p.opt1);
+            try std.testing.expect(p.flag1);
+        },
+        .@"fancy-alt2" => return error.TestUnexpectedResult,
+    }
+}
+
+test "M12: members of one branch may be combined" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m12Parse(&arena, &.{ "-1", "7", "--flag1" }, &diag);
+    switch (v.mode.?) {
+        .alt1 => |p| try std.testing.expectEqual(@as(u32, 7), p.opt1),
+        .@"fancy-alt2" => return error.TestUnexpectedResult,
+    }
+}
+
+test "M12: VariantNamed branch activates under its tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m12Parse(&arena, &.{ "-2", "hello" }, &diag);
+    switch (v.mode.?) {
+        .alt1 => return error.TestUnexpectedResult,
+        .@"fancy-alt2" => |p| try std.testing.expectEqualStrings("hello", p.opt2),
+    }
+}
+
+test "M12: members from two branches conflict" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.ConflictingAlt, m12Parse(&arena, &.{ "--opt1=1", "--opt2=x" }, &diag));
+    try std.testing.expectEqualStrings("mode", diag.field.?);
+}
+
+test "M12: unseen member of an active branch is missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.MissingRequired, m12Parse(&arena, &.{"--opt1=1"}, &diag));
+    try std.testing.expectEqualStrings("flag1", diag.field.?);
+}
+
+test "M12: active-branch validation runs and reports the member field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.InvalidValue, m12Parse(&arena, &.{"--opt2="}, &diag));
+    try std.testing.expectEqualStrings("opt2", diag.field.?);
+    if (diag.message) |m| allocatorFree(&arena, m);
+}
+
+fn allocatorFree(arena: *std.heap.ArenaAllocator, m: String) void {
+    arena.allocator().free(m);
+}
+
+test "M12: Alt member unknown flag is a plain UnknownFlag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m12Parse(&arena, &.{"--nope"}, &diag));
+    try std.testing.expectEqualStrings("--nope", diag.token.?);
+}
+
+test "M12: Alt flag flag clashes with the parent are a compile error" {
+    if (false) {
+        const Bad = .{
+            .host = Flag([]const u8){},
+            .mode = Alt(.{ .a = .{ .host = Flag(u8){} } }),
+        };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: duplicate tags via VariantNamed are a compile error" {
+    if (false) {
+        const Bad = .{ .mode = Alt(.{
+            .a = VariantNamed("same", .{ .x = Flag(u8){} }),
+            .b = VariantNamed("same", .{ .y = Flag(u8){} }),
+        }) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: an Alt branch name clashing with a Group name is a compile error" {
+    if (false) {
+        const Bad = .{
+            .g = Group(.{ .p = Flag(u8){} }, "alt1"),
+            .mode = Alt(.{ .alt1 = .{ .q = Flag(u8){} } }),
+        };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: non-flag Alt member is a compile error" {
+    if (false) {
+        const Bad = .{ .mode = Alt(.{ .a = .{ .x = Argument(u8){} } }) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: defaulted Alt member is a compile error" {
+    if (false) {
+        const Bad = .{ .mode = Alt(.{ .a = .{ .x = Flag(u8){ .default = Default(u8){ .direct = 1 } } } }) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: duplicate flags across branches are a compile error" {
+    if (false) {
+        const Bad = .{ .mode = Alt(.{
+            .a = .{ .x = Flag(u8){ .long = "same" } },
+            .b = .{ .y = Flag(u8){ .long = "same" } },
+        }) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: zero-branch Alt is a compile error" {
+    if (false) {
+        const Bad = .{ .mode = Alt(.{}) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M12: help groups one branch per heading" {
+    var data = try M12.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    var found_alt1 = false;
+    var found_fancy = false;
+    for (data.flag_groups) |g| {
+        if (g.name) |n| {
+            if (std.mem.eql(u8, n, "alt1")) found_alt1 = true;
+            if (std.mem.eql(u8, n, "fancy-alt2")) found_fancy = true;
+        }
+    }
+    try std.testing.expect(found_alt1 and found_fancy);
+
+    const h = try M12.helpText(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    try std.testing.expect(std.mem.indexOf(u8, h, "alt1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "fancy-alt2") != null);
+}
+
+test "M12: usage line renders Alt branches as an alternation clause" {
+    var data = try M12.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), data.usage_alts.len);
+    try std.testing.expectEqual(@as(usize, 2), data.usage_alts[0].branches.len);
+    try std.testing.expectEqualStrings("opt1", data.usage_alts[0].branches[0][0].name);
+    try std.testing.expectEqualStrings("flag1", data.usage_alts[0].branches[0][1].name);
+    try std.testing.expectEqualStrings("opt2", data.usage_alts[0].branches[1][0].name);
+}
+
+test "M12: usage clause renders Alt alternation with flat highlighting" {
+    const def = .{
+        .mode = Alt(.{
+            .a = .{ .x = Flag(u32){} },
+            .b = .{ .y = Flag([]const u8){} },
+        }),
+    };
+    const C = generate(App{ .name = "u", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, def);
+    const h = try C.helpText(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    try std.testing.expect(std.mem.startsWith(u8, h, "Usage: u (--x=X | --y=Y) [flags]"));
+}
+
+const M12CmdDef = .{
+    .command = Commands(.{
+        .run = Command(CommandMeta{ .help = "Run." }, .{
+            .speed = Alt(.{ .fast = .{ .fast = Flag(bool){} } }),
+        }),
+    }),
+};
+
+test "M12: an Alt inside a command definition works" {
+    const C = generate(App{ .name = "c", .help = "c" }, M12CmdDef);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "run", "--fast" }, &diag);
+    try std.testing.expect(v.command != null);
+    switch (v.command.?) {
+        .run => |p| try std.testing.expect(p.speed != null),
+    }
+}
+
+const M12MixedDef = .{
+    .verbose = Flag(bool){ .short = "v", .default = Default(bool){ .direct = false } },
+    .mode = Alt(.{ .a = .{ .x = Flag(u32){} }, .b = .{ .y = Flag(bool){} } }),
+    .command = Commands(.{ .go = Command(CommandMeta{ .help = "Go." }, .{}) }),
+};
+
+test "M12: Alt and Commands coexist at the root" {
+    const C = generate(App{ .name = "x", .help = "x" }, M12MixedDef);
+    const fields = @typeInfo(C.View).@"struct".fields;
+    try std.testing.expectEqualStrings("mode", fields[fields.len - 2].name);
+    try std.testing.expectEqualStrings("command", fields[fields.len - 1].name);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "-v", "--x=3", "go" }, &diag);
+    try std.testing.expect(v.verbose);
+    try std.testing.expect(v.mode != null);
+    try std.testing.expect(v.command != null);
+    switch (v.mode.?) {
+        .a => |p| try std.testing.expectEqual(@as(u32, 3), p.x),
+        .b => return error.TestUnexpectedResult,
+    }
+    switch (v.command.?) {
+        .go => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M13: truly optional flags (?Flag(T) via dap.Optional).
+// ---------------------------------------------------------------------------
+
+const M13Def = .{
+    .req = Flag([]const u8){ .short = "r" },
+    .opt_str = Optional(Flag([]const u8){ .short = "s", .validation = Validate.stringNotEmpty, .help = "Optional." }),
+    .opt_u32 = Optional(Flag(u32){ .long = "num" }),
+    .opt_bool = Optional(Flag(bool){ .long = "maybe" }),
+    .file = Argument([]const u8){},
+};
+
+const M13 = generate(App{ .name = "m13", .help = "m13" }, M13Def);
+const M13View = M13.View;
+
+test "M13: normalization marks optional specs" {
+    var seen_str = false;
+    var seen_req = false;
+    var seen_file = false;
+    inline for (M13.specs) |s| {
+        if (comptime std.mem.eql(u8, s.name, "opt_str")) {
+            seen_str = true;
+            try std.testing.expect(s.optional);
+            try std.testing.expect(!s.required);
+            try std.testing.expect(s.default == null);
+            try std.testing.expect(s.vtype == []const u8);
+        }
+        if (comptime std.mem.eql(u8, s.name, "req")) {
+            seen_req = true;
+            try std.testing.expect(!s.optional);
+            try std.testing.expect(s.required);
+        }
+        if (comptime std.mem.eql(u8, s.name, "file")) {
+            seen_file = true;
+            try std.testing.expect(!s.optional);
+            try std.testing.expect(s.required);
+        }
+    }
+    try std.testing.expect(seen_str and seen_req and seen_file);
+}
+
+test "M13: View carries optional-typed fields in order" {
+    try std.testing.expectEqual(?[]const u8, @FieldType(M13View, "opt_str"));
+    try std.testing.expectEqual(?u32, @FieldType(M13View, "opt_u32"));
+    try std.testing.expectEqual(?bool, @FieldType(M13View, "opt_bool"));
+    try std.testing.expectEqual([]const u8, @FieldType(M13View, "req"));
+    const fields = @typeInfo(M13View).@"struct".fields;
+    try std.testing.expectEqualStrings("builtin_help", fields[0].name);
+    try std.testing.expectEqualStrings("req", fields[1].name);
+    try std.testing.expectEqualStrings("opt_str", fields[2].name);
+    try std.testing.expectEqualStrings("opt_u32", fields[3].name);
+    try std.testing.expectEqualStrings("opt_bool", fields[4].name);
+    try std.testing.expectEqualStrings("file", fields[5].name);
+}
+
+fn m13Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M13View {
+    return M13.parseInner(arena.allocator(), std.process.Environ.empty, args, diag);
+}
+
+test "M13: omitted optional flags resolve to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m13Parse(&arena, &.{ "-r", "x", "f" }, &diag);
+    try std.testing.expectEqualStrings("x", v.req);
+    try std.testing.expectEqualStrings("f", v.file);
+    try std.testing.expect(v.opt_str == null);
+    try std.testing.expect(v.opt_u32 == null);
+    try std.testing.expect(v.opt_bool == null);
+}
+
+test "M13: provided optional flags decode in every form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v1 = try m13Parse(&arena, &.{ "-r", "x", "--num=7", "f" }, &diag);
+    try std.testing.expectEqual(@as(?u32, 7), v1.opt_u32);
+    const v2 = try m13Parse(&arena, &.{ "-r", "x", "-s", "hello", "f" }, &diag);
+    try std.testing.expectEqualStrings("hello", v2.opt_str.?);
+    const v3 = try m13Parse(&arena, &.{ "-r", "x", "--num", "9", "f" }, &diag);
+    try std.testing.expectEqual(@as(?u32, 9), v3.opt_u32);
+    const v4 = try m13Parse(&arena, &.{ "-r", "x", "--maybe", "f" }, &diag);
+    try std.testing.expectEqual(@as(?bool, true), v4.opt_bool);
+    const v5 = try m13Parse(&arena, &.{ "-r", "x", "--maybe=false", "f" }, &diag);
+    try std.testing.expectEqual(@as(?bool, false), v5.opt_bool);
+}
+
+test "M13: bad optional value reports InvalidWire with field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.InvalidWire, m13Parse(&arena, &.{ "-r", "x", "--num=abc", "f" }, &diag));
+    try std.testing.expectEqualStrings("opt_u32", diag.field.?);
+}
+
+test "M13: validation is skipped when the optional flag is null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m13Parse(&arena, &.{ "-r", "x", "f" }, &diag);
+    try std.testing.expect(v.opt_str == null);
+    try std.testing.expect(diag.message == null);
+}
+
+test "M13: validation runs when the optional flag is set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.InvalidValue, m13Parse(&arena, &.{ "-r", "x", "-s", "", "f" }, &diag));
+    try std.testing.expectEqualStrings("opt_str", diag.field.?);
+    if (diag.message) |m| allocatorFree(&arena, m);
+}
+
+test "M13: help marks optional flags and omits them from usage" {
+    var data = try M13.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    var found = false;
+    for (data.flag_groups) |g| {
+        for (g.flags) |o| {
+            if (std.mem.eql(u8, o.name, "num")) {
+                found = true;
+                try std.testing.expect(o.optional);
+            }
+        }
+    }
+    try std.testing.expect(found);
+
+    const Flat = generate(App{ .name = "m13", .help = "m13", .help_renderer = .{ .highlight = .{ .flat = {} } } }, M13Def);
+    const h = try Flat.helpText(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    try std.testing.expect(std.mem.indexOf(u8, h, "--num") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "--maybe") != null);
+    const usage_end = std.mem.indexOf(u8, h, "\n").?;
+    const usage = h[0..usage_end];
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--num") == null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--maybe") == null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "-r") != null);
+}
+
+test "M13: optional flags work inside groups and commands" {
+    const def = .{
+        .grp = Group(.{ .og = Optional(Flag(u32){ .long = "og" }) }, "g"),
+        .command = Commands(.{
+            .run = Command(CommandMeta{ .help = "Run." }, .{
+                .sub_opt = Optional(Flag([]const u8){ .long = "so" }),
+            }),
+        }),
+    };
+    const C = generate(App{ .name = "c", .help = "c" }, def);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{"run"}, &diag);
+    try std.testing.expect(v.og == null);
+    try std.testing.expect(v.command != null);
+    switch (v.command.?) {
+        .run => |p| try std.testing.expect(p.sub_opt == null),
+    }
+    const v2 = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "--og=5", "run", "--so", "z" }, &diag);
+    try std.testing.expectEqual(@as(?u32, 5), v2.og);
+    switch (v2.command.?) {
+        .run => |p| try std.testing.expectEqualStrings("z", p.sub_opt.?),
+    }
+}
+
+test "M13: raw optional spelling behaves identically" {
+    const def = .{
+        .raw = @as(?Flag(u16), Flag(u16){ .long = "raw" }),
+    };
+    const C = generate(App{ .name = "r", .help = "r" }, def);
+    var seen = false;
+    inline for (C.specs) |s| {
+        if (comptime std.mem.eql(u8, s.name, "raw")) {
+            seen = true;
+            try std.testing.expect(s.optional);
+        }
+    }
+    try std.testing.expect(seen);
+    try std.testing.expectEqual(?u16, @FieldType(C.View, "raw"));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{}, &diag);
+    try std.testing.expect(v.raw == null);
+    const v2 = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{"--raw=3"}, &diag);
+    try std.testing.expectEqual(@as(?u16, 3), v2.raw);
+}
+
+test "M13: Optional helper preserves the payload and rejects non-flags" {
+    const F = Flag(u8){ .short = "z" };
+    const O = Optional(F);
+    try std.testing.expect(@typeInfo(@TypeOf(O)) == .optional);
+    try std.testing.expect(@typeInfo(@TypeOf(O)).optional.child.dap_value_type == u8);
+    if (false) {
+        _ = Optional(Argument([]const u8){});
+    }
+    if (false) {
+        _ = Optional(3);
+    }
+}
+
+test "M13: optional flag with a direct default is a compile error" {
+    if (false) {
+        const Bad = .{ .x = Optional(Flag(u8){ .default = Default(u8){ .direct = 1 } }) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M13: optional flag with an env default is a compile error" {
+    if (false) {
+        const Bad = .{ .x = Optional(Flag(u8){ .default = Default(u8){ .env = "X" } }) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M13: optional argument is a compile error" {
+    if (false) {
+        const Bad = .{ .x = @as(?Argument(u8), Argument(u8){}) };
+        _ = normalize(Bad);
+    }
+}
+
+test "M13: optional flag inside an Alt branch is a compile error" {
+    if (false) {
+        const Bad = .{ .mode = Alt(.{ .a = .{ .x = Optional(Flag(u8){}) } }) };
+        _ = normalize(Bad);
+    }
 }
