@@ -69,7 +69,10 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   payload after the command token. Each command is a `dap.Command(meta, def)`
   sibling field of the parent declaration and yields one `?View` the caller
   unwraps with `if (cli.cmd) |sub| ...`; `--` disables handoff so command-like
-  literals can be passed.
+  literals can be passed. A declaration with commands also exposes an optional
+  tagged union, `CLI.command(cli)`, whose tags are the declaration field names:
+  `if (CLI.command(cli)) |cmd| switch (cmd) { ... } else { ... }`. It is
+  present only when the level declares subcommands.
 - **Exclusive groups.** An `Alt` field declares branches of mutually exclusive
   flags. A branch activates when any of its members is seen; only flags are
   allowed inside branches and defaults are forbidden. The generated field is a

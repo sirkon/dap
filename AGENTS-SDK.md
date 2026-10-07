@@ -261,6 +261,28 @@ a command field name must not collide with a flag or group-member name;
 commands nest arbitrarily. Nested commands read as
 `cli.parent.?.child.?.file`.
 
+When a declaration carries at least one command, its generated namespace also
+exposes `command(view) ?CommandPayload` — a switch-shaped alternative to
+unwrapping each `?View` field by hand. `CommandPayload` is a tagged union with
+one member per command, keyed by the **declaration field name** (not the wire
+name: a `stop` field wire-named `halt` switches as `.stop`), each payload the
+subcommand's `View`:
+
+```zig
+if (CLI.command(cli)) |cmd| switch (cmd) {
+    .start => |s| try serve(s.name),
+    .stop => try shutdown(),
+} else {
+    // root level execution (no subcommand token appeared)
+}
+```
+
+At most one command field is ever non-null (the scan hands off at most once),
+so `command` returns the single active branch or `null`. It allocates nothing
+and cannot fail. A declaration with no commands exposes neither `command` nor
+`CommandPayload` (a reference is a compile error), so the accessor is always
+safe to call where a level declares subcommands and simply absent otherwise.
+
 Flag long names and short aliases must be **globally unique across the entire
 command tree**, not merely within a level: whenever help is requested, flags
 from every ancestor level merge into the active scope (see §10.5), so a name
@@ -400,6 +422,8 @@ Generated namespace members:
 | `app_meta`                      | The `App` passed in.                                     |
 | `specs`                         | Normalized comptime spec table.                          |
 | `commands`                      | The detected command entries (slice; empty when none).   |
+| `CommandPayload`                | Tagged union of command fields; **only when subcommands exist**. |
+| `command(view) ?CommandPayload` | Wrap the active subcommand's `View`, else `null`; **only when subcommands exist**. |
 
 ---
 
@@ -784,6 +808,8 @@ These mistakes are compile errors, not runtime errors:
 - Defaults allowed only on the last argument.
 - Subcommand handoff triggers on a positional equal to a command name; `--`
   disables it.
+- `CLI.command(cli) ?CommandPayload` switches on the active subcommand (tags
+  are declaration field names); present only when the level declares commands.
 - `Alt`: one active branch max; `ConflictingAlt` otherwise; all members of the
   active branch are required.
 - Optional flags yield `?T`; defaults forbidden; validation skipped when null.

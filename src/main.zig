@@ -94,6 +94,9 @@ pub fn main(init: std.process.Init) !void {
     };
     try stdout.print("last   = {}\n", .{cli.last});
     try stdout.print("count  = {}\n", .{cli.count});
-    if (cli.command2) |c| try stdout.print("value  = {s}\n", .{c.value});
+    if (CLI.command(cli)) |cmd| switch (cmd) {
+        .command1 => try stdout.print("command = command-1\n", .{}),
+        .command2 => |c| try stdout.print("value  = {s}\n", .{c.value}),
+    };
     try stdout.flush();
 }

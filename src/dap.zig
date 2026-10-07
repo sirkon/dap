@@ -375,6 +375,20 @@ pub const CommandMeta = struct {
 /// }),
 /// // cli.parent.?.child.?.file
 /// ```
+///
+/// When a declaration carries at least one command, the generated namespace
+/// also exposes `command(view) ?CommandPayload`, a switch-shaped alternative
+/// to unwrapping each `?View` field by hand. Its tags are the declaration
+/// field names (a `stop` field wire-named `halt` switches as `.stop`):
+///
+/// ```
+/// if (CLI.command(cli)) |cmd| switch (cmd) {
+///     .start => |s| try serve(s.name),
+///     .stop => try shutdown(),
+/// } else {
+///     // root level execution
+/// }
+/// ```
 pub fn Command(comptime meta: CommandMeta, comptime def: anytype) type {
     return struct {
         pub const dap_kind: Kind = .command;
@@ -1336,7 +1350,20 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// - `pub fn helpData(allocator) !HelpData` — runtime-filled description;
 /// - `pub fn helpText(allocator) !String` — render `helpData` with the
 ///   renderer configured in `app.help_renderer.style` (`.compact` by default,
-///   or a user-provided function via `.custom`).
+///   or a user-provided function via `.custom`);
+/// - `pub const CommandPayload` and `pub fn command(view) ?CommandPayload`
+///   — present only when the declaration carries subcommands; `command`
+///   wraps the active subcommand's View into the union, `null` when none
+///   was activated:
+///
+/// ```
+/// if (CLI.command(cli)) |cmd| switch (cmd) {
+///     .start => |s| try serve(s.name),
+///     .stop => try shutdown(),
+/// } else {
+///     // root level execution
+/// }
+/// ```
 ///
 /// An `Alt` declaration contributes one `?Union` field to `View` (before any
 /// command fields), `null` until one of its branch flags is seen.
@@ -1687,7 +1714,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         break :blk buckets;
     };
 
-    return struct {
+    const Base = struct {
         pub const app_meta = app;
         pub const specs = all_specs;
         pub const commands = cmd_entries;
@@ -2151,6 +2178,34 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return error.TooManyArguments;
         }
     };
+
+    // COMMAND ACCESS (D7): the accessor pair exists only when the level
+    // declares subcommands; a commandless level returns the plain namespace.
+    if (cmd_entries.len == 0) return Base;
+
+    return struct {
+        pub const app_meta = Base.app_meta;
+        pub const specs = Base.specs;
+        pub const commands = Base.commands;
+        pub const View = Base.View;
+        pub const parse = Base.parse;
+        const parseInner = Base.parseInner;
+        const parseInnerHelp = Base.parseInnerHelp;
+        pub const helpData = Base.helpData;
+        pub const helpText = Base.helpText;
+
+        pub const CommandPayload = CommandPayloadOf(app, cmd_entries);
+
+        /// D9/D10: wrap the active subcommand's View into the optional
+        /// tagged union of this level's commands; `null` when no command
+        /// field was activated.
+        pub fn command(view: View) ?CommandPayload {
+            inline for (cmd_entries) |c| {
+                if (@field(view, c.field)) |sub| return @unionInit(CommandPayload, c.field, sub);
+            }
+            return null;
+        }
+    };
 }
 
 /// Wrapper generated for a single command. `app` carries the joined command
@@ -2170,6 +2225,33 @@ fn subApp(comptime parent: App, comptime c: CommandEntry) App {
         .i18n = c.Cmd.cmd_meta.i18n,
         .help_renderer = parent.help_renderer,
     };
+}
+
+/// D8: the optional tagged union returned by the generated `command`
+/// accessor: one member per command field, keyed by the declaration field
+/// name (not the wire name), its payload the command's generated `View` —
+/// the same type the parent `View` stores as `?View`. Synthesized only for
+/// levels that declare at least one command.
+fn CommandPayloadOf(comptime app: App, comptime cmd_entries: []const CommandEntry) type {
+    const n = cmd_entries.len;
+    const names: [n]String = blk: {
+        var a: [n]String = undefined;
+        for (cmd_entries, 0..) |c, i| a[i] = c.field;
+        break :blk a;
+    };
+    const types: [n]type = blk: {
+        var a: [n]type = undefined;
+        for (cmd_entries, 0..) |c, i| a[i] = Sub(c.Cmd, subApp(app, c)).View;
+        break :blk a;
+    };
+    const attrs: [n]std.builtin.Type.UnionField.Attributes = @splat(.{});
+    const TagInt = std.math.IntFittingRange(0, n - 1);
+    const Tag = @Enum(TagInt, .exhaustive, &names, blk: {
+        var a: [n]TagInt = undefined;
+        for (0..n) |i| a[i] = @intCast(i);
+        break :blk &a;
+    });
+    return @Union(.auto, Tag, &names, &types, &attrs);
 }
 
 /// Normalized, comptime-only description of a single flag or argument.
@@ -5526,4 +5608,113 @@ test "M14: duplicate flag across sibling commands is a compile error" {
         };
         comptime _ = generate(App{ .name = "m14", .help = "" }, Bad);
     }
+}
+
+// ---------------------------------------------------------------------------
+// M15: CLI.command, the optional tagged union of subcommands.
+// ---------------------------------------------------------------------------
+
+test "M15: command returns null when no command token appeared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const a = try m7Parse(&arena, &.{ "--needed", "v" }, &diag);
+    try std.testing.expect(M7.command(a) == null);
+}
+
+test "M15: command wraps the active sub-view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const a = try m7Parse(&arena, &.{ "--verbose", "--needed", "v", "start", "--force", "file" }, &diag);
+    switch (M7.command(a).?) {
+        .start => |s| {
+            try std.testing.expectEqualStrings("file", s.name);
+            try std.testing.expect(s.force);
+        },
+        .stop, .nested => return error.TestUnexpectedResult,
+    }
+}
+
+test "M15: command tags are declaration field names, not wire names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const a = try m7Parse(&arena, &.{ "--needed", "v", "halt" }, &diag);
+    try std.testing.expectEqual(@as(std.meta.Tag(M7.CommandPayload), .stop), std.meta.activeTag(M7.command(a).?));
+}
+
+test "M15: nested commands stay reachable through the payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const a = try m7Parse(&arena, &.{ "--needed", "v", "nested", "deep", "5" }, &diag);
+    switch (M7.command(a).?) {
+        .nested => |n| try std.testing.expectEqual(@as(u8, 5), n.deep.?.n),
+        .start, .stop => return error.TestUnexpectedResult,
+    }
+}
+
+test "M15: a single command builds a one-tag payload" {
+    const C = generate(App{ .name = "one", .help = "one" }, .{
+        .go = Command(.{ .help = "Go." }, .{ .n = Argument(u8){} }),
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "go", "5" }, &diag);
+    switch (C.command(v).?) {
+        .go => |g| try std.testing.expectEqual(@as(u8, 5), g.n),
+    }
+}
+
+test "M15: command coexists with Alt and optional flags at the root" {
+    const C = generate(App{ .name = "mixed", .help = "mixed" }, M12MixedDef);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "-v", "--x=3", "go" }, &diag);
+    try std.testing.expectEqual(@as(std.meta.Tag(C.CommandPayload), .go), std.meta.activeTag(C.command(v).?));
+    switch (v.mode.?) {
+        .a => |p| try std.testing.expectEqual(@as(u32, 3), p.x),
+        .b => return error.TestUnexpectedResult,
+    }
+}
+
+test "M15: CommandPayload members match the sub-view types" {
+    inline for (M7.commands) |c| {
+        try std.testing.expectEqual(@as(type, Sub(c.Cmd, subApp(M7.app_meta, c)).View), @FieldType(M7.CommandPayload, c.field));
+        try std.testing.expectEqual(@as(type, ?@FieldType(M7.CommandPayload, c.field)), @FieldType(M7.View, c.field));
+    }
+}
+
+test "M15: command and CommandPayload are omitted without commands" {
+    const C = generate(App{ .name = "plain", .help = "" }, .{
+        .a = Flag(u8){ .default = Default(u8){ .direct = 0 } },
+        .b = Argument([]const u8){},
+    });
+    try std.testing.expect(!@hasDecl(C, "command"));
+    try std.testing.expect(!@hasDecl(C, "CommandPayload"));
+    if (false) {
+        // enabling this must fail to compile: no member named 'command'
+        // _ = C.command;
+    }
+}
+
+test "M15: the command shell forwards the base members" {
+    try std.testing.expect(@hasDecl(M7, "command"));
+    try std.testing.expect(@hasDecl(M7, "CommandPayload"));
+    try std.testing.expect(@hasDecl(M7, "app_meta"));
+    try std.testing.expect(@hasDecl(M7, "specs"));
+    try std.testing.expect(@hasDecl(M7, "commands"));
+    try std.testing.expect(@hasDecl(M7, "View"));
+    try std.testing.expect(@hasDecl(M7, "parse"));
+    try std.testing.expect(@hasDecl(M7, "parseInner"));
+    try std.testing.expect(@hasDecl(M7, "parseInnerHelp"));
+    try std.testing.expect(@hasDecl(M7, "helpData"));
+    try std.testing.expect(@hasDecl(M7, "helpText"));
+
+    try std.testing.expect(@hasDecl(M13, "parse"));
+    try std.testing.expect(!@hasDecl(M13, "command"));
+    try std.testing.expect(!@hasDecl(M13, "CommandPayload"));
 }

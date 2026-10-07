@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (149 tests, the milestone-tagged M1–M14
+`zig test src/dap.zig` both pass (158 tests, the milestone-tagged M1–M15
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
@@ -44,12 +44,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `dedupeBuiltinHelp`, `appendActiveScopes`, `contextHelpText`) and the
   builtin-help injection helpers (`builtin_help_field`, `BuiltinHelp`,
   `MergedDecl`, `withBuiltinHelp`, `renderHelpWithStyle`) follow.
-- Then the public `generate` entry point, then the private normalization/decode
-  helpers (`Spec`, `Defaults`/`DefaultRepr`, `normalize`, `specFromField`,
+- Then the public `generate` entry point (its namespace body named `Base`, plus
+  the conditional forwarding shell that adds `CommandPayload`/`command` when
+  commands exist), then the private normalization/decode helpers (`Spec`,
+  `Defaults`/`DefaultRepr`, `normalize`, `specFromField`,
   `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `helpRequested`,
   `validateAlt`, `resolveAbsent`, the `check*` validators plus
   `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
-  `Sub`/`subApp`), then the test blocks.
+  `Sub`/`subApp`/`CommandPayloadOf`), then the test blocks.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`.
 
 ## Conventions
@@ -122,6 +124,25 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   excluded) and `checkGlobalFlagNames` rejects any long/long or short/short
   collision with both level paths in the message; sibling commands are covered
   too. This runs in `generate` right after `normalize`'s own per-level checks.
+- A level that declares commands additionally exposes a switch-shaped accessor
+  (D7–D10). Because Zig 0.16 has no `comptime if` at container scope, `generate`
+  builds its namespace under a local `Base` and, when `cmd_entries.len == 0`,
+  returns `Base` verbatim (accessor pair absent — `@hasDecl` is `false`, so a
+  reference is a "no member named 'command'" compile error). Otherwise it
+  returns a thin forwarding shell: `pub` aliases for `app_meta`, `specs`,
+  `commands`, `View`, `parse`, `helpData`, `helpText` (plus non-pub
+  `parseInner`/`parseInnerHelp`, preserving same-file visibility and the parent
+  handoff), and the `pub const CommandPayload` / `pub fn command(view)
+  ?CommandPayload` pair. `CommandPayloadOf(app, cmd_entries)` (beside
+  `Sub`/`subApp`) synthesizes the union with the same `@Enum`/`@Union(.auto,
+  ...)` machinery `Alt` uses: one member per `CommandEntry`, tag = `c.field`
+  (declaration field name, not the wire name), payload = `Sub(c.Cmd,
+  subApp(app, c)).View`, the exact expression the `View` field type uses, so
+  identities match bit-for-bit. `command` is infallible and allocation-free: it
+  `inline for`s the command fields and `@unionInit`s the first non-null one
+  (the single handoff guarantees at most one is set), returning `null` when
+  none was activated. Zero commands never synthesize the union (a zero-field
+  `@Union` is illegal); one command uses `std.math.IntFittingRange(0, 0)`.
 - A `-h, --help` bool flag is injected as `.builtin_help` at index 0 of every
   declaration before normalization (`BuiltinHelp` / `withBuiltinHelp`), so it
   appears first in `View` and in the flags section. It carries
