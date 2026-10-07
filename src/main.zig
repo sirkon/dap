@@ -98,5 +98,9 @@ pub fn main(init: std.process.Init) !void {
         .command1 => try stdout.print("command = command-1\n", .{}),
         .command2 => |c| try stdout.print("value  = {s}\n", .{c.value}),
     };
+
+    std.debug.print("checkpoint\n", .{});
+    try CLI.usage(cli);
+
     try stdout.flush();
 }

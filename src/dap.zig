@@ -1873,6 +1873,27 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return try helpTextWithStyle(allocator);
         }
 
+        /// Print the context-sensitive help of a parsed `View` to stdout: the
+        /// same text the builtin `-h`/`--help` intercept would print for the
+        /// command chain activated in `view`. Rendering allocations use an
+        /// internal allocator and are freed before returning; only a write to
+        /// stdout is ignored, matching the parse intercept.
+        ///
+        /// ```
+        /// const cli = try CLI.parse(arena.allocator(), environ, args, &diag);
+        /// try CLI.usage(cli);
+        /// ```
+        pub fn usage(v: View) std.mem.Allocator.Error!void {
+            const allocator = std.heap.page_allocator;
+            const text = try contextHelpText(@This(), allocator, &v);
+            defer allocator.free(text);
+            var stdout_buffer: [0x1000]u8 = undefined;
+            const stdout_file = std.Io.File.stdout();
+            var stdout_writer = stdout_file.writer(std.Options.debug_io, &stdout_buffer);
+            stdout_writer.interface.print("{s}\n", .{text}) catch {};
+            stdout_writer.interface.flush() catch {};
+        }
+
         /// Render one flag entry into `HelpData`, duplicating every string.
         fn fillFlag(allocator: std.mem.Allocator, comptime s: Spec) std.mem.Allocator.Error!HelpData.Flag {
             const oname = try allocator.dupe(u8, s.long);
@@ -2193,6 +2214,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         const parseInnerHelp = Base.parseInnerHelp;
         pub const helpData = Base.helpData;
         pub const helpText = Base.helpText;
+        pub const usage = Base.usage;
 
         pub const CommandPayload = CommandPayloadOf(app, cmd_entries);
 
@@ -5574,6 +5596,13 @@ test "M14: merged help frees everything when an allocation fails" {
         }
         try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
     }
+}
+
+test "M14: generated namespace exposes usage" {
+    // Not invoked: writing to stdout in a test can hang the runner. Only the
+    // declaration is checked here; `zig build run` exercises the printing.
+    try std.testing.expect(@hasDecl(M14, "usage"));
+    comptime try std.testing.expect(@TypeOf(M14.usage) == fn (M14.View) std.mem.Allocator.Error!void);
 }
 
 test "M14: duplicate long flag across levels is a compile error" {
