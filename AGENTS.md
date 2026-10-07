@@ -10,11 +10,11 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (134 tests, the milestone-tagged M1–M13
+`zig test src/dap.zig` both pass (149 tests, the milestone-tagged M1–M14
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
-  `Enumeration`, `Commands`, `Command`, `Alt`, runtime help (`HelpData` +
+  `Enumeration`, `Command`, `Alt`, runtime help (`HelpData` +
   `renderHelpWithStyle`/`renderCompact`), `DecodeError`/`ParseError`, `Diag`,
   and the test suite.
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
@@ -32,18 +32,24 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
 - `src/dap.zig` — core implementation. Public data types (`Kind`,
   `HelpRendererStyle`, `HelpRendererHighlight`, `App`, `HelpHighlight`,
   `String`, `Default(T)`, `defaultValue`, `Flag(T)`, `Optional`, `Group`,
-  `Argument(T)`, `Enumeration`, `Enum`, `Commands`, `CommandMeta`, `Command`,
+  `Argument(T)`, `Enumeration`, `Enum`, `CommandMeta`, `Command`,
   `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`, `Diag`,
   `HelpData`) come first.
 - The private compact-help scaffolding (`HelpStyle`, `HelpSegment`, `HelpRow`,
   `HelpSection`, `helpStyleCode`, `helpSegmentsWidth`, the `appendHelpStyled`/
-  `appendHelpSegments`/`appendFlagUsage` family, `upperDup`) and the
+  `appendHelpSegments`/`appendFlagUsage` family, `upperDup`), the file-private
+  `HelpData` free helpers (`freeFlag`/`freeFlags`/`freeFlagGroups`/
+  `freeArguments`/`freeArgGroups`/`freeCommands`), the scope-merge family
+  (`emptyHelpData`, `sameGroupName`, `absorbScope`, `isBuiltinHelp`,
+  `dedupeBuiltinHelp`, `appendActiveScopes`, `contextHelpText`) and the
   builtin-help injection helpers (`builtin_help_field`, `BuiltinHelp`,
   `MergedDecl`, `withBuiltinHelp`, `renderHelpWithStyle`) follow.
 - Then the public `generate` entry point, then the private normalization/decode
   helpers (`Spec`, `Defaults`/`DefaultRepr`, `normalize`, `specFromField`,
-  `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `validateAlt`,
-  `resolveAbsent`, the `check*` validators), then the test blocks.
+  `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `helpRequested`,
+  `validateAlt`, `resolveAbsent`, the `check*` validators plus
+  `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
+  `Sub`/`subApp`), then the test blocks.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`.
 
 ## Conventions
@@ -86,13 +92,36 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
 - `Alt(.{...})` declares exclusive branches of flags (`VariantNamed` overrides
   a branch tag). `normalize` flattens each branch into the parent spec list with
   `Spec.group = tag`, `Spec.alt`/`Spec.alt_branch` set; `generate` appends one
-  `?AT.Union` field per Alt before the trailing `Commands` field. Parsing tracks
+  `?AT.Union` field per Alt before the command fields. Parsing tracks
   activation in `assignValue` (materializing the union on first touch,
   `ConflictingAlt` on a second branch) and `validateAlt` runs in Phase 1.5;
   Alt members are skipped by the flat POST-PASS/VALIDATE phases, and `Alt`
   itself already rejects zero branches, duplicate tags, non-flag members,
   defaulted members, and optional members at comptime. `checkGroupDefs`
   rejects an Alt tag colliding with a `Group` name.
+- Subcommands are sibling `Command(meta, def)` fields. `normalize` collects
+  them via the `.command` `dap_kind` dispatch into `NormResult.commands`, a
+  slice of `CommandEntry` (`field` = declaration/View field, `name` =
+  `cmd_meta.name orelse field`, `Cmd` = the `Command(...)` type). `Sub(c.Cmd,
+  subApp(app, c))` generates each sub-namespace: `subApp` builds the child
+  `App` from the parent's path anchor (`App.name ++ " " ++ c.name`, wire
+  names), the command's `CommandMeta` help/i18n, and the parent's renderer, so
+  every level knows its full usage path. `generate` appends one
+  `?Sub(c.Cmd, subApp(app, c)).View` field per command after the Alt fields;
+  parsing hands off to `Sub(...).parseInnerHelp` and assigns the sub-View
+  directly (no tagged union). Duplicate command wire names at a level and
+  command-field names colliding with a spec are compile errors
+  (`checkCommandNames` / `checkCommandFieldNames`); mixing commands with
+  positional arguments in one declaration is also rejected
+  (`checkCommandArgumentMix`), since a command token hands off the rest of the
+  wire and a parent positional could never be filled; a level with no command
+  fields simply has none. Flag long names and short aliases must be *globally*
+  unique across the whole command tree (not just per level):
+  `collectFlagOrigins` recursively re-`normalize`s each level's subtree (group
+  and Alt members included, the injected builtin and positional arguments
+  excluded) and `checkGlobalFlagNames` rejects any long/long or short/short
+  collision with both level paths in the message; sibling commands are covered
+  too. This runs in `generate` right after `normalize`'s own per-level checks.
 - A `-h, --help` bool flag is injected as `.builtin_help` at index 0 of every
   declaration before normalization (`BuiltinHelp` / `withBuiltinHelp`), so it
   appears first in `View` and in the flags section. It carries
@@ -108,6 +137,18 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `renderCompact` renders a kong-style two-column layout inline, applying the
   scheme after all column widths have been measured on the raw text. Nothing
   help-related runs unless one of those is called.
+- Help is *context-sensitive*. A `-h`/`--help` anywhere in the active command
+  chain is detected by `helpRequested` (a comptime walk of the View command
+  fields); `parseInnerHelp` carries an `ancestor_help` flag through the handoff
+  so a help token before the commands is honoured too, and Phase 2 of every
+  `parseInner` early-returns on it, bypassing all required checks and
+  validations. `contextHelpText` then builds one `HelpData` per active level
+  (root first) via `appendActiveScopes`, folds them with `absorbScope` (flag
+  groups merge by name with move semantics, `usage_alts` append, and arg
+  groups/commands/info/name come from the deepest scope so the usage header
+  reads `app svc build`), dedupes the repeated injected builtin via
+  `dedupeBuiltinHelp`, and renders once. Root-scope help is byte-identical to
+  the pre-merge path; failure help (`printFailureExit`) stays root-scoped.
 - Ordering inside `src/dap.zig`: public data types first, then private
   help/builtin scaffolding, then the public `generate` entry point, then
   private normalization/decode helpers, then tests.

@@ -66,14 +66,20 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   validation skips a `null` value.
 - **Subcommand handoff.** A positional token equal to a registered command name
   terminates the current parse and calls that subcommand's `parse` with the
-  payload after the command token. The result is a `?Union` the caller switches
-  over manually; `--` disables handoff so command-like literals can be passed.
+  payload after the command token. Each command is a `dap.Command(meta, def)`
+  sibling field of the parent declaration and yields one `?View` the caller
+  unwraps with `if (cli.cmd) |sub| ...`; `--` disables handoff so command-like
+  literals can be passed.
 - **Exclusive groups.** An `Alt` field declares branches of mutually exclusive
   flags. A branch activates when any of its members is seen; only flags are
   allowed inside branches and defaults are forbidden. The generated field is a
   `?Union` (`null` when no branch was seen); passing flags from two branches of
   the same `Alt` is a `ConflictingAlt` parse error. Each branch becomes a help
   group named after its field or its `VariantNamed` override.
+- **Global flag uniqueness.** Flag long names and short aliases must be unique
+  across the *entire* command tree (siblings included), not merely within a
+  level. Deep help merges flags from every ancestor, so a reused name would be
+  ambiguous; a collision is a compile error naming both level paths.
 - **Ownership.** Strings stored in the `View` are allocated with the parser's
   allocator; an arena is the intended lifetime. `Diag.deinit` frees only the
   diagnostic `message`.
@@ -153,6 +159,25 @@ Usage: dap-example (--file=FILE | --url=URL) <string> [flags]
 `HelpData` exposes this structure directly as `usage_alts`, a slice of
 `HelpData.Usage` (one per `Alt`), each holding its branches as slices of
 `HelpData.Flag` referencing the entries also present in `flag_groups`.
+
+Help is **context-sensitive**: after one or more subcommands, `-h`/`--help`
+describes the deepest active command. The usage header reconstructs the command
+path, arguments and next-level subcommands come from that deepest scope, and
+flags are merged from every ancestor level. `Group`/`Alt` groups sharing a name
+across levels merge into one block, and the injected `-h, --help` appears once.
+
+```text
+$ app command-2 info -h
+Usage: app command-2 info --required=REQUIRED [--flag] [flags]
+
+Info about command 2.
+
+Flags:
+  -h, --help                 Show context-sensitive help.
+      --required=REQUIRED    Mandatory value.
+      --value=               Command 2 value.
+      --details=             Info details.
+```
 
 Highlighting follows `App.help_renderer.highlight` (`HelpRendererHighlight`):
 `flat` emits plain text, `bold` (the default) and `color` apply the matching

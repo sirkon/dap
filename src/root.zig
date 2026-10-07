@@ -16,7 +16,6 @@ pub const Enum = @import("dap.zig").Enum;
 pub const Enumeration = @import("dap.zig").Enumeration;
 pub const CommandMeta = @import("dap.zig").CommandMeta;
 pub const Command = @import("dap.zig").Command;
-pub const Commands = @import("dap.zig").Commands;
 pub const Validate = @import("dap.zig").Validate;
 pub const DecodeError = @import("dap.zig").DecodeError;
 pub const ParseError = @import("dap.zig").ParseError;

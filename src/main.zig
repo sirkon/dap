@@ -35,10 +35,28 @@ const def = .{
         .short = "f",
         .help = "Flag to show off in the usage header.",
     },
-    .target = dap.Argument([]const u8){
-        .name = "string",
-        .help = "The target string.",
-    },
+    .command1 = dap.Command(
+        .{ .name = "command-1", .help = "Command 1." },
+        .{},
+    ),
+    .command2 = dap.Command(
+        .{ .name = "command-2", .help = "Command 2." },
+        .{
+            .value = dap.Flag(dap.String){
+                .default = dap.defaultValue(dap.String, ""),
+                .help = "Command 2 value.",
+            },
+            .info = dap.Command(
+                .{ .help = "Info about command 2." },
+                .{
+                    .details = dap.Flag(dap.String){
+                        .default = dap.defaultValue(dap.String, ""),
+                        .help = "Info details.",
+                    },
+                },
+            ),
+        },
+    ),
 };
 
 const CLI = dap.generate(
@@ -76,6 +94,6 @@ pub fn main(init: std.process.Init) !void {
     };
     try stdout.print("last   = {}\n", .{cli.last});
     try stdout.print("count  = {}\n", .{cli.count});
-    try stdout.print("string = {s}\n", .{cli.target});
+    if (cli.command2) |c| try stdout.print("value  = {s}\n", .{c.value});
     try stdout.flush();
 }
