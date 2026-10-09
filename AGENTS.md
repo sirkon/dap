@@ -90,7 +90,11 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `HelpData.Flag.optional` marks them and `renderCompact` omits them from the
   usage clause.
 - Wire names are verbatim field names (`dry_run` → `--dry_run`); a dash-spelled
-  name requires an explicit `.long`.
+  name requires an explicit `.long`. Declaration field names must not start
+  with `_`: `_` is reserved for the command `View` fields. The check is
+  `checkNoUnderscoreFields`, run first thing in `normalize` over the raw
+  declaration (the first processing stage, no context), and again in
+  `specFromField` so group and `Alt` members are covered.
 - `Alt(.{...})` declares exclusive branches of flags (`VariantNamed` overrides
   a branch tag). `normalize` flattens each branch into the parent spec list with
   `Spec.group = tag`, `Spec.alt`/`Spec.alt_branch` set; `generate` appends one
@@ -103,27 +107,29 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   rejects an Alt tag colliding with a `Group` name.
 - Subcommands are sibling `Command(meta, def)` fields. `normalize` collects
   them via the `.command` `dap_kind` dispatch into `NormResult.commands`, a
-  slice of `CommandEntry` (`field` = declaration/View field, `name` =
-  `cmd_meta.name orelse field`, `Cmd` = the `Command(...)` type). `Sub(c.Cmd,
-  subApp(app, c))` generates each sub-namespace: `subApp` builds the child
-  `App` from the parent's path anchor (`App.name ++ " " ++ c.name`, wire
-  names), the command's `CommandMeta` help/i18n, and the parent's renderer, so
-  every level knows its full usage path. `generate` appends one
-  `?Sub(c.Cmd, subApp(app, c)).View` field per command after the Alt fields;
-  parsing hands off to `Sub(...).parseInnerHelp` and assigns the sub-View
-  directly (no tagged union). Duplicate command wire names at a level and
-  command-field names colliding with a spec are compile errors
-  (`checkCommandNames` / `checkCommandFieldNames`); mixing commands with
-  positional arguments in one declaration is also rejected
-  (`checkCommandArgumentMix`), since a command token hands off the rest of the
-  wire and a parent positional could never be filled; a level with no command
-  fields simply has none. Flag long names and short aliases must be *globally*
-  unique across the whole command tree (not just per level):
-  `collectFlagOrigins` recursively re-`normalize`s each level's subtree (group
-  and Alt members included, the injected builtin and positional arguments
-  excluded) and `checkGlobalFlagNames` rejects any long/long or short/short
-  collision with both level paths in the message; sibling commands are covered
-  too. This runs in `generate` right after `normalize`'s own per-level checks.
+  slice of `CommandEntry` (`field` = declaration field name, the union tag;
+  `view_field` = that name prefixed with `_`, the field the `View` stores the
+  sub-view under; `name` = `cmd_meta.name orelse field`; `Cmd` = the
+  `Command(...)` type). `Sub(c.Cmd, subApp(app, c))` generates each
+  sub-namespace: `subApp` builds the child `App` from the parent's path anchor
+  (`App.name ++ " " ++ c.name`, wire names), the command's `CommandMeta`
+  help/i18n, and the parent's renderer, so every level knows its full usage
+  path. `generate` appends one `?Sub(c.Cmd, subApp(app, c)).View` field per
+  command after the Alt fields, named `c.view_field`; parsing hands off to
+  `Sub(...).parseInnerHelp` and assigns the sub-View directly (no tagged
+  union). Duplicate command wire names at a level and command-field names
+  colliding with a spec are compile errors (`checkCommandNames` /
+  `checkCommandFieldNames`); mixing commands with positional arguments in one
+  declaration is also rejected (`checkCommandArgumentMix`), since a command
+  token hands off the rest of the wire and a parent positional could never be
+  filled; a level with no command fields simply has none. Flag long names and
+  short aliases must be *globally* unique across the whole command tree (not
+  just per level): `collectFlagOrigins` recursively re-`normalize`s each
+  level's subtree (group and Alt members included, the injected builtin and
+  positional arguments excluded) and `checkGlobalFlagNames` rejects any
+  long/long or short/short collision with both level paths in the message;
+  sibling commands are covered too. This runs in `generate` right after
+  `normalize`'s own per-level checks.
 - A level that declares commands additionally exposes a switch-shaped accessor
   (D7–D10). Because Zig 0.16 has no `comptime if` at container scope, `generate`
   builds its namespace under a local `Base` and, when `cmd_entries.len == 0`,
@@ -136,10 +142,11 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   ?CommandPayload` pair. `CommandPayloadOf(app, cmd_entries)` (beside
   `Sub`/`subApp`) synthesizes the union with the same `@Enum`/`@Union(.auto,
   ...)` machinery `Alt` uses: one member per `CommandEntry`, tag = `c.field`
-  (declaration field name, not the wire name), payload = `Sub(c.Cmd,
-  subApp(app, c)).View`, the exact expression the `View` field type uses, so
-  identities match bit-for-bit. `command` is infallible and allocation-free: it
-  `inline for`s the command fields and `@unionInit`s the first non-null one
+  (plain declaration field name, neither the wire name nor the `_`-prefixed
+  `View` field), payload = `Sub(c.Cmd, subApp(app, c)).View`, the exact
+  expression the `View` field type uses, so identities match bit-for-bit.
+  `command` is infallible and allocation-free: it `inline for`s the command
+  fields (reading `c.view_field`), and `@unionInit`s the first non-null one
   (the single handoff guarantees at most one is set), returning `null` when
   none was activated. Zero commands never synthesize the union (a zero-field
   `@Union` is illegal); one command uses `std.math.IntFittingRange(0, 0)`.

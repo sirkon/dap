@@ -51,7 +51,9 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   from index `0` and never skips a token. Pass the arguments with the binary
   name already removed (`os.argv[1..]`).
 - **Verbatim names.** Field names are wire names verbatim (`dry_run` ->
-  `--dry_run`). A dash-spelled name requires an explicit `.long`.
+  `--dry_run`). A dash-spelled name requires an explicit `.long`. A declaration
+  field name must not start with `_`; the leading underscore is reserved for
+  the `_`-prefixed command fields the `View` carries.
 - **Derived `required`.** A flag or argument is required iff it has no
   default. Boolean flags are the exception: they are always optional (an
   omitted bool flag is `false`), a `true` default is a compile error (use a
@@ -67,12 +69,12 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
 - **Subcommand handoff.** A positional token equal to a registered command name
   terminates the current parse and calls that subcommand's `parse` with the
   payload after the command token. Each command is a `dap.Command(meta, def)`
-  sibling field of the parent declaration and yields one `?View` the caller
-  unwraps with `if (cli.cmd) |sub| ...`; `--` disables handoff so command-like
-  literals can be passed. A declaration with commands also exposes an optional
-  tagged union, `CLI.command(cli)`, whose tags are the declaration field names:
-  `if (CLI.command(cli)) |cmd| switch (cmd) { ... } else { ... }`. It is
-  present only when the level declares subcommands.
+  sibling field of the parent declaration; in the `View` the parsed sub-view
+  is stored under a `_`-prefixed field (`_cmd`). Reach the active command
+  through the optional tagged union `CLI.command(cli)`, whose tags are the
+  plain declaration field names (no `_`): `if (CLI.command(cli)) |cmd| switch
+  (cmd) { ... } else { ... }`. It is present only when the level declares
+  subcommands; `--` disables handoff so command-like literals can be passed.
 - **Exclusive groups.** An `Alt` field declares branches of mutually exclusive
   flags. A branch activates when any of its members is seen; only flags are
   allowed inside branches and defaults are forbidden. The generated field is a

@@ -103,16 +103,19 @@ The declaration is an **anonymous struct literal**. Each field is one of:
 | `dap.Argument(T){...}` | argument   | `T` (or `?T` only if declared optional) |
 | `dap.Group(def, name)` | group      | its members, flattened                  |
 | `dap.Alt(.{...})`      | alt        | `?Union` (one per Alt)                  |
-| `dap.Command(meta, def)` | command  | `?View` (one per command field)         |
+| `dap.Command(meta, def)` | command  | `?View` under a `_`-prefixed name (`_cmd`) |
 
 Order matters: `View` fields appear in declaration order, with the injected
 `builtin_help: bool` first (§6), then the `Alt` unions and the per-command
-sub-`View`s.
+sub-`View`s. Declaration field names must not start with `_`; that prefix is
+reserved for the command `View` fields.
 
 ### 3.1 Flag names
 
 Field names are **wire names verbatim** (`dry_run` → `--dry_run`). A
-dash-spelled wire name requires an explicit `.long`:
+dash-spelled wire name requires an explicit `.long`. A field name must not
+begin with `_`: that prefix is reserved for the `_`-prefixed command fields
+the `View` carries (§3.7, §5).
 
 ```zig
 .dry_run = dap.Flag(bool){ .long = "dry-run" },   // -> --dry-run
@@ -246,12 +249,15 @@ pub const CommandMeta = struct {
 
 The first argument is typed `CommandMeta`, so an anonymous struct literal
 coerces. Each command field contributes one `?View` field to the parent
-`View`, named after the declaration field, `null` unless the command's wire
-name (`.name` orelse the field name) appears:
+`View`, stored under the declaration field name prefixed with `_` (`_start`),
+`null` unless the command's wire name (`.name` orelse the field name) appears.
+This raw `_`-prefixed field is how the parsed sub-view is carried; declaration
+field names must not themselves begin with `_` (that prefix is reserved, §13),
+and consumers normally reach the active command through `command` below:
 
 ```zig
-if (cli.start) |s| try serve(s.name);
-if (cli.stop) |_| try shutdown();
+// View field: cli._start, cli._stop
+if (cli._start) |s| try serve(s.name);
 ```
 
 Handoff: a positional token equal to a registered command name terminates the
@@ -259,14 +265,14 @@ current parse and invokes that subcommand's parse on the remaining tokens
 (again from its own index 0). Command names must be unique within a level and
 a command field name must not collide with a flag or group-member name;
 commands nest arbitrarily. Nested commands read as
-`cli.parent.?.child.?.file`.
+`cli._parent.?._child.?.file`.
 
 When a declaration carries at least one command, its generated namespace also
-exposes `command(view) ?CommandPayload` — a switch-shaped alternative to
-unwrapping each `?View` field by hand. `CommandPayload` is a tagged union with
-one member per command, keyed by the **declaration field name** (not the wire
-name: a `stop` field wire-named `halt` switches as `.stop`), each payload the
-subcommand's `View`:
+exposes `command(view) ?CommandPayload` — the official, switch-shaped way to
+reach the active command. `CommandPayload` is a tagged union with one member
+per command, keyed by the **plain declaration field name** (neither the wire
+name, nor the `_`-prefixed `View` field: a `stop` field stored as `_stop` and
+wire-named `halt` switches as `.stop`), each payload the subcommand's `View`:
 
 ```zig
 if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -389,7 +395,9 @@ degenerate: it yields a type with `decode`/`encode` only (no `view`,
 - `builtin_help: bool` first (the injected `-h, --help`, §6);
 - one field per spec, in declaration order;
 - one `?Union` field per `Alt` and one `?View` field per command, after the
-  specs.
+  specs. A command's `View` field carries a `_` prefix (`_stop`); the plain
+  name is the tag of the `command` union (§3.7). Declaration field names must
+  not begin with `_`.
 
 `CLI.parse`:
 
@@ -774,6 +782,8 @@ These mistakes are compile errors, not runtime errors:
 
 - A declaration field that is not a `Flag`, `Argument`, `Group`, `Alt`,
   or `Command`.
+- A declaration field whose name starts with `_` (the prefix is reserved for
+  the `_`-prefixed command fields the `View` carries; §3.7, §5).
 - Duplicate long flag names, duplicate short flag names, duplicate field names.
 - **Duplicate flag names across levels**: because flags of every ancestor level
   merge into a deep help scope, long names and short aliases must be globally
@@ -801,7 +811,9 @@ These mistakes are compile errors, not runtime errors:
 ## 14. Semantics cheat sheet
 
 - Every `parse` is pure payload: no token is skipped, at any nesting level.
-- Field names are wire names verbatim; dashes need explicit `.long`.
+- Field names are wire names verbatim; dashes need explicit `.long`. Field
+  names must not start with `_` (reserved for the `_`-prefixed command
+  `View` fields).
 - `required` is derived: required ⇔ no default (bools excepted: always
   optional, default `false`).
 - Precedence: wire > env > direct default > zero value.
@@ -809,7 +821,8 @@ These mistakes are compile errors, not runtime errors:
 - Subcommand handoff triggers on a positional equal to a command name; `--`
   disables it.
 - `CLI.command(cli) ?CommandPayload` switches on the active subcommand (tags
-  are declaration field names); present only when the level declares commands.
+  are the plain declaration field names; the `View` stores it `_`-prefixed);
+  present only when the level declares commands.
 - `Alt`: one active branch max; `ConflictingAlt` otherwise; all members of the
   active branch are required.
 - Optional flags yield `?T`; defaults forbidden; validation skipped when null.

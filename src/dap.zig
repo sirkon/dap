@@ -363,9 +363,12 @@ pub const CommandMeta = struct {
 /// ```
 ///
 /// Each command field contributes one `?View` field to the parent `View`,
-/// named after the declaration field, `null` unless that command's wire name
-/// (`.name` orelse the field name) appears. Consume it with
-/// `if (cli.start) |sub| ...`. Nested commands nest:
+/// stored under the declaration field name prefixed with `_` (`_start`),
+/// `null` unless that command's wire name (`.name` orelse the field name)
+/// appears. This is how the parsed sub-view is carried, but it is an
+/// implementation detail: a declaration field name must not begin with `_`,
+/// and consumers reach commands through the namespace's `command` accessor
+/// (below). Nested commands nest:
 ///
 /// ```
 /// .parent = dap.Command(.{ .name = "parent" }, .{
@@ -373,13 +376,15 @@ pub const CommandMeta = struct {
 ///         .file = dap.Argument(dap.String){},
 ///     }),
 /// }),
-/// // cli.parent.?.child.?.file
+/// // cli._parent.?.file through the View, or the `command` union below
 /// ```
 ///
 /// When a declaration carries at least one command, the generated namespace
-/// also exposes `command(view) ?CommandPayload`, a switch-shaped alternative
-/// to unwrapping each `?View` field by hand. Its tags are the declaration
-/// field names (a `stop` field wire-named `halt` switches as `.stop`):
+/// also exposes `command(view) ?CommandPayload`, the official way to reach
+/// the active command: it wraps the single non-null `?View` into a tagged
+/// union, `null` when no command token appeared. Its tags are the plain
+/// declaration field names, without the `_` prefix the `View` uses (a `stop`
+/// field wire-named `halt` switches as `.stop`):
 ///
 /// ```
 /// if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -1299,7 +1304,7 @@ fn appendActiveScopes(
     v: anytype,
 ) std.mem.Allocator.Error!void {
     inline for (NS.commands) |c| {
-        if (@field(v, c.field)) |sub| {
+        if (@field(v, c.view_field)) |sub| {
             const S = Sub(c.Cmd, subApp(NS.app_meta, c));
             const scope = try S.helpData(allocator);
             scopes.append(allocator, scope) catch |e| {
@@ -1344,7 +1349,7 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// - `pub const View` — the strongly-typed view, a struct with one field per
 ///   declaration field (in declaration order, with the injected
 ///   `builtin_help: bool` first), one `?Union` per `Alt` field, and one
-///   `?View` per command field;
+///   `?View` per command field under a `_`-prefixed name (`_stop`);
 /// - `pub fn parse(allocator, environ, args, diag) ParseError!View`;
 /// - `app_meta`, `specs`, `commands` metadata;
 /// - `pub fn helpData(allocator) !HelpData` — runtime-filled description;
@@ -1354,7 +1359,8 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// - `pub const CommandPayload` and `pub fn command(view) ?CommandPayload`
 ///   — present only when the declaration carries subcommands; `command`
 ///   wraps the active subcommand's View into the union, `null` when none
-///   was activated:
+///   was activated. The union tags are the plain declaration field names,
+///   without the `_` prefix the `View` uses:
 ///
 /// ```
 /// if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -1433,13 +1439,17 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// `View` is a plain struct (`cli.login`, `cli.path`, ...) whose strings are
 /// allocated with the passed allocator. No name transformation is applied:
 /// field names are wire names verbatim (`dry_run` → `--dry_run`), and a
-/// dash-spelled name requires an explicit `.long`.
+/// dash-spelled name requires an explicit `.long`. A declaration field name
+/// must not start with `_`: the leading underscore is reserved for the
+/// `_`-prefixed command fields the `View` carries.
 ///
 /// A command field hands parsing off to the matching subcommand. The token
 /// equal to a registered command name terminates the current parse and the
 /// subcommand's `parse` receives `args[command_index + 1 ..]`, again starting
-/// at its own index `0`. Each command's result is a `?View` field the consumer
-/// unwraps manually; when no command token appears the field is `null`:
+/// at its own index `0`. Each command's result is a `?View` field of `View`,
+/// stored under the declaration field name prefixed with `_` (`_start`);
+/// when no command token appears the field is `null`. Reach commands through
+/// the namespace's `command` accessor rather than the raw `_`-prefixed field:
 ///
 /// ```
 /// const def = .{
@@ -1455,8 +1465,10 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 ///
 /// const CLI = dap.generate(dap.App{ .name = "svc", .help = "Service." }, def);
 /// var cli = try CLI.parse(allocator, environ, args, &diag);
-/// if (cli.start) |s| try serve(s.name);
-/// if (cli.stop) |_| try shutdown();
+/// if (CLI.command(cli)) |cmd| switch (cmd) {
+///     .start => |s| try serve(s.name),
+///     .stop => try shutdown(),
+/// };
 /// ```
 ///
 /// An `Alt` field declares exclusive groups of parameters: a branch becomes
@@ -1614,7 +1626,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         var names: []const String = &.{};
         for (all_specs) |s| names = names ++ &[_]String{s.name};
         for (alts) |a| names = names ++ &[_]String{a.field};
-        for (cmd_entries) |c| names = names ++ &[_]String{c.field};
+        for (cmd_entries) |c| names = names ++ &[_]String{c.view_field};
         break :blk names;
     };
     const field_types = blk: {
@@ -2018,7 +2030,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // a branch is materialized only when one of its members is seen.
             v.builtin_help = false;
             inline for (alts) |a| @field(v, a.field) = null;
-            inline for (cmd_entries) |c| @field(v, c.field) = null;
+            inline for (cmd_entries) |c| @field(v, c.view_field) = null;
 
             // Phase 1: SCAN
             var i: usize = 0;
@@ -2053,7 +2065,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                         inline for (cmd_entries) |c| {
                             if (std.mem.eql(u8, c.name, tok)) {
                                 const S = Sub(c.Cmd, subApp(app, c));
-                                @field(v, c.field) = try S.parseInnerHelp(allocator, environ, args[i + 1 ..], diag, help_seen);
+                                @field(v, c.view_field) = try S.parseInnerHelp(allocator, environ, args[i + 1 ..], diag, help_seen);
                                 handed_off = true;
                                 matched = true;
                             }
@@ -2223,7 +2235,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// field was activated.
         pub fn command(view: View) ?CommandPayload {
             inline for (cmd_entries) |c| {
-                if (@field(view, c.field)) |sub| return @unionInit(CommandPayload, c.field, sub);
+                if (@field(view, c.view_field)) |sub| return @unionInit(CommandPayload, c.field, sub);
             }
             return null;
         }
@@ -2250,10 +2262,11 @@ fn subApp(comptime parent: App, comptime c: CommandEntry) App {
 }
 
 /// D8: the optional tagged union returned by the generated `command`
-/// accessor: one member per command field, keyed by the declaration field
-/// name (not the wire name), its payload the command's generated `View` —
-/// the same type the parent `View` stores as `?View`. Synthesized only for
-/// levels that declare at least one command.
+/// accessor: one member per command field, keyed by the plain declaration
+/// field name (not the wire name nor the `_`-prefixed `View` field), its
+/// payload the command's generated `View` — the same type the parent `View`
+/// stores as `?View`. Synthesized only for levels that declare at least one
+/// command.
 fn CommandPayloadOf(comptime app: App, comptime cmd_entries: []const CommandEntry) type {
     const n = cmd_entries.len;
     const names: [n]String = blk: {
@@ -2310,11 +2323,13 @@ const DefaultRepr = struct {
 };
 
 /// A single command declaration found at a given level. `field` is the
-/// declaration (and View) field name; `name` is the wire name
-/// (`cmd_meta.name orelse field`); `Cmd` is the type returned by
-/// `Command(...)`.
+/// declaration field name (the `command` union tag); `view_field` is that
+/// name prefixed with `_`, the field the parent `View` stores the sub-view
+/// under; `name` is the wire name (`cmd_meta.name orelse field`); `Cmd` is
+/// the type returned by `Command(...)`.
 const CommandEntry = struct {
     field: String,
+    view_field: String,
     name: String,
     Cmd: type,
 };
@@ -2541,7 +2556,7 @@ fn assignValue(
 fn helpRequested(comptime NS: type, v: anytype) bool {
     if (v.builtin_help) return true;
     inline for (NS.commands) |c| {
-        if (@field(v, c.field)) |sub| {
+        if (@field(v, c.view_field)) |sub| {
             if (helpRequested(Sub(c.Cmd, subApp(NS.app_meta, c)), &sub)) return true;
         }
     }
@@ -2633,6 +2648,9 @@ fn resolveAbsent(
 }
 
 fn specFromField(comptime f: std.builtin.Type.StructField) Spec {
+    if (std.mem.startsWith(u8, f.name, "_")) {
+        @compileError("declaration field name '" ++ f.name ++ "' must not start with '_'");
+    }
     const Raw = f.type;
     const is_opt = @typeInfo(Raw) == .optional;
     const T = if (is_opt) @typeInfo(Raw).optional.child else Raw;
@@ -2745,6 +2763,22 @@ fn altSpecs(comptime AT: type, comptime field_name: String) []const Spec {
         }
     }
     return out;
+}
+
+/// Reject declaration fields whose names start with `_`. The leading
+/// underscore is reserved: command fields are surfaced in the `View` under a
+/// `_`-prefixed name (the plain name is the branch of the `command` union).
+/// Applies to the top level of every declaration, including command bodies,
+/// which `normalize` recurses into; group and `Alt` members are checked where
+/// their specs are built.
+fn checkNoUnderscoreFields(comptime def: anytype) void {
+    comptime {
+        for (@typeInfo(@TypeOf(def)).@"struct".fields) |f| {
+            if (std.mem.startsWith(u8, f.name, "_")) {
+                @compileError("declaration field name '" ++ f.name ++ "' must not start with '_'");
+            }
+        }
+    }
 }
 
 fn checkCommandNames(comptime commands: []const CommandEntry) void {
@@ -2860,6 +2894,14 @@ fn commandWireName(comptime meta: CommandMeta, comptime field: String) String {
     return meta.name orelse field;
 }
 
+/// The `View` field name of a command: the declaration field name prefixed
+/// with `_`. Command fields are hidden behind this prefix in the `View`
+/// (`_stop`), while the `command` union keeps the plain declaration name
+/// (`stop`). Consumers reach commands through `namespace.command`.
+fn viewCommandField(comptime field: String) String {
+    return "_" ++ field;
+}
+
 /// One flag discovered somewhere in the declaration tree, together with the
 /// level path it lives at. Drives the global uniqueness check (D6).
 const FlagOrigin = struct {
@@ -2942,6 +2984,7 @@ fn checkGlobalFlagNames(comptime origins: []const FlagOrigin) void {
 }
 
 fn normalize(comptime def: anytype) NormResult {
+    comptime checkNoUnderscoreFields(def);
     var specs: []const Spec = &.{};
     var commands: []const CommandEntry = &.{};
     var alts: []const AltLevel = &.{};
@@ -2953,6 +2996,7 @@ fn normalize(comptime def: anytype) NormResult {
             if (@hasDecl(V, "dap_kind") and V.dap_kind == .command) {
                 commands = commands ++ &[_]CommandEntry{.{
                     .field = f.name,
+                    .view_field = viewCommandField(f.name),
                     .name = commandWireName(V.cmd_meta, f.name),
                     .Cmd = V,
                 }};
@@ -3261,8 +3305,10 @@ test "M1: commands level detected" {
     const C = generate(App{ .name = "app", .help = "help" }, M1CmdDef);
     try std.testing.expectEqual(@as(usize, 2), C.commands.len);
     try std.testing.expectEqualStrings("start", C.commands[0].field);
+    try std.testing.expectEqualStrings("_start", C.commands[0].view_field);
     try std.testing.expectEqualStrings("start", C.commands[0].name);
     try std.testing.expectEqualStrings("stop", C.commands[1].field);
+    try std.testing.expectEqualStrings("_stop", C.commands[1].view_field);
     try std.testing.expectEqualStrings("halt", C.commands[1].name);
     try std.testing.expect(C.commands[0].Cmd.dap_kind == .command);
 }
@@ -3317,6 +3363,24 @@ test "M1: multiple command fields are legal" {
     try std.testing.expectEqual(@as(usize, 2), C.commands.len);
     try std.testing.expectEqualStrings("start", C.commands[0].field);
     try std.testing.expectEqualStrings("stop", C.commands[1].field);
+}
+
+test "M1: command view fields carry an underscore prefix" {
+    const C = generate(App{ .name = "app", .help = "" }, .{
+        .start = Command(.{ .help = "Start." }, .{}),
+        .stop = Command(.{ .name = "halt", .help = "Stop." }, .{}),
+    });
+    try std.testing.expectEqualStrings("_start", C.commands[0].view_field);
+    try std.testing.expectEqualStrings("_stop", C.commands[1].view_field);
+}
+
+test "M1: an underscore-prefixed declaration field is a compile error" {
+    if (false) {
+        const Bad = .{
+            ._hidden = Flag(u8){},
+        };
+        comptime _ = normalize(Bad);
+    }
 }
 
 test "M1: duplicate command names are a compile error" {
@@ -3401,11 +3465,12 @@ test "M2: View field order and types" {
     try std.testing.expectEqualStrings("host", fields[6].name);
     try std.testing.expectEqual(@as(type, []const u8), fields[6].type);
 
-    // trailing command fields are optional sub-Views.
-    try std.testing.expectEqualStrings("start", fields[7].name);
+    // trailing command fields are optional sub-Views, hidden behind a `_`
+    // prefix.
+    try std.testing.expectEqualStrings("_start", fields[7].name);
     try std.testing.expect(@typeInfo(fields[7].type) == .optional);
     try std.testing.expect(@typeInfo(@typeInfo(fields[7].type).optional.child) == .@"struct");
-    try std.testing.expectEqualStrings("stop", fields[8].name);
+    try std.testing.expectEqualStrings("_stop", fields[8].name);
     try std.testing.expect(@typeInfo(fields[8].type) == .optional);
     try std.testing.expect(@typeInfo(@typeInfo(fields[8].type).optional.child) == .@"struct");
 }
@@ -3418,7 +3483,7 @@ test "M2: @FieldType matches specs" {
         try std.testing.expectEqual(@as(type, s.vtype), @FieldType(V, s.name));
     }
     inline for (C.commands) |c| {
-        const T = @FieldType(V, c.field);
+        const T = @FieldType(V, c.view_field);
         try std.testing.expect(@typeInfo(T) == .optional);
         try std.testing.expectEqual(@as(type, ?Sub(c.Cmd, subApp(C.app_meta, c)).View), T);
     }
@@ -3445,14 +3510,15 @@ test "M2: command View fields are optional sub-views" {
     try std.testing.expectEqual(@as(usize, 2), C.commands.len);
 
     // each command field's View payload is the command's generated View; the
-    // injected builtin_help field occupies the first slot of every sub.
-    const StartSub = @typeInfo(@FieldType(C.View, "start")).optional.child;
+    // injected builtin_help field occupies the first slot of every sub. Command
+    // fields carry a `_` prefix in the View.
+    const StartSub = @typeInfo(@FieldType(C.View, "_start")).optional.child;
     const start_fields = @typeInfo(StartSub).@"struct".fields;
     try std.testing.expectEqual(@as(usize, 2), start_fields.len);
     try std.testing.expectEqualStrings("builtin_help", start_fields[0].name);
     try std.testing.expectEqualStrings("name", start_fields[1].name);
 
-    const HaltSub = @typeInfo(@FieldType(C.View, "stop")).optional.child;
+    const HaltSub = @typeInfo(@FieldType(C.View, "_stop")).optional.child;
     try std.testing.expectEqual(@as(usize, 1), @typeInfo(HaltSub).@"struct".fields.len);
 
     // the sub level has no commands of its own.
@@ -3470,11 +3536,11 @@ test "M2: View is a fully usable struct" {
     v.dry_run = false;
     v.port = 8080;
     v.host = "localhost";
-    v.start = null;
-    v.stop = null;
+    v._start = null;
+    v._stop = null;
 
     try std.testing.expectEqualStrings("bob", v.login);
-    try std.testing.expect(v.start == null);
+    try std.testing.expect(v._start == null);
 }
 
 const DecodeOk = struct {
@@ -4056,9 +4122,9 @@ test "M7: root flags then command handoff" {
     const a = try m7Parse(&arena, &.{ "--verbose", "--needed", "v", "start", "file" }, &diag);
     try std.testing.expect(a.verbose);
     try std.testing.expectEqualStrings("v", a.needed);
-    try std.testing.expect(a.start != null);
-    try std.testing.expect(a.stop == null);
-    try std.testing.expectEqualStrings("file", a.start.?.name);
+    try std.testing.expect(a._start != null);
+    try std.testing.expect(a._stop == null);
+    try std.testing.expectEqualStrings("file", a._start.?.name);
 }
 
 test "M7: no command leaves the command fields null" {
@@ -4067,9 +4133,9 @@ test "M7: no command leaves the command fields null" {
     var diag: Diag = .{};
 
     const a = try m7Parse(&arena, &.{ "--needed", "v" }, &diag);
-    try std.testing.expect(a.start == null);
-    try std.testing.expect(a.stop == null);
-    try std.testing.expect(a.nested == null);
+    try std.testing.expect(a._start == null);
+    try std.testing.expect(a._stop == null);
+    try std.testing.expect(a._nested == null);
 }
 
 test "M7: named command via CommandMeta" {
@@ -4078,8 +4144,8 @@ test "M7: named command via CommandMeta" {
     var diag: Diag = .{};
 
     const a = try m7Parse(&arena, &.{ "--needed", "v", "halt" }, &diag);
-    try std.testing.expect(a.stop != null);
-    try std.testing.expect(a.start == null);
+    try std.testing.expect(a._stop != null);
+    try std.testing.expect(a._start == null);
 }
 
 test "M7: flags after the command are scoped to the sub" {
@@ -4089,9 +4155,9 @@ test "M7: flags after the command are scoped to the sub" {
 
     // `--force` is a start-scoped flag; the root never sees it.
     const a = try m7Parse(&arena, &.{ "--needed", "v", "start", "--force", "file" }, &diag);
-    try std.testing.expect(a.start != null);
-    try std.testing.expect(a.start.?.force);
-    try std.testing.expectEqualStrings("file", a.start.?.name);
+    try std.testing.expect(a._start != null);
+    try std.testing.expect(a._start.?.force);
+    try std.testing.expectEqualStrings("file", a._start.?.name);
 }
 
 test "M7: root required still enforced after handoff" {
@@ -4130,10 +4196,10 @@ test "M7: nested commands recurse" {
     var diag: Diag = .{};
 
     const a = try m7Parse(&arena, &.{ "--needed", "v", "nested", "deep", "5" }, &diag);
-    try std.testing.expect(a.nested != null);
-    const nested = a.nested.?;
-    try std.testing.expect(nested.deep != null);
-    try std.testing.expectEqual(@as(u8, 5), nested.deep.?.n);
+    try std.testing.expect(a._nested != null);
+    const nested = a._nested.?;
+    try std.testing.expect(nested._deep != null);
+    try std.testing.expectEqual(@as(u8, 5), nested._deep.?.n);
 }
 
 // --- M8: Enumeration (factory, round-trips, integration) ---
@@ -5149,8 +5215,8 @@ test "M12: an Alt inside a command definition works" {
     defer arena.deinit();
     var diag: Diag = .{};
     const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "run", "--fast" }, &diag);
-    try std.testing.expect(v.run != null);
-    try std.testing.expect(v.run.?.speed != null);
+    try std.testing.expect(v._run != null);
+    try std.testing.expect(v._run.?.speed != null);
 }
 
 const M12MixedDef = .{
@@ -5163,7 +5229,7 @@ test "M12: Alt and command fields coexist at the root" {
     const C = generate(App{ .name = "x", .help = "x" }, M12MixedDef);
     const fields = @typeInfo(C.View).@"struct".fields;
     try std.testing.expectEqualStrings("mode", fields[fields.len - 2].name);
-    try std.testing.expectEqualStrings("go", fields[fields.len - 1].name);
+    try std.testing.expectEqualStrings("_go", fields[fields.len - 1].name);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5171,7 +5237,7 @@ test "M12: Alt and command fields coexist at the root" {
     const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "-v", "--x=3", "go" }, &diag);
     try std.testing.expect(v.verbose);
     try std.testing.expect(v.mode != null);
-    try std.testing.expect(v.go != null);
+    try std.testing.expect(v._go != null);
     switch (v.mode.?) {
         .a => |p| try std.testing.expectEqual(@as(u32, 3), p.x),
         .b => return error.TestUnexpectedResult,
@@ -5330,11 +5396,11 @@ test "M13: optional flags work inside groups and commands" {
     var diag: Diag = .{};
     const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{"run"}, &diag);
     try std.testing.expect(v.og == null);
-    try std.testing.expect(v.run != null);
-    try std.testing.expect(v.run.?.sub_opt == null);
+    try std.testing.expect(v._run != null);
+    try std.testing.expect(v._run.?.sub_opt == null);
     const v2 = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "--og=5", "run", "--so", "z" }, &diag);
     try std.testing.expectEqual(@as(?u32, 5), v2.og);
-    try std.testing.expectEqualStrings("z", v2.run.?.sub_opt.?);
+    try std.testing.expectEqualStrings("z", v2._run.?.sub_opt.?);
 }
 
 test "M13: raw optional spelling behaves identically" {
@@ -5484,12 +5550,12 @@ test "M14: deep help request bypasses every required check" {
     // Root `--config` is required and absent, yet the deep help request parses.
     const vsvc = try m14Parse(&arena, &.{ "svc", "-h" }, &diag);
     try std.testing.expect(helpRequested(M14, &vsvc));
-    try std.testing.expect(vsvc.svc != null);
+    try std.testing.expect(vsvc._svc != null);
 
     const vbuild = try m14Parse(&arena, &.{ "svc", "build", "-h" }, &diag);
     try std.testing.expect(helpRequested(M14, &vbuild));
-    try std.testing.expect(vbuild.svc != null);
-    try std.testing.expect(vbuild.svc.?.build != null);
+    try std.testing.expect(vbuild._svc != null);
+    try std.testing.expect(vbuild._svc.?._build != null);
 }
 
 test "M14: root help stays root-scoped and byte-identical" {
@@ -5679,7 +5745,7 @@ test "M15: nested commands stay reachable through the payload" {
     var diag: Diag = .{};
     const a = try m7Parse(&arena, &.{ "--needed", "v", "nested", "deep", "5" }, &diag);
     switch (M7.command(a).?) {
-        .nested => |n| try std.testing.expectEqual(@as(u8, 5), n.deep.?.n),
+        .nested => |n| try std.testing.expectEqual(@as(u8, 5), n._deep.?.n),
         .start, .stop => return error.TestUnexpectedResult,
     }
 }
@@ -5713,7 +5779,7 @@ test "M15: command coexists with Alt and optional flags at the root" {
 test "M15: CommandPayload members match the sub-view types" {
     inline for (M7.commands) |c| {
         try std.testing.expectEqual(@as(type, Sub(c.Cmd, subApp(M7.app_meta, c)).View), @FieldType(M7.CommandPayload, c.field));
-        try std.testing.expectEqual(@as(type, ?@FieldType(M7.CommandPayload, c.field)), @FieldType(M7.View, c.field));
+        try std.testing.expectEqual(@as(type, ?@FieldType(M7.CommandPayload, c.field)), @FieldType(M7.View, c.view_field));
     }
 }
 
