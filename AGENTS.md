@@ -10,13 +10,16 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (158 tests, the milestone-tagged M1–M15
+`zig test src/dap.zig` both pass (184 tests, the milestone-tagged M1–M16
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
   `Enumeration`, `Command`, `Alt`, runtime help (`HelpData` +
-  `renderHelpWithStyle`/`renderCompact`), `DecodeError`/`ParseError`, `Diag`,
+  `renderHelpWithStyle`/`renderCompact`), typo suggestions (`SuggestValid`/
+  `Suggest` + the `suggest*` family), `DecodeError`/`ParseError`, `Diag`,
   and the test suite.
+- `src/stdcompare.zig` holds the private `levenshtein` helper the suggester
+  ranks with; it is imported directly by `dap.zig` (not re-exported).
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
   `usingnamespace` in Zig 0.16; exports are explicit).
 - `build.zig` exposes a public `dap` module rooted at `src/root.zig`, builds a
@@ -33,8 +36,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `HelpRendererStyle`, `HelpRendererHighlight`, `App`, `HelpHighlight`,
   `String`, `Default(T)`, `defaultValue`, `Flag(T)`, `Optional`, `Group`,
   `Argument(T)`, `Enumeration`, `Enum`, `CommandMeta`, `Command`,
-  `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`, `Diag`,
-  `HelpData`) come first.
+  `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`,
+  `SuggestValid`, `Suggest`, `Diag`, `HelpData`) come first.
 - The private compact-help scaffolding (`HelpStyle`, `HelpSegment`, `HelpRow`,
   `HelpSection`, `helpStyleCode`, `helpSegmentsWidth`, the `appendHelpStyled`/
   `appendHelpSegments`/`appendFlagUsage` family, `upperDup`), the file-private
@@ -177,9 +180,33 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   reads `app svc build`), dedupes the repeated injected builtin via
   `dedupeBuiltinHelp`, and renders once. Root-scope help is byte-identical to
   the pre-merge path; failure help (`printFailureExit`) stays root-scoped.
+- Typo suggestions ride on `Diag`. When a flag token matches no declaration
+  (`consumeLongFlag`/`consumeShortFlag` fall-through) or a bare token overflows
+  a level's argument slots (`assignPositional`), the failure site calls
+  `suggestProbe(all_specs, cmd_entries, shape, body)` and stores the result in
+  the new `Diag.unknown` (`?Suggest`, a `flag`/`cmd` tagged union of
+  `SuggestValid`). `SuggestValid.name`/`short` borrow the comptime spec/command
+  strings (static lifetime), so `Diag.deinit` frees only `message` as before.
+  `suggestProbe`'s three shapes: `.long` (`--…`) scores long names with a
+  command fallback (a dashed token honours its flag shape on a distance tie);
+  `.short` (`-…`) scores short names plus single-char longs; `.bare` scores
+  commands only. Ranking (`suggestConsider`/`suggestKeep`) is lower
+  Levenshtein distance, then `.edit` over `.prefix`, then first-declared; the
+  threshold is `suggestMaxDistance` (0 for length ≤ 2, 1 ≤ 5, 2 ≤ 10, else
+  `~L/4`); prefix completions (`suggestIsPrefix`) require a body of length ≥ 2
+  and a unique completion. The injected builtin help flag is a normal
+  candidate. Tokens consumed after the `--` terminator pass `suggest = false`
+  (the user declared them data, not typos).
+- `HelpData.error_text` (optional) leads `renderCompact`'s view, wrapped in
+  the new `HelpStyle.error_msg` category (scheme `usage.error_msg`).
+  `printFailureExit` builds the diagnostic block once (`buildErrorText` from
+  `Diag.field`/`token`/`message`/`unknown`), passes it to `helpTextWithStyle`
+  for the `.compact` renderer, and otherwise prints it standalone
+  (`printDiagnosticsStandalone`); a failed render or diagnostic build falls
+  back to the standalone lines so diagnostics are never lost.
 - Ordering inside `src/dap.zig`: public data types first, then private
-  help/builtin scaffolding, then the public `generate` entry point, then
-  private normalization/decode helpers, then tests.
+  help/builtin scaffolding, then the private `suggest*` family, then the public
+  `generate` entry point, then private normalization/decode helpers, then tests.
 
 ## Notes
 

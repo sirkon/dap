@@ -19,6 +19,7 @@
 //! always be required.
 
 const std = @import("std");
+const stdcompare = @import("stdcompare.zig");
 
 /// Kind of a declaration field.
 pub const Kind = enum {
@@ -66,6 +67,7 @@ pub const HelpHighlight = struct {
     };
 
     usage: struct {
+        error_msg: []const u8 = "",
         app_name: []const u8 = "",
         required_flags: HelpHighlight.Flag = .{},
         optionals: []const u8 = "",
@@ -99,6 +101,7 @@ pub const HelpHighlight = struct {
 
     const color = HelpHighlight{
         .usage = .{
+            .error_msg = "\x1b[1;91m",
             .app_name = "\x1b[1;96m",
             .required_flags = .{
                 .name = "\x1b[1;96m",
@@ -582,6 +585,37 @@ pub const ParseError = error{
     InvalidWtf8,
 } || std.mem.Allocator.Error || DecodeError;
 
+/// One candidate a rejected token may have meant, plus how it was ranked. All
+/// strings are borrowed from the declaration (compile-time known, `'static`
+/// lifetime), so the struct owns nothing and never allocates.
+pub const SuggestValid = struct {
+    /// The candidate's wire name as typed by the user, without the leading
+    /// dashes: the bare flag long name or the bare command name. Rendering
+    /// adds the `--` prefix for flags (or a `-` for a short candidate).
+    name: String,
+    /// Short spelling when the candidate has one and was ranked via it.
+    short: ?String = null,
+    /// The namespace the candidate lives in.
+    kind: SuggestValid.Kind,
+    /// Levenshtein distance between the normalized unknown token and the
+    /// candidate; lower is better.
+    distance: usize,
+    /// Why this candidate was chosen: `edit` (edit distance below the
+    /// threshold) or `prefix` (the candidate extends the token's body).
+    reason: Reason,
+
+    pub const Kind = enum { flag, cmd };
+    pub const Reason = enum { edit, prefix };
+};
+
+/// A suggestion for a rejected token: the union tag is the candidate
+/// namespace, mirroring [`SuggestValid.kind`] so a copied payload keeps its
+/// meaning while renderers `switch` on the tag.
+pub const Suggest = union(enum) {
+    flag: SuggestValid,
+    cmd: SuggestValid,
+};
+
 /// Diagnostic detail for the most recent failed `parse`. `field` and `token`
 /// borrow caller-owned memory (declaration names / argv); `message` is
 /// allocated with the parser's allocator and must be released by `deinit`.
@@ -589,6 +623,11 @@ pub const Diag = struct {
     field: ?String = null,
     token: ?String = null,
     message: ?String = null,
+    /// Populated when a flag token or a bare command-shaped token matched no
+    /// declaration but a close candidate exists. The payload strings are
+    /// borrowed from the declaration (compile-time known), so `deinit` does
+    /// not touch them; reading `unknown` after the parse call is safe.
+    unknown: ?Suggest = null,
 
     pub fn deinit(self: *Diag, allocator: std.mem.Allocator) void {
         if (self.message) |m| allocator.free(m);
@@ -678,6 +717,11 @@ pub const HelpData = struct {
     usage_alts: []Usage = &.{},
     /// Subcommands in declaration order.
     commands: []CommandInfo,
+    /// Optional error line rendered at the very top of the compact view,
+    /// highlighted with `usage.error_msg`. Borrowed static or caller-owned
+    /// text; it is *not* freed by `deinit` (the failure diagnostics own it).
+    /// `null` for ordinary help.
+    error_text: ?String = null,
     /// Highlight scheme `renderCompact` applies. Filled from
     /// `App.help_renderer.highlight`; the codes are borrowed static strings and
     /// are not freed by `deinit`.
@@ -756,6 +800,15 @@ pub const HelpData = struct {
 
         // The scheme is resolved once; every fragment is emitted through it.
         const hl = HelpHighlight.resolve(self.highlight);
+
+        // Failure diagnostics lead the view: the error line sits above the
+        // usage header, highlighted with the error token.
+        if (self.error_text) |e| {
+            if (e.len > 0) {
+                try appendHelpStyled(&out, allocator, hl, .error_msg, e);
+                try out.append(allocator, '\n');
+            }
+        }
 
         // Order flag and argument groups by name, the ungrouped bucket
         // (`null`) first.
@@ -991,6 +1044,7 @@ pub const HelpData = struct {
 /// Highlight category a compact-help fragment belongs to.
 const HelpStyle = enum {
     plain,
+    error_msg,
     usage_label,
     usage_app_name,
     usage_required_name,
@@ -1026,6 +1080,7 @@ const HelpSection = struct {
 fn helpStyleCode(hl: HelpHighlight, style: HelpStyle) []const u8 {
     return switch (style) {
         .plain => "",
+        .error_msg => hl.usage.error_msg,
         .usage_label => hl.groups,
         .usage_app_name => hl.usage.app_name,
         .usage_required_name => hl.usage.required_flags.name,
@@ -1608,6 +1663,194 @@ fn renderHelpWithStyle(
     };
 }
 
+/// Shape of the token whose lookup failed, deciding which candidate
+/// namespaces [`suggestProbe`] scores.
+const SuggestShape = enum {
+    /// A `--…` token: long names first, commands as a cross-namespace
+    /// fallback (a user typing `--build` for the command `build`).
+    long,
+    /// A `-…` token: short names only (plus single-character longs).
+    short,
+    /// A bare token at a command checkpoint: command names only.
+    bare,
+};
+
+/// Candidate namespace [`suggestLoad`] scores in one pass. A single call
+/// always compares like against like; cross-namespace preference is decided
+/// by [`suggestProbe`].
+const SuggestLoad = enum {
+    /// Long flag bodies: long names always, short names for very short
+    /// bodies, prefix completions on long names.
+    long_flag,
+    /// Short flag bodies: short names for very short bodies, plus
+    /// single-character long names.
+    short_flag,
+    /// Bare command-shaped bodies: command names, prefix completions
+    /// included.
+    cmd,
+};
+
+/// The largest edit distance still treated as a plausible typo for a body of
+/// length `n` against a candidate of length `m`. Graduated to approximate a
+/// ~25% relative error budget with exact integer math: no hint for words too
+/// short to have a meaningful typo, a fixed budget for medium words, and a
+/// quarter of the length beyond that.
+fn suggestMaxDistance(n: usize, m: usize) usize {
+    const L = @max(n, m);
+    if (L == 0) return 0;
+    if (L <= 2) return 0;
+    if (L <= 5) return 1;
+    if (L <= 10) return 2;
+    return (L + 3) / 4;
+}
+
+/// `cand` extends `body` (strictly longer and sharing its prefix), e.g.
+/// `dry` completing to `dry_run`.
+fn suggestIsPrefix(body: String, cand: String) bool {
+    return cand.len > body.len and std.mem.startsWith(u8, cand, body);
+}
+
+/// Hold the best candidate seen so far, replacing it only on a strictly
+/// better score: lower distance wins, then `.edit` over `.prefix`, and on a
+/// perfect tie the earlier declaration is kept (first seen wins).
+fn suggestKeep(best: *?SuggestValid, p: SuggestValid) void {
+    const b = best.* orelse {
+        best.* = p;
+        return;
+    };
+    const p_rank: u1 = if (p.reason == .edit) 0 else 1;
+    const b_rank: u1 = if (b.reason == .edit) 0 else 1;
+    if (p.distance < b.distance or (p.distance == b.distance and p_rank < b_rank)) {
+        best.* = p;
+    }
+}
+
+/// Score one candidate against `body` and fold it into `best`. `long` is the
+/// candidate's long wire name (or the command name); `short`, when set, is a
+/// short spelling that won the ranking and is what rendering shows. `prefix_ok`
+/// gates prefix completions on the pre-computed uniqueness check.
+fn suggestConsider(
+    best: *?SuggestValid,
+    body: String,
+    long: String,
+    short: ?String,
+    kind: SuggestValid.Kind,
+    eligible: bool,
+    prefix_ok: bool,
+) void {
+    if (!eligible) return;
+    if (long.len == 0) return;
+    const cand = short orelse long;
+
+    const d = stdcompare.levenshtein(body, cand);
+    var picked: ?SuggestValid = null;
+    if (d <= suggestMaxDistance(body.len, cand.len)) {
+        picked = .{ .name = long, .short = short, .kind = kind, .distance = d, .reason = .edit };
+    } else if (prefix_ok and short == null and suggestIsPrefix(body, long)) {
+        picked = .{ .name = long, .short = null, .kind = kind, .distance = long.len - body.len, .reason = .prefix };
+    }
+    if (picked) |p| suggestKeep(best, p);
+}
+
+/// The best candidate for `body` within one namespace `which`, or `null` when
+/// nothing clears the threshold. Prefix completions are offered only when
+/// exactly one candidate extends `body`: an ambiguous completion (`bui` →
+/// `build` / `buildx`) yields no prefix hint.
+fn suggestLoad(
+    comptime specs: []const Spec,
+    comptime cmds: []const CommandEntry,
+    comptime which: SuggestLoad,
+    body: String,
+) ?SuggestValid {
+    var prefix_count: usize = 0;
+    if (body.len >= 2) {
+        switch (which) {
+            .long_flag => inline for (specs) |s| {
+                if (s.kind != .flag) continue;
+                if (suggestIsPrefix(body, s.long)) prefix_count += 1;
+            },
+            .short_flag => {},
+            .cmd => inline for (cmds) |c| {
+                if (suggestIsPrefix(body, c.name)) prefix_count += 1;
+            },
+        }
+    }
+    const prefix_ok = prefix_count == 1;
+
+    var best: ?SuggestValid = null;
+    switch (which) {
+        .long_flag => {
+            inline for (specs) |s| {
+                if (s.kind != .flag) continue;
+                suggestConsider(&best, body, s.long, null, .flag, true, prefix_ok);
+            }
+            inline for (specs) |s| {
+                if (s.kind != .flag) continue;
+                if (s.short) |sh| {
+                    suggestConsider(&best, body, s.long, sh, .flag, body.len <= 2, prefix_ok);
+                }
+            }
+        },
+        .short_flag => {
+            inline for (specs) |s| {
+                if (s.kind != .flag) continue;
+                if (s.short) |sh| {
+                    suggestConsider(&best, body, s.long, sh, .flag, body.len <= 2, prefix_ok);
+                }
+            }
+            inline for (specs) |s| {
+                if (s.kind != .flag) continue;
+                if (s.long.len == 1) {
+                    suggestConsider(&best, body, s.long, null, .flag, true, prefix_ok);
+                }
+            }
+        },
+        .cmd => {
+            inline for (cmds) |c| {
+                suggestConsider(&best, body, c.name, null, .cmd, true, prefix_ok);
+            }
+        },
+    }
+    return best;
+}
+
+/// The namespace-tagged suggestion for a rejected token body. The token's
+/// dash shape decides precedence: a `--…` body prefers flags with a command
+/// fallback, a `-…` body scores shorts only, and a bare body scores commands
+/// only. `body` is already normalized (no leading dashes, no `=value`).
+fn suggestProbe(
+    comptime specs: []const Spec,
+    comptime cmds: []const CommandEntry,
+    comptime shape: SuggestShape,
+    body: String,
+) ?Suggest {
+    if (body.len == 0) return null;
+    switch (shape) {
+        .long => {
+            const flag_cand = suggestLoad(specs, cmds, .long_flag, body);
+            const cmd_cand = suggestLoad(specs, cmds, .cmd, body);
+            if (flag_cand) |f| {
+                if (cmd_cand) |c| {
+                    // A dashed token is flag-shaped: the command only wins when
+                    // it is a strictly better match; a tie honours the shape.
+                    if (c.distance < f.distance) return .{ .cmd = c };
+                }
+                return .{ .flag = f };
+            }
+            if (cmd_cand) |c| return .{ .cmd = c };
+            return null;
+        },
+        .short => {
+            if (suggestLoad(specs, cmds, .short_flag, body)) |s| return .{ .flag = s };
+            return null;
+        },
+        .bare => {
+            if (suggestLoad(specs, cmds, .cmd, body)) |s| return .{ .cmd = s };
+            return null;
+        },
+    }
+}
+
 pub fn generate(comptime app: App, comptime def: anytype) type {
     @setEvalBranchQuota(1_000_000);
     const merged = withBuiltinHelp(def);
@@ -1882,7 +2125,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// follows `app.help_renderer.style`: `.compact` renders the kong-style
         /// two-column layout, `.custom` invokes the user-provided function.
         pub fn helpText(allocator: std.mem.Allocator) std.mem.Allocator.Error!String {
-            return try helpTextWithStyle(allocator);
+            return try helpTextWithStyle(allocator, null);
         }
 
         /// Print the context-sensitive help of a parsed `View` to stdout: the
@@ -1952,28 +2195,107 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         }
 
         /// Print the parse diagnostics and the help text to stderr, then exit with
-        /// code 1. The help text is freed before exiting. Write errors are
-        /// ignored: there is no sensible fallback once stderr is gone, and
-        /// `std.process.exit` must still run.
+        /// code 1. The compact renderer leads its view with the diagnostics
+        /// (highlighted with the error token); a custom renderer, or a render
+        /// failure, falls back to plain diagnostic lines so they are never
+        /// lost. Write errors are ignored: there is no sensible fallback once
+        /// stderr is gone, and `std.process.exit` must still run.
         fn printFailureExit(allocator: std.mem.Allocator, diag: ?*const Diag) noreturn {
-            if (diag) |d| {
-                if (d.field) |f| std.debug.print("error: field '{s}' is invalid or missing\n", .{f});
-                if (d.token) |t| std.debug.print("error: token '{s}' is invalid\n", .{t});
-                if (d.message) |m| std.debug.print("error: {s}\n", .{m});
-            }
-            if (helpTextWithStyle(allocator)) |text| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            const error_text: ?String = blk: {
+                const t = buildErrorText(&buf, allocator, diag) catch break :blk null;
+                break :blk if (t.len > 0) t else null;
+            };
+
+            const compact = switch (app.help_renderer.style) {
+                .compact => true,
+                .custom => false,
+            };
+            // The compact renderer folds the diagnostics into its view; any
+            // other renderer (or a failed diagnostic build) prints them as
+            // standalone lines so they are never lost.
+            const standalone = !compact or error_text == null;
+            if (standalone) printDiagnosticsStandalone(diag);
+
+            if (helpTextWithStyle(allocator, if (compact) error_text else null)) |text| {
                 defer allocator.free(text);
                 std.debug.print("{s}\n", .{text});
-            } else |_| {}
+            } else |_| {
+                // A failed render must not swallow the diagnostics.
+                if (compact) if (error_text) |e| std.debug.print("{s}\n", .{e});
+            }
             std.process.exit(1);
+        }
+
+        /// Render the failure diagnostic block into `buf` as one plain-text
+        /// string: the same lines `printDiagnosticsStandalone` prints, joined
+        /// by newlines, so `renderCompact` can lead its view with them (and
+        /// color the whole block with the error token). Returns the (possibly
+        /// empty) slice into `buf`; the caller owns `buf`.
+        fn buildErrorText(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, diag: ?*const Diag) std.mem.Allocator.Error!String {
+            const d = diag orelse return "";
+            var wrote = false;
+            if (d.field) |f| {
+                try buf.print(allocator, "error: field '{s}' is invalid or missing", .{f});
+                wrote = true;
+            }
+            if (d.token) |t| {
+                if (wrote) try buf.append(allocator, '\n');
+                try buf.print(allocator, "error: token '{s}' is invalid", .{t});
+                wrote = true;
+            }
+            if (d.message) |m| {
+                if (wrote) try buf.append(allocator, '\n');
+                try buf.print(allocator, "error: {s}", .{m});
+                wrote = true;
+            }
+            if (d.unknown) |u| {
+                if (wrote) try buf.append(allocator, '\n');
+                const sp = suggestSpelling(u);
+                try buf.print(allocator, "error: did you mean '{s}{s}'?", .{ sp.dash, sp.shown });
+            }
+            return buf.items;
+        }
+
+        /// Print the failure diagnostics as standalone stderr lines. Used as
+        /// the fallback when the renderer is not the compact one (which folds
+        /// them into its view) or when rendering failed. The suggested
+        /// spelling is wrapped in the scheme's error color.
+        fn printDiagnosticsStandalone(diag: ?*const Diag) void {
+            const d = diag orelse return;
+            if (d.field) |f| std.debug.print("error: field '{s}' is invalid or missing\n", .{f});
+            if (d.token) |t| std.debug.print("error: token '{s}' is invalid\n", .{t});
+            if (d.message) |m| std.debug.print("error: {s}\n", .{m});
+            if (d.unknown) |u| {
+                const hl = HelpHighlight.resolve(app.help_renderer.highlight);
+                const pre = hl.usage.error_msg;
+                const reset = if (pre.len > 0) hl.reset else "";
+                const sp = suggestSpelling(u);
+                std.debug.print("error: did you mean '{s}{s}{s}{s}'?\n", .{ pre, sp.dash, sp.shown, reset });
+            }
+        }
+
+        /// The display pieces of a suggestion: the dash prefix (`--` for a long
+        /// flag, `-` for a short one, empty for a command) and the spelling to
+        /// show after it. Kept as two slices so the hint never allocates.
+        const Spelling = struct { dash: String, shown: String };
+
+        fn suggestSpelling(u: Suggest) Spelling {
+            return switch (u) {
+                .flag => |s| .{ .dash = if (s.short != null) "-" else "--", .shown = s.short orelse s.name },
+                .cmd => |s| .{ .dash = "", .shown = s.name },
+            };
         }
 
         /// Fill the `HelpData` description of this declaration and render it with
         /// the app's configured renderer. The description is freed before
-        /// returning; only the rendered string stays allocated.
-        fn helpTextWithStyle(allocator: std.mem.Allocator) std.mem.Allocator.Error!String {
+        /// returning; only the rendered string stays allocated. `error_text`,
+        /// when set, leads the compact view with the failure diagnostics.
+        fn helpTextWithStyle(allocator: std.mem.Allocator, error_text: ?String) std.mem.Allocator.Error!String {
             var data = try helpData(allocator);
             defer data.deinit(allocator);
+            data.error_text = error_text;
             return try renderHelpWithStyle(app.help_renderer.style, allocator, &data);
         }
 
@@ -2039,23 +2361,25 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
                 if (std.mem.eql(u8, tok, "--")) {
                     // Everything after `--` is a literal positional; the
-                    // terminator also suppresses any handoff.
+                    // terminator also suppresses any handoff and, since the
+                    // user declared these tokens to be data, the typo
+                    // suggester too.
                     i += 1;
                     while (i < args.len) : (i += 1) {
-                        try assignPositional(allocator, &v, &seen, &pos, args[i], diag);
+                        try assignPositional(allocator, &v, &seen, &pos, args[i], diag, false);
                     }
                     break;
                 }
 
                 if (std.mem.startsWith(u8, tok, "--")) {
-                    try consumeLongFlag(allocator, &v, &seen, args, &i, diag);
+                    try consumeLongFlag(allocator, &v, &seen, args, &i, diag, true);
                     if (v.builtin_help) help_seen = true;
                 } else if (tok.len > 1 and tok[0] == '-') {
-                    try consumeShortFlag(allocator, &v, &seen, args, &i, diag);
+                    try consumeShortFlag(allocator, &v, &seen, args, &i, diag, true);
                     if (v.builtin_help) help_seen = true;
                 } else {
                     if (cmd_entries.len == 0) {
-                        try assignPositional(allocator, &v, &seen, &pos, tok, diag);
+                        try assignPositional(allocator, &v, &seen, &pos, tok, diag, true);
                     } else {
                         // HANDOFF: a positional token equal to a registered
                         // command name is checked before POSITIONAL. The
@@ -2071,7 +2395,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                             }
                         }
                         if (!matched) {
-                            try assignPositional(allocator, &v, &seen, &pos, tok, diag);
+                            try assignPositional(allocator, &v, &seen, &pos, tok, diag, true);
                         }
                     }
                 }
@@ -2133,7 +2457,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return v;
         }
 
-        fn consumeLongFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag) ParseError!void {
+        fn consumeLongFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag, suggest: bool) ParseError!void {
             const tok = args[i.*];
             const body = tok[2..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
@@ -2158,11 +2482,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 }
             }
 
-            if (diag) |d| d.token = tok;
+            if (diag) |d| {
+                d.token = tok;
+                if (suggest) d.unknown = suggestProbe(all_specs, cmd_entries, .long, name);
+            }
             return error.UnknownFlag;
         }
 
-        fn consumeShortFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag) ParseError!void {
+        fn consumeShortFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag, suggest: bool) ParseError!void {
             const tok = args[i.*];
             const body = tok[1..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
@@ -2191,13 +2518,19 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 }
             }
 
-            if (diag) |d| d.token = tok;
+            if (diag) |d| {
+                d.token = tok;
+                if (suggest) d.unknown = suggestProbe(all_specs, cmd_entries, .short, name);
+            }
             return error.UnknownFlag;
         }
 
-        fn assignPositional(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, pos: *usize, tok: []const u8, diag: ?*Diag) ParseError!void {
+        fn assignPositional(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, pos: *usize, tok: []const u8, diag: ?*Diag, suggest: bool) ParseError!void {
             if (pos.* >= arg_count) {
-                if (diag) |d| d.token = tok;
+                if (diag) |d| {
+                    d.token = tok;
+                    if (suggest) d.unknown = suggestProbe(all_specs, cmd_entries, .bare, tok);
+                }
                 return error.TooManyArguments;
             }
             inline for (all_specs, 0..) |s, si| {
@@ -2207,7 +2540,10 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                     return;
                 }
             }
-            if (diag) |d| d.token = tok;
+            if (diag) |d| {
+                d.token = tok;
+                if (suggest) d.unknown = suggestProbe(all_specs, cmd_entries, .bare, tok);
+            }
             return error.TooManyArguments;
         }
     };
@@ -5812,4 +6148,226 @@ test "M15: the command shell forwards the base members" {
     try std.testing.expect(@hasDecl(M13, "parse"));
     try std.testing.expect(!@hasDecl(M13, "command"));
     try std.testing.expect(!@hasDecl(M13, "CommandPayload"));
+}
+
+// ---------------------------------------------------------------------------
+// M16: typo suggestions for unknown tokens.
+// ---------------------------------------------------------------------------
+
+test "M16: threshold table is graduated" {
+    // Empty never suggests.
+    try std.testing.expectEqual(@as(usize, 0), suggestMaxDistance(0, 0));
+    // Short words allow no edit at all.
+    try std.testing.expectEqual(@as(usize, 0), suggestMaxDistance(1, 1));
+    // The budget follows the longer side.
+    try std.testing.expectEqual(@as(usize, 2), suggestMaxDistance(2, 10));
+    // Medium words get a fixed budget.
+    try std.testing.expectEqual(@as(usize, 1), suggestMaxDistance(3, 5));
+    try std.testing.expectEqual(@as(usize, 1), suggestMaxDistance(5, 5));
+    try std.testing.expectEqual(@as(usize, 2), suggestMaxDistance(6, 8));
+    try std.testing.expectEqual(@as(usize, 2), suggestMaxDistance(10, 10));
+    // Beyond that it is a quarter of the longer side, rounded up.
+    try std.testing.expectEqual(@as(usize, 3), suggestMaxDistance(11, 11));
+    try std.testing.expectEqual(@as(usize, 5), suggestMaxDistance(20, 20));
+    try std.testing.expectEqual(@as(usize, 5), suggestMaxDistance(17, 20));
+}
+
+const M16Def = .{
+    .dry_run = Flag(bool){
+        .long = "dry_run",
+        .default = Default(bool){ .direct = false },
+    },
+    .verbose = Flag(bool){
+        .short = "v",
+        .long = "verbose",
+        .default = Default(bool){ .direct = false },
+    },
+    .deploy = Command(.{ .help = "Deploy." }, .{}),
+    .deployment = Command(.{ .help = "Deployment." }, .{}),
+};
+
+const M16 = generate(App{ .name = "m16", .help = "m16" }, M16Def);
+const M16View = M16.View;
+
+fn m16Parse(arena: *std.heap.ArenaAllocator, args: []const []const u8, diag: *Diag) !M16View {
+    return M16.parseInner(arena.allocator(), std.process.Environ.empty, args, diag);
+}
+
+test "M16: unknown long flag suggests near miss" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--dry-runn"}, &diag));
+    try std.testing.expectEqualStrings("--dry-runn", diag.token.?);
+    switch (diag.unknown.?) {
+        .flag => |s| {
+            try std.testing.expectEqualStrings("dry_run", s.name);
+            try std.testing.expectEqual(SuggestValid.Kind.flag, s.kind);
+            try std.testing.expectEqual(SuggestValid.Reason.edit, s.reason);
+            try std.testing.expectEqual(@as(usize, 2), s.distance);
+        },
+        .cmd => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: unknown long flag carries its attached value into the probe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--dry-runn=3"}, &diag));
+    switch (diag.unknown.?) {
+        .flag => |s| try std.testing.expectEqualStrings("dry_run", s.name),
+        .cmd => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: no suggestion for unrelated token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--zzz"}, &diag));
+    try std.testing.expectEqualStrings("--zzz", diag.token.?);
+    try std.testing.expect(diag.unknown == null);
+}
+
+test "M16: no absurd suggestion for a one-letter short" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"-z"}, &diag));
+    try std.testing.expect(diag.unknown == null);
+}
+
+test "M16: dashed short name suggests the short spelling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    // `--v` exact-matches the short `v` of `verbose`; the hint reverts to `-v`.
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--v"}, &diag));
+    switch (diag.unknown.?) {
+        .flag => |s| {
+            try std.testing.expectEqualStrings("verbose", s.name);
+            try std.testing.expectEqualStrings("v", s.short.?);
+        },
+        .cmd => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: builtin help flag is a real suggestion target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--halp"}, &diag));
+    switch (diag.unknown.?) {
+        .flag => |s| try std.testing.expectEqualStrings("help", s.name),
+        .cmd => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: unique prefix completes with the prefix reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--dry"}, &diag));
+    switch (diag.unknown.?) {
+        .flag => |s| {
+            try std.testing.expectEqualStrings("dry_run", s.name);
+            try std.testing.expectEqual(SuggestValid.Reason.prefix, s.reason);
+        },
+        .cmd => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: unknown command suggests near miss" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.TooManyArguments, m16Parse(&arena, &.{"deploi"}, &diag));
+    try std.testing.expectEqualStrings("deploi", diag.token.?);
+    switch (diag.unknown.?) {
+        .cmd => |s| {
+            try std.testing.expectEqualStrings("deploy", s.name);
+            try std.testing.expectEqual(SuggestValid.Kind.cmd, s.kind);
+        },
+        .flag => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: ambiguous prefix yields no prefix hint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    // `dep` prefixes both `deploy` and `deployment`; no unambiguous completion.
+    try std.testing.expectError(error.TooManyArguments, m16Parse(&arena, &.{"dep"}, &diag));
+    try std.testing.expect(diag.unknown == null);
+}
+
+test "M16: dashed token falls back to a command suggestion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    // `deploy` is a command; typing it dashed is a namespace slip.
+    try std.testing.expectError(error.UnknownFlag, m16Parse(&arena, &.{"--deploy"}, &diag));
+    switch (diag.unknown.?) {
+        .cmd => |s| try std.testing.expectEqualStrings("deploy", s.name),
+        .flag => return error.TestUnexpectedResult,
+    }
+}
+
+test "M16: tokens after the terminator never suggest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.TooManyArguments, m16Parse(&arena, &.{ "--", "deploy" }, &diag));
+    try std.testing.expectEqualStrings("deploy", diag.token.?);
+    try std.testing.expect(diag.unknown == null);
+}
+
+test "M16: suggestion stays null without a diag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.UnknownFlag, M16.parseInner(arena.allocator(), std.process.Environ.empty, &.{"--dry-runn"}, null));
+}
+
+test "M16: M4 unknown-token diagnostics still carry token only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownFlag, m4Parse(&arena, &.{ "--nope", "f" }, &diag));
+    try std.testing.expectEqualStrings("--nope", diag.token.?);
+    // `nope` is far from every M4 long; no hint, preserving the old message.
+    try std.testing.expect(diag.unknown == null);
+}
+
+test "M16: renderCompact leads with the error line" {
+    var data = try M16.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    data.error_text = "error: token '--dry-runn' is invalid";
+    const h = try data.renderCompact(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    // M16 uses the default (bold) scheme, whose error token is empty, so the
+    // line is plain text sitting above the usage header.
+    try std.testing.expect(std.mem.startsWith(u8, h, "error: token '--dry-runn' is invalid\n"));
+}
+
+test "M16: error line carries the error_msg highlight code" {
+    const CLI = generate(App{
+        .name = "app",
+        .help = "Do things.",
+        .help_renderer = .{ .highlight = .color },
+    }, M16Def);
+    var data = try CLI.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    data.error_text = "error: token '--dry-runn' is invalid";
+    const h = try data.renderCompact(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    try std.testing.expect(std.mem.startsWith(u8, h, "\x1b[1;91merror: token '--dry-runn' is invalid\x1b[0m\n\x1b[1;92mUsage: "));
+}
+
+test "M16: absent error line leaves the compact view unchanged" {
+    var data = try M16.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    const h = try data.renderCompact(std.testing.allocator);
+    defer std.testing.allocator.free(h);
+    try std.testing.expect(std.mem.indexOf(u8, h, "error:") == null);
 }
