@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (184 tests, the milestone-tagged M1–M16
+`zig test src/dap.zig` both pass (195 tests, the milestone-tagged M1–M17
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
@@ -64,11 +64,27 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   operates on types, not runtime values.
 - Public doc comments (`///`) carry usage examples written as fenced Zig code
   inside the comments — keep this pattern when adding API surface.
-- Custom value types must provide two public methods to be usable:
-  `pub fn decode(self: *Self, data []const u8) DecodeError!void` and
-  `pub fn encode(self: *Self) []const u8`. Builtin numeric types and
-  `[]const u8` (aliased as `dap.String`) work out of the box, as do
-  `Enumeration` results.
+- Custom value types must provide three public methods to be usable:
+  `pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!Self`
+  (a static constructor returning a fully built value, so types with internal
+  allocations can own them),
+  `pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8`
+  (returns an allocator-owned wire spelling the caller frees) and
+  `pub fn deinit(self: *Self, allocator: std.mem.Allocator) void` (releases the
+  value's internals; must not `allocator.destroy(self)`). `DecodeError`
+  folds in `std.mem.Allocator.Error` so `decode` may allocate. A decode/
+  encode-only struct is a `@compileError` via `isDecodable`. Builtin numeric
+  types and `[]const u8` (aliased as `dap.String`) work out of the box, as do
+  `Enumeration` results (both `Enumeration` shapes carry a no-op `deinit`).
+- The generated `View` owns every field it stores: a `deinit` method on the
+  generated namespace (`CLI.deinit(&view, allocator)`) frees string slices,
+  calls a custom type's `deinit`, recurses into optionals, releases only the
+  active `Alt` branch, and recurses into every activated command sub-`View`
+  (via `Sub(...).deinit`, forwarded through the command shell as
+  `pub const deinit = Base.deinit`). The dispatcher is `deinitValue` (beside
+  `decodeInto`). It is valid once on a successful parse, not idempotent. A
+  custom struct's direct default is routed through an `encode`/`decode`
+  roundtrip in `assignDirectDefault` so it never points at comptime memory.
 - Validation functions share the signature
   `fn (std.mem.Allocator, T) std.mem.Allocator.Error!?String`: return `null` on
   success, an allocated error message string on failure. See
@@ -120,7 +136,12 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   path. `generate` appends one `?Sub(c.Cmd, subApp(app, c)).View` field per
   command after the Alt fields, named `c.view_field`; parsing hands off to
   `Sub(...).parseInnerHelp` and assigns the sub-View directly (no tagged
-  union). Duplicate command wire names at a level and command-field names
+  union). Handoff also passes an ancestor chain (`Ancestor`/`ParseFrame`/
+  `ancestorFns`, nearest-first with an `up` link): a flag token that misses the
+  sub's own specs is retried against each ancestor's `assignLongFlag`/
+  `assignShortFlag`, so `app sub --root-flag` assigns into the ancestor's
+  `View`, consistent with the merged help and the global uniqueness rule.
+  Duplicate command wire names at a level and command-field names
   colliding with a spec are compile errors (`checkCommandNames` /
   `checkCommandFieldNames`); mixing commands with positional arguments in one
   declaration is also rejected (`checkCommandArgumentMix`), since a command

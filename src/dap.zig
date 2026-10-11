@@ -11,12 +11,22 @@
 //! `f80`) and `dap.String` (`[]const u8`). Custom value types are usable when
 //! they expose:
 //!
-//!     pub fn decode(self: *Self, data: []const u8) DecodeError!void
-//!     pub fn encode(self: *Self) []const u8
+//!     pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!Self
+//!     pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8
+//!     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void
 //!
-//! These two methods are the stable contract. The list is intended to grow with
-//! optional methods (for completions and such), but `decode`/`encode` will
-//! always be required.
+//! `decode` is a static constructor: it takes the allocator and the wire token
+//! and returns a fully built value, so types with internal allocations (arg
+//! arrays, nested buffers) can own them. `encode` builds the wire spelling
+//! into allocator-owned memory the caller frees. `deinit` releases a value's
+//! internals; it must NOT call `allocator.destroy(self)` (the value is a copy).
+//!
+//! These three methods are the stable contract. Every field of a `View`
+//! returned by a successful `parse` is owned by the caller; release it with
+//! `CLI.deinit(&view, allocator)` (see the `generate` docs).
+//!
+//! The list is intended to grow with optional methods (for completions and
+//! such), but `decode`/`encode`/`deinit` will always be required.
 
 const std = @import("std");
 const stdcompare = @import("stdcompare.zig");
@@ -248,7 +258,8 @@ pub fn Argument(comptime T: type) type {
 /// Resulting names must be validated against using the same name for different branches (which may happen with custom
 /// ones).
 ///
-/// It creates a valid type with decode and encode methods. The view must be a Zig enumeration:
+/// It creates a valid type with `decode`/`encode` methods matching the custom
+/// value-type contract. The view must be a Zig enumeration:
 /// ```
 /// enum{
 ///     branch1,
@@ -263,15 +274,20 @@ pub fn Enumeration(comptime T: anytype) type {
         // No branches: there is no tag type to build a `@Enum` from. Degenerate
         // but still usable as a value type (never accepts a wire token).
         return struct {
-            pub fn decode(self: *@This(), data: []const u8) DecodeError!void {
-                _ = self;
+            pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!@This() {
+                _ = allocator;
                 _ = data;
                 return error.InvalidWire;
             }
 
-            pub fn encode(self: *@This()) []const u8 {
+            pub fn encode(self: *@This(), allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
                 _ = self;
-                return "";
+                return try allocator.dupe(u8, "");
+            }
+
+            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+                _ = self;
+                _ = allocator;
             }
         };
     }
@@ -316,18 +332,23 @@ pub fn Enumeration(comptime T: anytype) type {
         pub const EnumView = View;
         pub const names = wire_names;
 
-        pub fn decode(self: *@This(), data: []const u8) DecodeError!void {
+        pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!@This() {
+            _ = allocator;
             inline for (wire_names, 0..) |nm, i| {
                 if (std.mem.eql(u8, nm, data)) {
-                    self.view = @enumFromInt(@as(TagInt, @intCast(i)));
-                    return;
+                    return .{ .view = @enumFromInt(@as(TagInt, @intCast(i))) };
                 }
             }
             return error.InvalidWire;
         }
 
-        pub fn encode(self: *@This()) []const u8 {
-            return wire_names[@intFromEnum(self.view)];
+        pub fn encode(self: *@This(), allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+            return try allocator.dupe(u8, wire_names[@intFromEnum(self.view)]);
+        }
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            _ = self;
+            _ = allocator;
         }
     };
 }
@@ -559,8 +580,10 @@ pub const Validate = struct {
     }
 };
 
-/// This error can be returned on decode.
-pub const DecodeError = error{
+/// This error can be returned on decode. Custom `decode` receives the shared
+/// allocator and may allocate internal storage (arrays, nested buffers), so
+/// the allocator's error set is folded in.
+pub const DecodeError = std.mem.Allocator.Error || error{
     /// InvalidWire means the value does not represent a correct value.
     InvalidWire,
 
@@ -1577,12 +1600,24 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// Custom value types are supported when they expose
 ///
 /// ```
-/// pub fn decode(self: *Self, data: []const u8) dap.DecodeError!void
-/// pub fn encode(self: *Self) []const u8
+/// pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!Self
+/// pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8
+/// pub fn deinit(self: *Self, allocator: std.mem.Allocator) void
 /// ```
 ///
+/// `decode` is a static constructor returning a fully built value (so types
+/// with internal allocations can own them); `encode` returns an
+/// allocator-owned wire spelling the caller frees; `deinit` releases the
+/// value's internals and must not call `allocator.destroy(self)`.
+///
+/// Every field of a `View` returned by a successful `parse` is owned by the
+/// caller: `[]const u8` fields are duplicated from argv, environ and comptime
+/// literals, and custom-type fields own their internals. Release them with
+/// `CLI.deinit(&view, allocator)`. It is valid once on a successful parse and
+/// is not idempotent; `args`/`environ` are borrowed only during `parse`.
+///
 /// The list of these methods is meant to grow (completions and such), but
-/// these two are the stable contract. Builtin scalars, `dap.String`
+/// these three are the stable contract. Builtin scalars, `dap.String`
 /// (`[]const u8`) and `dap.Enumeration` results work out of the box.
 /// Name of the builtin help flag injected into every declaration.
 const builtin_help_field = "builtin_help";
@@ -1975,6 +2010,33 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         pub const commands = cmd_entries;
         pub const View = @Struct(.auto, null, &Names, &Types, &Attrs);
 
+        /// Release every owned field of a `View` returned by a successful
+        /// parse: string slices, custom-type internals, optional payloads, the
+        /// active `Alt` branch, and every activated command sub-`View`.
+        /// Valid once, not idempotent; custom types handle their own internals.
+        pub fn deinit(self: *View, allocator: std.mem.Allocator) void {
+            inline for (all_specs) |s| {
+                if (s.alt != null) continue; // Alt members released via their Alt field below
+                deinitValue(specViewType(s), allocator, &@field(self, s.name));
+            }
+            inline for (alts) |a| {
+                if (@field(self, a.field)) |*u| {
+                    switch (u.*) {
+                        inline else => |*branch| {
+                            inline for (@typeInfo(@TypeOf(branch.*)).@"struct".fields) |f| {
+                                deinitValue(f.type, allocator, &@field(branch, f.name));
+                            }
+                        },
+                    }
+                }
+            }
+            inline for (cmd_entries) |c| {
+                if (@field(self, c.view_field)) |*sub| {
+                    Sub(c.Cmd, subApp(app, c)).deinit(sub, allocator);
+                }
+            }
+        }
+
         /// Fill a runtime [`HelpData`] description of this declaration. Every
         /// string and slice is allocated with `allocator`; release them with
         /// `HelpData.deinit`. Nothing here runs unless this or `helpText` is
@@ -2189,7 +2251,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             if (s.vtype == String) return try allocator.dupe(u8, d.get([]const u8));
             if (@typeInfo(s.vtype) == .@"struct") {
                 var tmp: s.vtype = d.get(s.vtype);
-                return try allocator.dupe(u8, tmp.encode());
+                return try tmp.encode(allocator);
             }
             return try std.fmt.allocPrint(allocator, "{}", .{d.get(s.vtype)});
         }
@@ -2330,14 +2392,18 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// `parse` turns them into stderr diagnostics plus help text and a
         /// nonzero exit.
         fn parseInner(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!View {
-            return parseInnerHelp(allocator, environ, args, diag, false);
+            return parseInnerHelp(allocator, environ, args, diag, false, null);
         }
 
         /// The parse pipeline. `ancestor_help` records that a help flag was seen on
         /// an ancestor level's wire before the handoff, so a deep command still
         /// honours the request (help token *before* the commands, D1) even though a
         /// plain sub-parse would otherwise fail its own required checks.
-        fn parseInnerHelp(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag, ancestor_help: bool) ParseError!View {
+        /// `up` links the active ancestor levels (nearest first, root last); a
+        /// flag token that matches no local spec is resolved against them,
+        /// mirroring the merged help and the global flag-name uniqueness rule,
+        /// so `app sub --root-flag` assigns into the ancestor's `View`.
+        fn parseInnerHelp(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag, ancestor_help: bool, up: ?*const Ancestor) ParseError!View {
             if (diag) |d| d.* = .{};
 
             var v: View = undefined;
@@ -2372,10 +2438,10 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 }
 
                 if (std.mem.startsWith(u8, tok, "--")) {
-                    try consumeLongFlag(allocator, &v, &seen, args, &i, diag, true);
+                    try consumeLongFlag(allocator, &v, &seen, args, &i, diag, true, up);
                     if (v.builtin_help) help_seen = true;
                 } else if (tok.len > 1 and tok[0] == '-') {
-                    try consumeShortFlag(allocator, &v, &seen, args, &i, diag, true);
+                    try consumeShortFlag(allocator, &v, &seen, args, &i, diag, true, up);
                     if (v.builtin_help) help_seen = true;
                 } else {
                     if (cmd_entries.len == 0) {
@@ -2389,7 +2455,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                         inline for (cmd_entries) |c| {
                             if (std.mem.eql(u8, c.name, tok)) {
                                 const S = Sub(c.Cmd, subApp(app, c));
-                                @field(v, c.view_field) = try S.parseInnerHelp(allocator, environ, args[i + 1 ..], diag, help_seen);
+                                var frame: ParseFrame(@This()) = .{ .v = &v, .seen = &seen };
+                                const chain: Ancestor = .{
+                                    .ctx = &frame,
+                                    .up = up,
+                                    .assign_long = ancestorFns(@This()).assignLong,
+                                    .assign_short = ancestorFns(@This()).assignShort,
+                                };
+                                @field(v, c.view_field) = try S.parseInnerHelp(allocator, environ, args[i + 1 ..], diag, help_seen, &chain);
                                 handed_off = true;
                                 matched = true;
                             }
@@ -2457,29 +2530,17 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return v;
         }
 
-        fn consumeLongFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag, suggest: bool) ParseError!void {
+        fn consumeLongFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag, suggest: bool, up: ?*const Ancestor) ParseError!void {
             const tok = args[i.*];
             const body = tok[2..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
             const name = if (eq) |e| body[0..e] else body;
             const eqv: ?[]const u8 = if (eq) |e| body[e + 1 ..] else null;
 
-            inline for (all_specs, 0..) |s, si| {
-                if (s.kind == .flag and std.mem.eql(u8, s.long, name)) {
-                    if (s.vtype == bool) {
-                        try assignValue(s, View, allocator, v, seen, si, eqv orelse "true", diag);
-                    } else if (eqv) |iv| {
-                        try assignValue(s, View, allocator, v, seen, si, iv, diag);
-                    } else {
-                        if (i.* + 1 >= args.len) {
-                            if (diag) |d| d.token = tok;
-                            return error.MissingValue;
-                        }
-                        i.* += 1;
-                        try assignValue(s, View, allocator, v, seen, si, args[i.*], diag);
-                    }
-                    return;
-                }
+            if (try assignLongFlag(@This(), allocator, v, seen, args, i, diag, name, eqv)) return;
+            var p = up;
+            while (p) |frame| : (p = frame.up) {
+                if (try frame.assign_long(frame.ctx, allocator, args, i, diag, name, eqv)) return;
             }
 
             if (diag) |d| {
@@ -2489,33 +2550,17 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             return error.UnknownFlag;
         }
 
-        fn consumeShortFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag, suggest: bool) ParseError!void {
+        fn consumeShortFlag(allocator: std.mem.Allocator, v: *View, seen: *[all_specs.len]bool, args: []const []const u8, i: *usize, diag: ?*Diag, suggest: bool, up: ?*const Ancestor) ParseError!void {
             const tok = args[i.*];
             const body = tok[1..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
             const name = if (eq) |e| body[0..e] else body;
             const eqv: ?[]const u8 = if (eq) |e| body[e + 1 ..] else null;
 
-            inline for (all_specs, 0..) |s, si| {
-                if (s.kind == .flag) {
-                    if (s.short) |sh| {
-                        if (std.mem.eql(u8, sh, name)) {
-                            if (s.vtype == bool) {
-                                try assignValue(s, View, allocator, v, seen, si, eqv orelse "true", diag);
-                            } else if (eqv) |iv| {
-                                try assignValue(s, View, allocator, v, seen, si, iv, diag);
-                            } else {
-                                if (i.* + 1 >= args.len) {
-                                    if (diag) |d| d.token = tok;
-                                    return error.MissingValue;
-                                }
-                                i.* += 1;
-                                try assignValue(s, View, allocator, v, seen, si, args[i.*], diag);
-                            }
-                            return;
-                        }
-                    }
-                }
+            if (try assignShortFlag(@This(), allocator, v, seen, args, i, diag, name, eqv)) return;
+            var p = up;
+            while (p) |frame| : (p = frame.up) {
+                if (try frame.assign_short(frame.ctx, allocator, args, i, diag, name, eqv)) return;
             }
 
             if (diag) |d| {
@@ -2563,6 +2608,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         pub const helpData = Base.helpData;
         pub const helpText = Base.helpText;
         pub const usage = Base.usage;
+        pub const deinit = Base.deinit;
 
         pub const CommandPayload = CommandPayloadOf(app, cmd_entries);
 
@@ -2588,6 +2634,43 @@ fn Sub(comptime Cmd: type, comptime app: App) type {
 
 /// The child app of one command entry: the command's wire name appended to
 /// the parent's path anchor, its meta strings, the parent's renderer.
+/// One active ancestor level handed down to a sub-parse, so a flag token that
+/// misses the sub's own specs can be resolved up the command chain. The
+/// ancestor's type is erased behind a context pointer plus the two assign
+/// entry points; `up` links to the next ancestor towards the root. Flags of
+/// every ancestor merge into deep help and are globally unique, so resolving
+/// them here keeps parsing consistent with what help advertises.
+const Ancestor = struct {
+    ctx: *anyopaque,
+    up: ?*const Ancestor,
+    assign_long: *const fn (*anyopaque, std.mem.Allocator, []const []const u8, *usize, ?*Diag, []const u8, ?[]const u8) ParseError!bool,
+    assign_short: *const fn (*anyopaque, std.mem.Allocator, []const []const u8, *usize, ?*Diag, []const u8, ?[]const u8) ParseError!bool,
+};
+
+/// Typed parse state of one ancestor level (its `View` plus the `seen` flags),
+/// what an `Ancestor.ctx` really points at.
+fn ParseFrame(comptime NS: type) type {
+    return struct {
+        v: *NS.View,
+        seen: *[NS.specs.len]bool,
+    };
+}
+
+/// Build the two type-erased entry points of one ancestor level.
+fn ancestorFns(comptime NS: type) type {
+    return struct {
+        fn assignLong(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const []const u8, i: *usize, diag: ?*Diag, name: []const u8, eqv: ?[]const u8) ParseError!bool {
+            const frame: *ParseFrame(NS) = @ptrCast(@alignCast(ctx));
+            return assignLongFlag(NS, allocator, frame.v, frame.seen, args, i, diag, name, eqv);
+        }
+
+        fn assignShort(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const []const u8, i: *usize, diag: ?*Diag, name: []const u8, eqv: ?[]const u8) ParseError!bool {
+            const frame: *ParseFrame(NS) = @ptrCast(@alignCast(ctx));
+            return assignShortFlag(NS, allocator, frame.v, frame.seen, args, i, diag, name, eqv);
+        }
+    };
+}
+
 fn subApp(comptime parent: App, comptime c: CommandEntry) App {
     return .{
         .name = if (parent.name.len == 0) c.name else parent.name ++ " " ++ c.name,
@@ -2754,7 +2837,7 @@ fn isDecodable(comptime T: type) bool {
     switch (@typeInfo(T)) {
         .int, .float => return true,
         .pointer => |p| return p.size == .slice and p.child == u8,
-        .@"struct" => return @hasDecl(T, "decode") and @hasDecl(T, "encode"),
+        .@"struct" => return @hasDecl(T, "decode") and @hasDecl(T, "encode") and @hasDecl(T, "deinit"),
         else => return false,
     }
 }
@@ -2770,6 +2853,9 @@ fn decodeBool(data: []const u8) DecodeError!bool {
 /// Decode a single wire token into `out` according to the §6.4 table.
 /// Builtin scalars, string slices and custom `decode`/`encode` structs are
 /// supported; anything else is rejected at compile time.
+///
+/// A custom `decode` is a static constructor returning a fully built value, so
+/// the type can own internal allocations it made with the shared allocator.
 fn decodeInto(comptime T: type, allocator: std.mem.Allocator, data: []const u8, out: *T) DecodeIntoTError!void {
     switch (@typeInfo(T)) {
         .bool => out.* = try decodeBool(data),
@@ -2782,12 +2868,36 @@ fn decodeInto(comptime T: type, allocator: std.mem.Allocator, data: []const u8, 
                 @compileError("pointer value type of '" ++ @typeName(T) ++ "' is not decodable by dap");
             }
         },
-        .@"struct" => {
-            var tmp: T = .{};
-            try tmp.decode(data);
-            out.* = tmp;
-        },
+        .@"struct" => out.* = try T.decode(allocator, data),
         else => @compileError("type '" ++ @typeName(T) ++ "' is not decodable by dap"),
+    }
+}
+
+/// Release the allocations owned by a decoded value of type `T`, mirroring
+/// `decodeInto`'s dispatch. Scalars own nothing; string slices are freed;
+/// custom structs release their own internals through their mandatory
+/// `deinit`; optionals recurse when non-null. A zero-length slice (the `""`
+/// zero default) is safe: `Allocator.free` returns early on an empty slice.
+fn deinitValue(comptime T: type, allocator: std.mem.Allocator, val: *T) void {
+    switch (@typeInfo(T)) {
+        .bool, .int, .float => {},
+        .pointer => |p| {
+            if (p.size != .slice) {
+                @compileError("pointer value type of '" ++ @typeName(T) ++ "' is not deinitalizable by dap");
+            }
+            switch (@typeInfo(p.child)) {
+                .@"struct" => {
+                    for (val.*) |*el| el.deinit(allocator);
+                    allocator.free(val.*);
+                },
+                else => allocator.free(val.*),
+            }
+        },
+        .@"struct" => val.deinit(allocator),
+        .optional => |o| {
+            if (val.*) |*inner| deinitValue(o.child, allocator, inner);
+        },
+        else => @compileError("type '" ++ @typeName(T) ++ "' is not deinitalizable by dap"),
     }
 }
 
@@ -2810,8 +2920,11 @@ fn specViewType(comptime s: Spec) type {
 
 /// Assign a normalized direct (comptime) default to `out`. String slices are
 /// copied with the caller's allocator so ownership stays uniform with values
-/// decoded from the wire.
-fn assignDirectDefault(comptime T: type, allocator: std.mem.Allocator, d: DefaultRepr, out: *T) std.mem.Allocator.Error!void {
+/// decoded from the wire. A custom struct default is routed through an
+/// `encode`/`decode` roundtrip so the value left in `out` is fully owned by
+/// `allocator`: a verbatim copy would put comptime slices under a `deinit`
+/// that frees them.
+fn assignDirectDefault(comptime T: type, allocator: std.mem.Allocator, d: DefaultRepr, out: *T) DecodeIntoTError!void {
     switch (@typeInfo(T)) {
         .pointer => |p| {
             if (p.size == .slice and p.child == u8) {
@@ -2819,9 +2932,87 @@ fn assignDirectDefault(comptime T: type, allocator: std.mem.Allocator, d: Defaul
                 return;
             }
         },
+        .@"struct" => {
+            var tmp: T = d.get(T);
+            const wire = try tmp.encode(allocator);
+            defer allocator.free(wire);
+            out.* = try T.decode(allocator, wire);
+            return;
+        },
         else => {},
     }
     out.* = d.get(T);
+}
+
+/// Try to bind a long flag token against one level's specs. `true` when the
+/// level declares the flag and its value was assigned, `false` when the token
+/// names no flag here. Split out of `consumeLongFlag` so the same lookup can
+/// run over each active ancestor frame, letting a parent flag follow a command.
+fn assignLongFlag(
+    comptime NS: type,
+    allocator: std.mem.Allocator,
+    v: *NS.View,
+    seen: *[NS.specs.len]bool,
+    args: []const []const u8,
+    i: *usize,
+    diag: ?*Diag,
+    name: []const u8,
+    eqv: ?[]const u8,
+) ParseError!bool {
+    inline for (NS.specs, 0..) |s, si| {
+        if (s.kind == .flag and std.mem.eql(u8, s.long, name)) {
+            if (s.vtype == bool) {
+                try assignValue(s, NS.View, allocator, v, seen, si, eqv orelse "true", diag);
+            } else if (eqv) |iv| {
+                try assignValue(s, NS.View, allocator, v, seen, si, iv, diag);
+            } else {
+                if (i.* + 1 >= args.len) {
+                    if (diag) |d| d.token = args[i.*];
+                    return error.MissingValue;
+                }
+                i.* += 1;
+                try assignValue(s, NS.View, allocator, v, seen, si, args[i.*], diag);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Short-alias counterpart of `assignLongFlag`.
+fn assignShortFlag(
+    comptime NS: type,
+    allocator: std.mem.Allocator,
+    v: *NS.View,
+    seen: *[NS.specs.len]bool,
+    args: []const []const u8,
+    i: *usize,
+    diag: ?*Diag,
+    name: []const u8,
+    eqv: ?[]const u8,
+) ParseError!bool {
+    inline for (NS.specs, 0..) |s, si| {
+        if (s.kind == .flag) {
+            if (s.short) |sh| {
+                if (std.mem.eql(u8, sh, name)) {
+                    if (s.vtype == bool) {
+                        try assignValue(s, NS.View, allocator, v, seen, si, eqv orelse "true", diag);
+                    } else if (eqv) |iv| {
+                        try assignValue(s, NS.View, allocator, v, seen, si, iv, diag);
+                    } else {
+                        if (i.* + 1 >= args.len) {
+                            if (diag) |d| d.token = args[i.*];
+                            return error.MissingValue;
+                        }
+                        i.* += 1;
+                        try assignValue(s, NS.View, allocator, v, seen, si, args[i.*], diag);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /// Decode `val` into the field named by comptime spec `s`, marking it seen.
@@ -2973,7 +3164,10 @@ fn resolveAbsent(
         }
     }
     if (s.default) |d| {
-        assignDirectDefault(s.vtype, allocator, d, &@field(v, s.name)) catch return error.OutOfMemory;
+        assignDirectDefault(s.vtype, allocator, d, &@field(v, s.name)) catch |e| {
+            if (diag) |dd| dd.field = s.name;
+            return e;
+        };
         return;
     }
     if (s.required) {
@@ -3007,7 +3201,7 @@ fn specFromField(comptime f: std.builtin.Type.StructField) Spec {
 
     const V = T.dap_value_type;
     if (!isDecodable(V)) {
-        @compileError("value type of declaration field '" ++ f.name ++ "' is not decodable (needs decode/encode methods)");
+        @compileError("value type of declaration field '" ++ f.name ++ "' is not decodable (needs decode/encode/deinit methods)");
     }
     const inst = if (is_opt) instValueOpt(f, T) else instValue(f);
     const defpair = declDefault(T, inst);
@@ -3882,28 +4076,39 @@ test "M2: View is a fully usable struct" {
 const DecodeOk = struct {
     value: u32 = 0,
 
-    pub fn decode(self: *DecodeOk, data: []const u8) DecodeError!void {
-        self.value = std.fmt.parseInt(u32, data, 10) catch return error.InvalidWire;
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!DecodeOk {
+        _ = allocator;
+        return .{ .value = std.fmt.parseInt(u32, data, 10) catch return error.InvalidWire };
     }
 
-    pub fn encode(self: *DecodeOk) []const u8 {
+    pub fn encode(self: *DecodeOk, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
         _ = self;
-        return "";
+        return try allocator.dupe(u8, "");
+    }
+
+    pub fn deinit(self: *DecodeOk, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
     }
 };
 
 const DecodeReject = struct {
     value: u8 = 0,
 
-    pub fn decode(self: *DecodeReject, data: []const u8) DecodeError!void {
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!DecodeReject {
+        _ = allocator;
         _ = data;
-        _ = self;
         return error.InvalidValue;
     }
 
-    pub fn encode(self: *DecodeReject) []const u8 {
+    pub fn encode(self: *DecodeReject, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
         _ = self;
-        return "";
+        return try allocator.dupe(u8, "");
+    }
+
+    pub fn deinit(self: *DecodeReject, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
     }
 };
 
@@ -4496,6 +4701,25 @@ test "M7: flags after the command are scoped to the sub" {
     try std.testing.expectEqualStrings("file", a._start.?.name);
 }
 
+test "M7: root flags resolve after a command handoff" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+
+    // Root flags and the sub's own flag interleave after the command token; the
+    // parent's `--verbose`/`--needed` are resolved up the ancestor chain while
+    // `--force` stays with the sub.
+    const a = try m7Parse(&arena, &.{ "start", "file", "--verbose", "--needed", "v", "--force" }, &diag);
+    try std.testing.expect(a.verbose);
+    try std.testing.expectEqualStrings("v", a.needed);
+    try std.testing.expect(a._start != null);
+    try std.testing.expect(a._start.?.force);
+    try std.testing.expectEqualStrings("file", a._start.?.name);
+
+    // An unknown token is still rejected even with active ancestors.
+    try std.testing.expectError(error.UnknownFlag, m7Parse(&arena, &.{ "start", "file", "--nope" }, &diag));
+}
+
 test "M7: root required still enforced after handoff" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4554,17 +4778,22 @@ test "M8: enumeration builds a view over branch names" {
 }
 
 test "M8: enumeration round-trips wire names through decode/encode" {
+    const allocator = std.testing.allocator;
     var m: Mode = .{};
-    try std.testing.expectEqualStrings("fast", m.encode());
+    const fast = try m.encode(allocator);
+    defer allocator.free(fast);
+    try std.testing.expectEqualStrings("fast", fast);
 
-    try m.decode("glacial");
-    try std.testing.expectEqualStrings("glacial", m.encode());
+    m = try Mode.decode(allocator, "glacial");
+    const glacial = try m.encode(allocator);
+    defer allocator.free(glacial);
+    try std.testing.expectEqualStrings("glacial", glacial);
     try std.testing.expectEqual(Mode.EnumView.slow, m.view);
 
-    try m.decode("fast");
+    m = try Mode.decode(allocator, "fast");
     try std.testing.expectEqual(Mode.EnumView.fast, m.view);
 
-    try std.testing.expectError(error.InvalidWire, m.decode("nope"));
+    try std.testing.expectError(error.InvalidWire, Mode.decode(allocator, "nope"));
     try std.testing.expectEqual(Mode.EnumView.fast, m.view);
 }
 
@@ -4585,7 +4814,8 @@ test "M8: enumeration works as an flag value type" {
 
     const a = try CLI.parse(allocator, std.process.Environ.empty, &.{ "--mode", "glacial", "f" }, &diag);
     var amode = a.mode;
-    try std.testing.expectEqualStrings("glacial", amode.encode());
+    const encoded = try amode.encode(allocator);
+    try std.testing.expectEqualStrings("glacial", encoded);
     try std.testing.expectEqualStrings("f", a.file);
 
     const b = try CLI.parse(allocator, std.process.Environ.empty, &.{"f"}, &diag);
@@ -4608,14 +4838,17 @@ test "M8: enumeration works as an argument value type" {
 
     const a = try CLI.parse(allocator, std.process.Environ.empty, &.{"glacial"}, &diag);
     var amode = a.mode;
-    try std.testing.expectEqualStrings("glacial", amode.encode());
+    const encoded = try amode.encode(allocator);
+    try std.testing.expectEqualStrings("glacial", encoded);
 }
 
 test "M8: empty enumeration is a decodable value type that rejects everything" {
     const Empty = Enumeration(.{});
     var e: Empty = .{};
-    try std.testing.expectError(error.InvalidWire, e.decode("anything"));
-    try std.testing.expectEqualStrings("", e.encode());
+    try std.testing.expectError(error.InvalidWire, Empty.decode(std.testing.allocator, "anything"));
+    const encoded = try e.encode(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings("", encoded);
 }
 
 // Negative check (verified by uncommenting):
@@ -6370,4 +6603,191 @@ test "M16: absent error line leaves the compact view unchanged" {
     const h = try data.renderCompact(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, h, "error:") == null);
+}
+
+// ---------------------------------------------------------------------------
+// M17: View deinit.
+// ---------------------------------------------------------------------------
+
+/// A custom value type that allocates inside `decode` (an owned `u16` slice),
+/// the reference shape for the three-method contract.
+const M17Custom = struct {
+    const Self = @This();
+
+    nums: []const u16,
+
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!Self {
+        var list: std.ArrayList(u16) = .empty;
+        errdefer list.deinit(allocator);
+
+        var it = std.mem.tokenizeScalar(u8, data, ',');
+        while (it.next()) |raw| {
+            const n = std.fmt.parseInt(u16, std.mem.trim(u8, raw, " \t"), 10) catch return error.InvalidWire;
+            try list.append(allocator, n);
+        }
+        return .{ .nums = try list.toOwnedSlice(allocator) };
+    }
+
+    pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.nums, 0..) |n, i| {
+            if (i != 0) try out.append(allocator, ',');
+            try out.print(allocator, "{}", .{n});
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        allocator.free(self.nums);
+    }
+};
+
+const M17ScalarDef = .{
+    .loud = Flag(bool){ .short = "l", .help = "Loud." },
+    .count = Flag(u16){ .default = Default(u16){ .direct = 1 }, .help = "Count." },
+    .ratio = Flag(f64){ .default = Default(f64){ .direct = 0.5 }, .help = "Ratio." },
+};
+
+const M17StringDef = .{
+    .user = Flag([]const u8){ .short = "u", .help = "User." },
+    .host = Flag([]const u8){ .default = Default([]const u8){ .direct = "localhost" }, .help = "Host." },
+    .env_user = Flag([]const u8){ .default = Default([]const u8){ .env = "DAP_M17_USER" }, .help = "Env user." },
+    .opt = Optional(Flag([]const u8){ .help = "Optional." }),
+};
+
+const M17CustomDef = .{
+    .nums = Flag(M17Custom){
+        .long = "nums",
+        .default = Default(M17Custom){ .direct = M17Custom{ .nums = &.{} } },
+        .help = "Numbers.",
+    },
+};
+
+const M17AltDef = .{
+    .source = Alt(.{
+        .file = .{
+            .file = Flag([]const u8){ .short = "s", .help = "Source file." },
+        },
+        .net = VariantNamed("net", .{
+            .url = Flag([]const u8){ .help = "Source URL." },
+        }),
+    }),
+};
+
+const M17CmdDef = .{
+    .config = Flag([]const u8){ .default = Default([]const u8){ .direct = "/etc/x" }, .help = "Config." },
+    .svc = Command(.{ .help = "Service." }, .{
+        .out = Flag([]const u8){ .default = Default([]const u8){ .direct = "out" }, .help = "Out." },
+        .build = Command(.{ .help = "Build." }, .{
+            .target = Argument([]const u8){ .help = "Target." },
+        }),
+    }),
+};
+
+const M17Scalar = generate(App{ .name = "m17-scalar", .help = "M17 scalar" }, M17ScalarDef);
+const M17String = generate(App{ .name = "m17-string", .help = "M17 string" }, M17StringDef);
+const M17CustomCli = generate(App{ .name = "m17-custom", .help = "M17 custom" }, M17CustomDef);
+const M17Alt = generate(App{ .name = "m17-alt", .help = "M17 alt" }, M17AltDef);
+const M17Cmd = generate(App{ .name = "m17-cmd", .help = "M17 cmd" }, M17CmdDef);
+
+// Negative check (verified by uncommenting): a struct with only decode and
+// encode is not a valid value type now that deinit is mandatory.
+// const M17NoDeinit = struct {
+//     value: u8 = 0,
+//     pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!@This() {
+//         _ = allocator; _ = data; return .{};
+//     }
+//     pub fn encode(self: *@This(), allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+//         _ = self; return try allocator.dupe(u8, "");
+//     }
+// };
+// const M17Bad = generate(App{ .name = "bad", .help = "bad" }, .{
+//     .x = Flag(M17NoDeinit){},
+// });
+
+test "M17: enumeration no-op deinit" {
+    var m: Mode = .{};
+    m.deinit(std.testing.allocator);
+
+    const Empty = Enumeration(.{});
+    var e: Empty = .{};
+    e.deinit(std.testing.allocator);
+}
+
+test "M17: scalar view deinit frees nothing" {
+    var diag: Diag = .{};
+    var v = try M17Scalar.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "-l", "--count", "3" }, &diag);
+    M17Scalar.deinit(&v, std.testing.allocator);
+    try std.testing.expect(v.loud);
+}
+
+test "M17: wire string is owned and released" {
+    var diag: Diag = .{};
+    var v = try M17String.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "-u", "alice" }, &diag);
+    try std.testing.expectEqualStrings("alice", v.user);
+    M17String.deinit(&v, std.testing.allocator);
+}
+
+test "M17: direct-default string is owned and released" {
+    var diag: Diag = .{};
+    var v = try M17String.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "-u", "alice" }, &diag);
+    try std.testing.expectEqualStrings("localhost", v.host);
+    M17String.deinit(&v, std.testing.allocator);
+}
+
+test "M17: env string is owned and released" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const envp = &[_][*:0]const u8{"DAP_M17_USER=envbob"};
+    var diag: Diag = .{};
+    var v = try M17String.parseInner(std.testing.allocator, makeEnviron(envp), &.{ "-u", "alice" }, &diag);
+    try std.testing.expectEqualStrings("envbob", v.env_user);
+    M17String.deinit(&v, std.testing.allocator);
+}
+
+test "M17: optional strings present and absent both release" {
+    var diag: Diag = .{};
+    var present = try M17String.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "-u", "a", "--opt", "x" }, &diag);
+    try std.testing.expectEqualStrings("x", present.opt.?);
+    M17String.deinit(&present, std.testing.allocator);
+
+    var absent = try M17String.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "-u", "a" }, &diag);
+    try std.testing.expect(absent.opt == null);
+    M17String.deinit(&absent, std.testing.allocator);
+}
+
+test "M17: custom type wire value is owned and released" {
+    var diag: Diag = .{};
+    var v = try M17CustomCli.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "--nums", "1,2,3" }, &diag);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 3 }, v.nums.nums);
+    M17CustomCli.deinit(&v, std.testing.allocator);
+}
+
+test "M17: custom direct default roundtrips into owned memory" {
+    var diag: Diag = .{};
+    var v = try M17CustomCli.parseInner(std.testing.allocator, std.process.Environ.empty, &.{}, &diag);
+    try std.testing.expectEqual(@as(usize, 0), v.nums.nums.len);
+    M17CustomCli.deinit(&v, std.testing.allocator);
+}
+
+test "M17: Alt active branch released and null union released" {
+    var diag: Diag = .{};
+    var active = try M17Alt.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "-s", "a.zig" }, &diag);
+    switch (active.source.?) {
+        .file => |p| try std.testing.expectEqualStrings("a.zig", p.file),
+        else => return error.TestUnexpectedResult,
+    }
+    M17Alt.deinit(&active, std.testing.allocator);
+
+    var none = try M17Alt.parseInner(std.testing.allocator, std.process.Environ.empty, &.{}, &diag);
+    try std.testing.expect(none.source == null);
+    M17Alt.deinit(&none, std.testing.allocator);
+}
+
+test "M17: nested command deinit recurses" {
+    var diag: Diag = .{};
+    var v = try M17Cmd.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "svc", "build", "hello" }, &diag);
+    try std.testing.expectEqualStrings("/etc/x", v.config);
+    try std.testing.expectEqualStrings("hello", v._svc.?._build.?.target);
+    M17Cmd.deinit(&v, std.testing.allocator);
 }

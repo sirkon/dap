@@ -1,6 +1,42 @@
 const std = @import("std");
 const dap = @import("dap");
 
+const CustomType = struct {
+    const Self = @This();
+
+    nums: []const u16,
+
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!Self {
+        var list: std.ArrayList(u16) = .empty;
+        errdefer list.deinit(allocator);
+
+        var it = std.mem.tokenizeScalar(u8, data, ',');
+        while (it.next()) |raw| {
+            const tok = std.mem.trim(u8, raw, " \t");
+            const n = std.fmt.parseInt(u16, tok, 10) catch return error.InvalidWire;
+            try list.append(allocator, n);
+        }
+
+        return .{
+            .nums = try list.toOwnedSlice(allocator),
+        };
+    }
+
+    pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.nums, 0..) |n, i| {
+            if (i != 0) try out.append(allocator, ',');
+            try out.print(allocator, "{}", .{n});
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        allocator.free(self.nums);
+    }
+};
+
 const def = .{
     .source = dap.Alt(.{
         .file = .{
@@ -34,6 +70,13 @@ const def = .{
     .flag = dap.Flag(bool){
         .short = "f",
         .help = "Flag to show off in the usage header.",
+    },
+    .custom = dap.Flag(CustomType){
+        .long = "custom",
+        .default = dap.defaultValue(CustomType, CustomType{
+            .nums = &.{},
+        }),
+        .help = "Custom type translating 1,2,3 into [1, 2, 3].",
     },
     .command1 = dap.Command(
         .{ .name = "command-1", .help = "Command 1." },
@@ -71,7 +114,7 @@ const CLI = dap.generate(
 );
 
 pub fn main(init: std.process.Init) !void {
-    const arena = init.arena.allocator();
+    const arena = std.heap.page_allocator;
 
     var stdout_buffer: [0x400]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -86,7 +129,8 @@ pub fn main(init: std.process.Init) !void {
     // Parse errors and --help/-h requests are handled inside parse: help is
     // rendered to stdout with a clean exit, failures print the diagnostics
     // plus help to stderr and exit with code 1.
-    const cli = try CLI.parse(arena, init.minimal.environ, args, &diag);
+    var cli = try CLI.parse(arena, init.minimal.environ, args, &diag);
+    defer CLI.deinit(&cli, arena);
 
     if (cli.source) |src| switch (src) {
         .file => |p| try stdout.print("file   = {s}\n", .{p.file}),
@@ -94,6 +138,7 @@ pub fn main(init: std.process.Init) !void {
     };
     try stdout.print("last   = {}\n", .{cli.last});
     try stdout.print("count  = {}\n", .{cli.count});
+    try stdout.print("custom_type = {}\n", .{cli.custom});
     if (CLI.command(cli)) |cmd| switch (cmd) {
         .command1 => try stdout.print("command = command-1\n", .{}),
         .command2 => |c| try stdout.print("value  = {s}\n", .{c.value}),

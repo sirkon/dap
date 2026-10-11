@@ -82,7 +82,11 @@ pub fn main(init: std.process.Init) !void {
 
     // On failure this prints diagnostics + help to stderr and exits(1);
     // on --help/-h it prints help to stdout and exits(0). See §9.
-    const cli = try CLI.parse(arena, init.minimal.environ, args, &diag);
+    var cli = try CLI.parse(arena, init.minimal.environ, args, &diag);
+
+    // deinit is a namespace function taking `&view`, NOT a method on the View
+    // itself (`cli.deinit(...)` does not compile). See §5 and §12.
+    defer CLI.deinit(&cli, arena);
 
     std.debug.print("{} {}\n", .{ cli.login, cli.path });
 }
@@ -319,32 +323,45 @@ floats use `std.fmt.parseFloat`.
 
 ### 4.1 Custom value types
 
-Any other type is usable when it is default-constructible (`.{}`) and exposes:
+Any other type is usable when it exposes:
 
 ```zig
-pub fn decode(self: *Self, data: []const u8) dap.DecodeError!void
-pub fn encode(self: *Self) []const u8
+pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!Self
+pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8
+pub fn deinit(self: *Self, allocator: std.mem.Allocator) void
 ```
 
-These two are the stable contract; more optional methods may be added later.
-`decode` returning `InvalidWire` means "this token is not the right shape";
-`InvalidValue` means "shape is fine, value rejected".
+These three are the stable contract; more optional methods may be added later.
+`decode` is a static constructor: it takes the allocator and the wire token and
+returns a fully built value, so a type with internal allocations (arg arrays,
+nested buffers) can own them. `dap.DecodeError` folds in the allocator's error
+set for that reason. `decode` returning `InvalidWire` means "this token is not
+the right shape"; `InvalidValue` means "shape is fine, value rejected".
+`encode` builds the wire spelling into allocator-owned memory the caller frees.
+`deinit` releases the value's internals; it must not call
+`allocator.destroy(self)` (the value is a copy, see §12).
 
 ```zig
 const Port = struct {
     value: u16 = 0,
-    pub fn decode(self: *Port, data: []const u8) dap.DecodeError!void {
-        self.value = std.fmt.parseInt(u16, data, 10) catch return error.InvalidWire;
-        if (self.value == 0) return error.InvalidValue;
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!Port {
+        _ = allocator;
+        const v = std.fmt.parseInt(u16, data, 10) catch return error.InvalidWire;
+        if (v == 0) return error.InvalidValue;
+        return .{ .value = v };
     }
-    pub fn encode(self: *Port) []const u8 {
-        _ = self; return "";   // only used for help default rendering
+    pub fn encode(self: *Port, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        return std.fmt.allocPrint(allocator, "{}", .{self.value});
+    }
+    pub fn deinit(self: *Port, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
     }
 };
 ```
 
-If a value type does not satisfy `isDecodable` (no `decode`/`encode`, or an
-unsupported pointer), the declaration is a **compile error**.
+If a value type does not satisfy `isDecodable` (no `decode`/`encode`/`deinit`,
+or an unsupported pointer), the declaration is a **compile error**.
 
 ### 4.2 `Enumeration(T)` and `Enum`
 
@@ -370,7 +387,7 @@ The resulting type exposes:
   first branch;
 - `EnumView` — that enum type, for comparisons;
 - `names` — the wire names in declaration order;
-- `decode` / `encode`.
+- `decode` / `encode` / `deinit`.
 
 Use it as a `Flag`/`Argument` value type:
 
@@ -383,7 +400,7 @@ Use it as a `Flag`/`Argument` value type:
 ```
 
 Duplicate wire names are a compile error. An **empty** `Enumeration` is
-degenerate: it yields a type with `decode`/`encode` only (no `view`,
+degenerate: it yields a type with `decode`/`encode`/`deinit` only (no `view`,
 `EnumView` or `names`) and rejects every token.
 
 ---
@@ -432,6 +449,13 @@ Generated namespace members:
 | `commands`                      | The detected command entries (slice; empty when none).   |
 | `CommandPayload`                | Tagged union of command fields; **only when subcommands exist**. |
 | `command(view) ?CommandPayload` | Wrap the active subcommand's `View`, else `null`; **only when subcommands exist**. |
+| `deinit(&view, alloc)`           | Release every owned field of a `View` from a successful parse (see §12). |
+
+`deinit` is a **namespace-level function**, not a method on `View`. `View` is a
+generated struct with fields only, so it has no decls: write
+`CLI.deinit(&view, allocator)`, never `view.deinit(allocator)` (the latter is a
+"no field or member function named 'deinit'" compile error). Because it mutates
+the view, the local must be `var`.
 
 ---
 
@@ -503,7 +527,11 @@ when absent. Rules:
   disables command handoff, so command-like or flag-like literals can be
   passed through.
 - **Missing value.** A non-bool flag given without a value is `MissingValue`.
-- **Unknown flag.** An unmatched `--long` or `-s` token is `UnknownFlag`.
+- **Unknown flag.** An unmatched `--long` or `-s` token is `UnknownFlag`. A
+  token that misses the active level's own specs is first retried against every
+  ancestor level's specs (nearest first), since each ancestor's flags merge
+  into a deep help scope and are globally unique; a hit assigns into that
+  ancestor's `View`, so `app sub --root-flag` works.
 - **Too many arguments.** A positional token with no free slot is
   `TooManyArguments`.
 - **Zero values.** An absent spec with a defaultless, optional, or bool type
@@ -766,8 +794,24 @@ Inline example:
 
 ## 12. Ownership
 
-- Strings decoded from the wire (and direct string defaults) are allocated with
-  the allocator passed to `parse`. An **arena** is the intended lifetime.
+- **The `View` owns everything it stores.** `[]const u8` fields (wire, env and
+  direct defaults included) are duplicated with the allocator passed to `parse`;
+  custom-type fields own their internals. Release them with
+  `CLI.deinit(&view, allocator)`, which frees string slices, calls a custom
+  type's `deinit`, recurses into optionals, releases only the active `Alt`
+  branch, and recurses into every activated command sub-`View`. It is valid
+  once on a `View` from a **successful** `parse` and is **not idempotent** (a
+  second call double-frees). `args`/`environ` are borrowed only during `parse`;
+  after it returns the `View` references neither.
+- `deinit` is a **namespace function**, not a method: call
+  `CLI.deinit(&view, allocator)`. `View` is a generated struct with no decls,
+  so `view.deinit(...)` does not compile, and the receiver must be a `var`.
+- A custom `decode` returns `Self` **by value**; its `deinit` must release
+  internals without `allocator.destroy(self)`. A custom struct's comptime
+  direct default is routed through an `encode`/`decode` roundtrip so the value
+  in the `View` is fully owned (never pointing at comptime memory).
+- An **arena** remains the simplest lifetime; `CLI.deinit` matters when a plain
+  allocator is used.
 - `Diag.deinit` frees only the allocated `message`; `field` and `token` are
   borrowed.
 - `helpText` and `renderCompact` return caller-owned strings.
@@ -798,7 +842,7 @@ These mistakes are compile errors, not runtime errors:
   token hands the rest of the wire to the subcommand, so a parent positional
   could never be filled).
 - An `Argument` with a default that is not the last argument.
-- A value type that is not decodable (missing `decode`/`encode`).
+- A value type that is not decodable (missing `decode`/`encode`/`deinit`).
 - A boolean flag with a direct default of `true`.
 - An optional flag with a default; an optional `Argument`; an optional flag
   inside an `Alt` branch.
@@ -829,6 +873,9 @@ These mistakes are compile errors, not runtime errors:
 - Builtin `-h/--help` bypasses checks, prints help, exits 0 — at any depth;
   deep help merges ancestor flags and scopes to the deepest active command.
 - Flag names/aliases are globally unique across the command tree.
+- The `View` owns every stored string and custom value; release it with
+  `CLI.deinit(&view, allocator)` (a namespace function, not a `View` method)
+  on a successful parse, once and not idempotently.
 - `parse` exits the process on help/failure; it does not return errors.
 
 ---

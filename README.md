@@ -75,6 +75,9 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   plain declaration field names (no `_`): `if (CLI.command(cli)) |cmd| switch
   (cmd) { ... } else { ... }`. It is present only when the level declares
   subcommands; `--` disables handoff so command-like literals can be passed.
+  A flag token after the command that matches no sub flag is retried against
+  every ancestor level, so parent flags (advertised in deep help, globally
+  unique) resolve wherever they are typed.
 - **Exclusive groups.** An `Alt` field declares branches of mutually exclusive
   flags. A branch activates when any of its members is seen; only flags are
   allowed inside branches and defaults are forbidden. The generated field is a
@@ -85,9 +88,14 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   across the *entire* command tree (siblings included), not merely within a
   level. Deep help merges flags from every ancestor, so a reused name would be
   ambiguous; a collision is a compile error naming both level paths.
-- **Ownership.** Strings stored in the `View` are allocated with the parser's
-  allocator; an arena is the intended lifetime. `Diag.deinit` frees only the
-  diagnostic `message`.
+- **Ownership.** Every field of a `View` returned by a successful `parse` is
+  owned by the caller: string slices (wire, env and direct defaults) are
+  duplicated with the parser's allocator, and custom-type fields own their
+  internals. Release them with `CLI.deinit(&view, allocator)` — a namespace
+  function, not a method on the view (`view.deinit(...)` does not compile); it
+  is valid once and not idempotent, and the local view must be `var`. An arena
+  remains the simplest lifetime. `Diag.deinit` frees only the diagnostic
+  `message`.
 
 ## Optional flags
 
@@ -113,9 +121,18 @@ Builtin scalars, `dap.String` (`[]const u8`) and `dap.Enumeration` results work
 out of the box. Other types must expose:
 
 ```zig
-pub fn decode(self: *Self, data: []const u8) dap.DecodeError!void
-pub fn encode(self: *Self) []const u8
+pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!Self
+pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8
+pub fn deinit(self: *Self, allocator: std.mem.Allocator) void
 ```
+
+`decode` is a static constructor returning a fully built value, so a type with
+internal allocations can own them (`dap.DecodeError` folds in the allocator's
+error set for this reason); `encode` returns an allocator-owned wire spelling
+that the caller frees; `deinit` releases the value's internals and must not
+call `allocator.destroy(self)`. Free a parsed `View` with
+`CLI.deinit(&view, allocator)` — a namespace function taking the view by
+pointer, not a method on the view (`view.deinit(...)` does not compile).
 
 ## Help
 
