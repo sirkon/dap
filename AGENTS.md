@@ -21,11 +21,11 @@ blocks). There is no `PLAN.md`; the test names are the plan of record.
 - `src/stdcompare.zig` holds the private `levenshtein` helper the suggester
   ranks with; it is imported directly by `dap.zig` (not re-exported).
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
-  `usingnamespace` in Zig 0.16; exports are explicit).
+  `usingnamespace`; exports are explicit).
 - `build.zig` exposes a public `dap` module rooted at `src/root.zig`, builds a
   `dap-example` executable from `src/main.zig` with a `run` step, and a `test`
   step compiling/running tests from `src/dap.zig`.
-- `build.zig.zon` sets `.name = .dap` and `.minimum_zig_version = "0.16.0"`.
+- `build.zig.zon` sets `.name = .dap` and `.minimum_zig_version = "0.17.0"`.
   Match that version.
 
 Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
@@ -155,7 +155,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   sibling commands are covered too. This runs in `generate` right after
   `normalize`'s own per-level checks.
 - A level that declares commands additionally exposes a switch-shaped accessor
-  (D7–D10). Because Zig 0.16 has no `comptime if` at container scope, `generate`
+  (D7–D10). Because Zig has no `comptime if` at container scope, `generate`
   builds its namespace under a local `Base` and, when `cmd_entries.len == 0`,
   returns `Base` verbatim (accessor pair absent — `@hasDecl` is `false`, so a
   reference is a "no member named 'command'" compile error). Otherwise it

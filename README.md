@@ -1,6 +1,6 @@
 # dap
 
-Declarative command-line parser for Zig (0.16.0).
+Declarative command-line parser for Zig (0.17.0).
 
 Describe your program's flags and arguments with a struct-based DSL;
 `dap.generate` builds both a parser and a strongly-typed view from that

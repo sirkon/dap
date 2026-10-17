@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the manual example");
     const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     run_step.dependOn(&run.step);
 
     const dap_tests = b.addTest(.{

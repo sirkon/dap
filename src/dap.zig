@@ -31,6 +31,25 @@
 const std = @import("std");
 const stdcompare = @import("stdcompare.zig");
 
+/// Reflection view of a single struct field. Zig 0.17 replaced the
+/// `StructField`/`UnionField` structs with parallel `field_names`,
+/// `field_types` and `field_attrs` arrays; this pairs them back up so the
+/// rest of the file can keep iterating fields as one value.
+const Field = struct {
+    name: [:0]const u8,
+    type: type,
+    attrs: std.builtin.Type.Struct.FieldAttributes,
+};
+
+fn fieldsOf(comptime T: type) [@typeInfo(T).@"struct".field_names.len]Field {
+    const info = @typeInfo(T).@"struct";
+    var out: [info.field_names.len]Field = undefined;
+    for (info.field_names, info.field_types, info.field_attrs, 0..) |name, ty, attrs, i| {
+        out[i] = .{ .name = name, .type = ty, .attrs = attrs };
+    }
+    return out;
+}
+
 /// Kind of a declaration field.
 pub const Kind = enum {
     flag,
@@ -268,7 +287,7 @@ pub fn Argument(comptime T: type) type {
 /// }
 /// ```
 pub fn Enumeration(comptime T: anytype) type {
-    const fields = @typeInfo(@TypeOf(T)).@"struct".fields;
+    const fields = fieldsOf(@TypeOf(T));
 
     if (fields.len == 0) {
         // No branches: there is no tag type to build a `@Enum` from. Degenerate
@@ -327,7 +346,7 @@ pub fn Enumeration(comptime T: anytype) type {
     });
 
     return struct {
-        view: View = @enumFromInt(0),
+        view: View = @fromBackingInt(@intCast(0)),
 
         pub const EnumView = View;
         pub const names = wire_names;
@@ -336,14 +355,14 @@ pub fn Enumeration(comptime T: anytype) type {
             _ = allocator;
             inline for (wire_names, 0..) |nm, i| {
                 if (std.mem.eql(u8, nm, data)) {
-                    return .{ .view = @enumFromInt(@as(TagInt, @intCast(i))) };
+                    return .{ .view = @fromBackingInt(@intCast(@as(TagInt, @intCast(i)))) };
                 }
             }
             return error.InvalidWire;
         }
 
         pub fn encode(self: *@This(), allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
-            return try allocator.dupe(u8, wire_names[@intFromEnum(self.view)]);
+            return try allocator.dupe(u8, wire_names[@backingInt(self.view)]);
         }
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -463,7 +482,7 @@ pub fn VariantNamed(comptime name: String, comptime branch: anytype) type {
 /// doing so is a `ConflictingAlt` parse error. Consume it with
 /// `switch (cli.alt orelse return) { ... }`.
 pub fn Alt(comptime T: anytype) type {
-    const fields = @typeInfo(@TypeOf(T)).@"struct".fields;
+    const fields = fieldsOf(@TypeOf(T));
     if (fields.len == 0) {
         @compileError("Alt must declare at least one branch");
     }
@@ -509,10 +528,10 @@ pub fn Alt(comptime T: anytype) type {
             if (@typeInfo(@TypeOf(Bdef)) != .@"struct") {
                 @compileError("Alt branch '" ++ f.name ++ "' must be a struct of flags or a VariantNamed");
             }
-            const bf = @typeInfo(@TypeOf(Bdef)).@"struct".fields;
+            const bf = fieldsOf(@TypeOf(Bdef));
             var nm: [bf.len]String = undefined;
             var ts: [bf.len]type = undefined;
-            var at: [bf.len]std.builtin.Type.StructField.Attributes = undefined;
+            var at: [bf.len]std.builtin.Type.Struct.FieldAttributes = undefined;
             for (bf, 0..) |bfld, bi| {
                 nm[bi] = bfld.name;
                 const ft = if (@typeInfo(bfld.type) == .optional) @typeInfo(bfld.type).optional.child else bfld.type;
@@ -533,9 +552,9 @@ pub fn Alt(comptime T: anytype) type {
     });
 
     const PayloadUnion = @Union(.auto, Tag, &tnames, &btypes, blk: {
-        var a: [tnames.len]std.builtin.Type.UnionField.Attributes = undefined;
+        var a: [tnames.len]std.builtin.Type.Union.FieldAttributes = undefined;
         for (0..tnames.len) |i| a[i] = .{};
-        const arr: [tnames.len]std.builtin.Type.UnionField.Attributes = a;
+        const arr: [tnames.len]std.builtin.Type.Union.FieldAttributes = a;
         break :blk &arr;
     });
 
@@ -1637,8 +1656,7 @@ const BuiltinHelp = Flag(bool){
 /// The merged declaration type: `.builtin_help` at index 0 followed by the
 /// user's fields in declaration order, each keeping its own default value.
 fn MergedDecl(comptime D: type) type {
-    const fields = @typeInfo(D).@"struct".fields;
-    const MergedField = std.builtin.Type.StructField;
+    const fields = fieldsOf(D);
     const Builtin = @TypeOf(BuiltinHelp);
 
     const merged_names = blk: {
@@ -1654,16 +1672,16 @@ fn MergedDecl(comptime D: type) type {
         break :blk a;
     };
     const attrs = blk: {
-        var a: [1 + fields.len]MergedField.Attributes = undefined;
+        var a: [1 + fields.len]std.builtin.Type.Struct.FieldAttributes = undefined;
         a[0] = .{
             .@"align" = @alignOf(Builtin),
             .default_value_ptr = @ptrCast(&BuiltinHelp),
         };
         inline for (fields, 0..) |f, fi| {
             a[1 + fi] = .{
-                .@"comptime" = f.is_comptime,
-                .@"align" = f.alignment,
-                .default_value_ptr = f.default_value_ptr,
+                .@"comptime" = f.attrs.@"comptime",
+                .@"align" = f.attrs.@"align",
+                .default_value_ptr = f.attrs.default_value_ptr,
             };
         }
         break :blk a;
@@ -1678,7 +1696,7 @@ fn MergedDecl(comptime D: type) type {
 fn withBuiltinHelp(comptime decl: anytype) MergedDecl(@TypeOf(decl)) {
     comptime var result: MergedDecl(@TypeOf(decl)) = undefined;
     @field(result, builtin_help_field) = BuiltinHelp;
-    inline for (@typeInfo(@TypeOf(decl)).@"struct".fields) |f| {
+    inline for (fieldsOf(@TypeOf(decl))) |f| {
         @field(result, f.name) = @field(decl, f.name);
     }
     return result;
@@ -1926,7 +1944,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         break :blk a;
     };
     const Attrs = blk: {
-        var a: [field_types.len]std.builtin.Type.StructField.Attributes = undefined;
+        var a: [field_types.len]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (0..field_types.len) |i| a[i] = .{};
         break :blk a;
     };
@@ -2023,7 +2041,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 if (@field(self, a.field)) |*u| {
                     switch (u.*) {
                         inline else => |*branch| {
-                            inline for (@typeInfo(@TypeOf(branch.*)).@"struct".fields) |f| {
+                            inline for (fieldsOf(@TypeOf(branch.*))) |f| {
                                 deinitValue(f.type, allocator, &@field(branch, f.name));
                             }
                         },
@@ -2698,7 +2716,7 @@ fn CommandPayloadOf(comptime app: App, comptime cmd_entries: []const CommandEntr
         for (cmd_entries, 0..) |c, i| a[i] = Sub(c.Cmd, subApp(app, c)).View;
         break :blk a;
     };
-    const attrs: [n]std.builtin.Type.UnionField.Attributes = @splat(.{});
+    const attrs: [n]std.builtin.Type.Union.FieldAttributes = @splat(.{});
     const TagInt = std.math.IntFittingRange(0, n - 1);
     const Tag = @Enum(TagInt, .exhaustive, &names, blk: {
         var a: [n]TagInt = undefined;
@@ -2780,53 +2798,50 @@ fn fnToPtr(comptime vf: anytype) *const anyopaque {
     return @ptrCast(&Holder.fnptr);
 }
 
-fn typeOfField(comptime f: std.builtin.Type.StructField) type {
-    return @as(*const type, @ptrCast(@alignCast(f.default_value_ptr.?))).*;
+fn typeOfField(comptime f: Field) type {
+    return f.attrs.defaultValue(type).?;
 }
 
-fn instValue(comptime f: std.builtin.Type.StructField) *const f.type {
-    return @ptrCast(@alignCast(f.default_value_ptr.?));
+fn instValue(comptime f: Field) f.type {
+    return f.attrs.defaultValue(f.type).?;
 }
 
 /// The inner (non-optional) declaration value of an optional-typed field.
-fn instValueOpt(comptime f: std.builtin.Type.StructField, comptime I: type) *const I {
-    const Holder = struct {
-        const value: I = @as(*const f.type, @ptrCast(@alignCast(f.default_value_ptr.?))).*.?;
-    };
-    return &Holder.value;
+fn instValueOpt(comptime f: Field, comptime I: type) I {
+    return f.attrs.defaultValue(f.type).?.?;
 }
 
-fn declLong(comptime T: type, inst: *const T) ?String {
+fn declLong(comptime T: type, inst: T) ?String {
     if (@hasField(T, "long")) return inst.long;
     return null;
 }
 
-fn declShort(comptime T: type, inst: *const T) ?String {
+fn declShort(comptime T: type, inst: T) ?String {
     if (@hasField(T, "short")) return inst.short;
     return null;
 }
 
-fn declDefault(comptime T: type, inst: *const T) ?Default(T.dap_value_type) {
+fn declDefault(comptime T: type, inst: T) ?Default(T.dap_value_type) {
     if (@hasField(T, "default")) return inst.default;
     return null;
 }
 
-fn declValidation(comptime T: type, inst: *const T) ?fn (std.mem.Allocator, T.dap_value_type) std.mem.Allocator.Error!?String {
+fn declValidation(comptime T: type, inst: T) ?fn (std.mem.Allocator, T.dap_value_type) std.mem.Allocator.Error!?String {
     if (@hasField(T, "validation")) return inst.validation;
     return null;
 }
 
-fn declHelp(comptime T: type, inst: *const T) String {
+fn declHelp(comptime T: type, inst: T) String {
     if (@hasField(T, "help")) return inst.help;
     return "";
 }
 
-fn declArgName(comptime T: type, inst: *const T) ?String {
+fn declArgName(comptime T: type, inst: T) ?String {
     if (@hasField(T, "name")) return inst.name;
     return null;
 }
 
-fn declI18n(comptime T: type, inst: *const T) ?String {
+fn declI18n(comptime T: type, inst: T) ?String {
     if (@hasField(T, "i18n")) return inst.i18n;
     return null;
 }
@@ -3177,7 +3192,7 @@ fn resolveAbsent(
     @field(v, s.name) = zeroValue(specViewType(s));
 }
 
-fn specFromField(comptime f: std.builtin.Type.StructField) Spec {
+fn specFromField(comptime f: Field) Spec {
     if (std.mem.startsWith(u8, f.name, "_")) {
         @compileError("declaration field name '" ++ f.name ++ "' must not start with '_'");
     }
@@ -3246,7 +3261,7 @@ fn specFromField(comptime f: std.builtin.Type.StructField) Spec {
 
 fn groupSpecs(comptime gdef: anytype, comptime gname: String) []const Spec {
     var out: []const Spec = &.{};
-    inline for (@typeInfo(@TypeOf(gdef)).@"struct".fields) |f| {
+    inline for (fieldsOf(@TypeOf(gdef))) |f| {
         if (f.type == type) {
             @compileError("nested groups are not supported; group member '" ++ f.name ++ "' is a type");
         }
@@ -3263,7 +3278,7 @@ fn groupSpecs(comptime gdef: anytype, comptime gname: String) []const Spec {
 /// forbidden (a default would imply implicit branch activation).
 fn altSpecs(comptime AT: type, comptime field_name: String) []const Spec {
     var out: []const Spec = &.{};
-    inline for (@typeInfo(@TypeOf(AT.alt_def)).@"struct".fields) |bf| {
+    inline for (fieldsOf(@TypeOf(AT.alt_def))) |bf| {
         const Bv = @field(AT.alt_def, bf.name);
         const Bdef = if (@TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_def"))
             Bv.dap_variant_def
@@ -3274,7 +3289,7 @@ fn altSpecs(comptime AT: type, comptime field_name: String) []const Spec {
         else
             bf.name;
 
-        inline for (@typeInfo(@TypeOf(Bdef)).@"struct".fields) |mf| {
+        inline for (fieldsOf(@TypeOf(Bdef))) |mf| {
             var s = specFromField(mf);
             if (s.kind != .flag) {
                 @compileError("Alt branch '" ++ bf.name ++ "' allows only flags; '" ++ mf.name ++ "' is not a Flag");
@@ -3303,7 +3318,7 @@ fn altSpecs(comptime AT: type, comptime field_name: String) []const Spec {
 /// their specs are built.
 fn checkNoUnderscoreFields(comptime def: anytype) void {
     comptime {
-        for (@typeInfo(@TypeOf(def)).@"struct".fields) |f| {
+        for (fieldsOf(@TypeOf(def))) |f| {
             if (std.mem.startsWith(u8, f.name, "_")) {
                 @compileError("declaration field name '" ++ f.name ++ "' must not start with '_'");
             }
@@ -3520,7 +3535,7 @@ fn normalize(comptime def: anytype) NormResult {
     var alts: []const AltLevel = &.{};
     var group_names: []const String = &.{};
 
-    inline for (@typeInfo(@TypeOf(def)).@"struct".fields) |f| {
+    inline for (fieldsOf(@TypeOf(def))) |f| {
         if (f.type == type) {
             const V = typeOfField(f);
             if (@hasDecl(V, "dap_kind") and V.dap_kind == .command) {
@@ -3659,7 +3674,7 @@ test "alt declaration compiles" {
     try std.testing.expect(A.dap_kind == .alt);
     try std.testing.expectEqualStrings("a", A.tag_names[0]);
     try std.testing.expectEqualStrings("a", A.branch_names[0]);
-    try std.testing.expectEqualStrings("x", @typeInfo(A.branch_types[0]).@"struct".fields[0].name);
+    try std.testing.expectEqualStrings("x", @typeInfo(A.branch_types[0]).@"struct".field_names[0]);
     try std.testing.expectEqualStrings("fancy-alt2", VariantNamed("fancy-alt2", .{}).dap_variant_name);
 }
 
@@ -3973,7 +3988,7 @@ test "M1: undecodable value type is a compile error" {
 test "M2: View field order and types" {
     const C = generate(App{ .name = "app", .help = "help" }, M1CmdDef);
     const V = C.View;
-    const fields = @typeInfo(V).@"struct".fields;
+    const fields = fieldsOf(V);
 
     // 7 specs (builtin_help injected first) + 2 command fields.
     try std.testing.expectEqual(@as(usize, 9), fields.len);
@@ -4024,7 +4039,7 @@ test "M2: View without commands has only spec fields" {
         .a = Flag(u8){ .default = Default(u8){ .direct = 0 } },
         .b = Argument([]const u8){},
     });
-    const fields = @typeInfo(C.View).@"struct".fields;
+    const fields = fieldsOf(C.View);
     try std.testing.expectEqual(@as(usize, 3), fields.len);
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqual(@as(type, bool), fields[0].type);
@@ -4043,13 +4058,13 @@ test "M2: command View fields are optional sub-views" {
     // injected builtin_help field occupies the first slot of every sub. Command
     // fields carry a `_` prefix in the View.
     const StartSub = @typeInfo(@FieldType(C.View, "_start")).optional.child;
-    const start_fields = @typeInfo(StartSub).@"struct".fields;
+    const start_fields = fieldsOf(StartSub);
     try std.testing.expectEqual(@as(usize, 2), start_fields.len);
     try std.testing.expectEqualStrings("builtin_help", start_fields[0].name);
     try std.testing.expectEqualStrings("name", start_fields[1].name);
 
     const HaltSub = @typeInfo(@FieldType(C.View, "_stop")).optional.child;
-    try std.testing.expectEqual(@as(usize, 1), @typeInfo(HaltSub).@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(HaltSub).@"struct".field_names.len);
 
     // the sub level has no commands of its own.
     const StartNs = Sub(C.commands[0].Cmd, subApp(C.app_meta, C.commands[0]));
@@ -4771,8 +4786,8 @@ const Mode = Enumeration(.{
 
 test "M8: enumeration builds a view over branch names" {
     const ModeView = Mode.EnumView;
-    try std.testing.expectEqualStrings("fast", @tagName(@as(ModeView, @enumFromInt(0))));
-    try std.testing.expectEqualStrings("slow", @tagName(@as(ModeView, @enumFromInt(1))));
+    try std.testing.expectEqualStrings("fast", @tagName(@as(ModeView, @fromBackingInt(@intCast(0)))));
+    try std.testing.expectEqualStrings("slow", @tagName(@as(ModeView, @fromBackingInt(@intCast(1)))));
     try std.testing.expectEqualStrings("fast", Mode.names[0]);
     try std.testing.expectEqualStrings("glacial", Mode.names[1]);
 }
@@ -5539,8 +5554,8 @@ test "M12: Alt declaration metadata" {
     try std.testing.expectEqualStrings("alt2", M12Alt.branch_names[1]);
     try std.testing.expectEqualStrings("alt1", M12Alt.tag_names[0]);
     try std.testing.expectEqualStrings("fancy-alt2", M12Alt.tag_names[1]);
-    try std.testing.expectEqualStrings("opt1", @typeInfo(M12Alt.branch_types[0]).@"struct".fields[0].name);
-    try std.testing.expectEqualStrings("opt2", @typeInfo(M12Alt.branch_types[1]).@"struct".fields[0].name);
+    try std.testing.expectEqualStrings("opt1", @typeInfo(M12Alt.branch_types[0]).@"struct".field_names[0]);
+    try std.testing.expectEqualStrings("opt2", @typeInfo(M12Alt.branch_types[1]).@"struct".field_names[0]);
 }
 
 test "M12: normalization flattens branches with group tags" {
@@ -5566,7 +5581,7 @@ test "M12: normalization flattens branches with group tags" {
 }
 
 test "M12: View carries an optional union field before commands" {
-    const fields = @typeInfo(M12View).@"struct".fields;
+    const fields = fieldsOf(M12View);
     const last = fields[fields.len - 1];
     try std.testing.expectEqualStrings("mode", last.name);
     const MaybeUnion = last.type;
@@ -5575,9 +5590,9 @@ test "M12: View carries an optional union field before commands" {
     try std.testing.expect(@typeInfo(UU) == .@"union");
     var seen1 = false;
     var seen2 = false;
-    inline for (@typeInfo(UU).@"union".fields) |uf| {
-        if (std.mem.eql(u8, uf.name, "alt1")) seen1 = true;
-        if (std.mem.eql(u8, uf.name, "fancy-alt2")) seen2 = true;
+    inline for (@typeInfo(UU).@"union".field_names) |uf| {
+        if (std.mem.eql(u8, uf, "alt1")) seen1 = true;
+        if (std.mem.eql(u8, uf, "fancy-alt2")) seen2 = true;
     }
     try std.testing.expect(seen1 and seen2);
 }
@@ -5796,7 +5811,7 @@ const M12MixedDef = .{
 
 test "M12: Alt and command fields coexist at the root" {
     const C = generate(App{ .name = "x", .help = "x" }, M12MixedDef);
-    const fields = @typeInfo(C.View).@"struct".fields;
+    const fields = fieldsOf(C.View);
     try std.testing.expectEqualStrings("mode", fields[fields.len - 2].name);
     try std.testing.expectEqualStrings("_go", fields[fields.len - 1].name);
 
@@ -5859,7 +5874,7 @@ test "M13: View carries optional-typed fields in order" {
     try std.testing.expectEqual(?u32, @FieldType(M13View, "opt_u32"));
     try std.testing.expectEqual(?bool, @FieldType(M13View, "opt_bool"));
     try std.testing.expectEqual([]const u8, @FieldType(M13View, "req"));
-    const fields = @typeInfo(M13View).@"struct".fields;
+    const fields = fieldsOf(M13View);
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqualStrings("req", fields[1].name);
     try std.testing.expectEqualStrings("opt_str", fields[2].name);
@@ -6373,8 +6388,12 @@ test "M15: the command shell forwards the base members" {
     try std.testing.expect(@hasDecl(M7, "commands"));
     try std.testing.expect(@hasDecl(M7, "View"));
     try std.testing.expect(@hasDecl(M7, "parse"));
-    try std.testing.expect(@hasDecl(M7, "parseInner"));
-    try std.testing.expect(@hasDecl(M7, "parseInnerHelp"));
+    // `@hasDecl` only sees `pub` declarations, and the inner parse entry
+    // points stay file-private; reference them to prove they are forwarded.
+    comptime {
+        _ = M7.parseInner;
+        _ = M7.parseInnerHelp;
+    }
     try std.testing.expect(@hasDecl(M7, "helpData"));
     try std.testing.expect(@hasDecl(M7, "helpText"));
 
