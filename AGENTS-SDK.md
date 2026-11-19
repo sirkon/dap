@@ -476,6 +476,7 @@ Generated namespace members:
 | `helpText(alloc) !String`       | Caller-owned rendered help using `app.help_renderer.style`. |
 | `helpData(alloc) !HelpData`     | Runtime description; `HelpData.renderCompact(alloc)` renders it. |
 | `usage(view) !void`             | Print context-sensitive help for a `View` of **any level** (like `command`): the scopes from this namespace's level down to that view's level, then the descendants still active in it. |
+| `completion(alloc, app_name, shell) !String` | Generate a bash/zsh/fish completion script for the whole tree; **root namespace only** (a child call is a compile error). |
 | `app_meta`                      | The `App` passed in.                                     |
 | `specs`                         | Normalized comptime spec table.                          |
 | `commands`                      | The detected command entries (slice; empty when none).   |
@@ -488,6 +489,41 @@ generated struct with fields only, so it has no decls: write
 `CLI.deinit(&view, allocator)`, never `view.deinit(allocator)` (the latter is a
 "no field or member function named 'deinit'" compile error). Because it mutates
 the view, the local must be `var`.
+
+### 5.1 Completion scripts
+
+`CLI.completion` renders a complete, installable completion script for the
+whole command tree, statically from the declaration (no `View`, no parse, no
+environment, no file I/O):
+
+```zig
+const script = try CLI.completion(allocator, "my-app", .zsh);
+```
+
+`dap.CompletionShell` is `.bash`, `.zsh` or `.fish`; the result is caller-owned,
+deterministic, and ends with exactly one `\n`. Errors are `OutOfMemory` and
+`error.InvalidAppName` (validation runs before any allocation).
+
+`app_name` is the name the script **registers**, not `App.name` (which is a
+possibly multi-word usage path). It must be non-empty ASCII, must not start
+with `-`, must not contain `/`, whitespace or control bytes, and may only use
+`A-Za-z0-9._+-`. Passing an installed alias as `app_name` is how one installs
+the same program under another name.
+
+Only the **root** namespace may call it: a subcommand level cannot reconstruct
+its ancestors' flags, so `Sub.completion(...)` is a compile error.
+
+```sh
+app completion bash > /etc/bash_completion.d/app
+app completion zsh  > "${fpath[1]}/_app"
+app completion fish > ~/.config/fish/completions/app.fish
+```
+
+The zsh file name must match `_<ident>`, where `ident` is `app_name` with every
+byte outside `[A-Za-z0-9_]` replaced by `_` (`my-app` -> `_my_app`); the
+registration itself always uses `app_name` verbatim. The script is a snapshot of
+the declaration: regenerate it when flags or commands change. Sanitization is
+not injective, so two `dap` CLIs can collide in one bash or fish session.
 
 ---
 
@@ -945,8 +981,16 @@ These mistakes are compile errors, not runtime errors:
 ## 15. Building and testing (in the `dap` package)
 
 ```sh
-zig build            # compile the module and the example executable
-zig build test       # run the unit tests in src/dap.zig
-zig test src/dap.zig # one-off test run
+zig build                  # compile the module and the example executable
+zig build test             # run the unit tests in src/dap.zig
+zig test src/dap.zig       # one-off test run
+zig build completion-test  # opt-in: generated scripts in real shells
 zig build run -- --help
+```
+
+The example binary also prints completion scripts (the root declares a required
+flag, hence `--required 0`):
+
+```sh
+zig build run -- --required 0 completion bash
 ```

@@ -37,6 +37,12 @@ const CustomType = struct {
     }
 };
 
+const Shell = dap.Enumeration(.{
+    .bash = dap.Enum{},
+    .zsh = dap.Enum{},
+    .fish = dap.Enum{},
+});
+
 const def = .{
     .source = dap.Alt(.{
         .file = .{
@@ -100,6 +106,14 @@ const def = .{
             ),
         },
     ),
+    .completion = dap.Command(
+        .{ .help = "Print a shell completion script." },
+        .{
+            .shell = dap.Argument(Shell){
+                .help = "Shell dialect to generate.",
+            },
+        },
+    ),
 };
 
 const CLI = dap.generate(
@@ -132,6 +146,21 @@ pub fn main(init: std.process.Init) !void {
     var cli = try CLI.parse(arena, init.minimal.environ, args, &diag);
     defer CLI.deinit(&cli, arena);
 
+    if (CLI.command(cli)) |cmd| switch (cmd) {
+        .completion => |c| {
+            const script = try CLI.completion(arena, "dap-example", switch (c.shell.view) {
+                .bash => .bash,
+                .zsh => .zsh,
+                .fish => .fish,
+            });
+            try stdout.writeAll(script);
+            try stdout.flush();
+            return;
+        },
+        .command1 => try stdout.print("command = command-1\n", .{}),
+        .command2 => |c| try stdout.print("value  = {s}\n", .{c.value}),
+    };
+
     if (cli.source) |src| switch (src) {
         .file => |p| try stdout.print("file   = {s}\n", .{p.file}),
         .net => |p| try stdout.print("net    = {s}\n", .{p.url}),
@@ -139,10 +168,6 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("last   = {}\n", .{cli.last});
     try stdout.print("count  = {}\n", .{cli.count});
     try stdout.print("custom_type = {}\n", .{cli.custom});
-    if (CLI.command(cli)) |cmd| switch (cmd) {
-        .command1 => try stdout.print("command = command-1\n", .{}),
-        .command2 => |c| try stdout.print("value  = {s}\n", .{c.value}),
-    };
 
     std.debug.print("checkpoint\n", .{});
     try CLI.usage(cli);

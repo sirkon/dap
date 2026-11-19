@@ -76,6 +76,12 @@ pub const HelpRendererHighlight = union(enum) {
     custom: HelpHighlight,
 };
 
+/// Shell dialect a completion script is generated for.
+pub const CompletionShell = enum { bash, zsh, fish };
+
+/// Errors a completion-script render can produce.
+pub const CompletionError = std.mem.Allocator.Error || error{InvalidAppName};
+
 /// App description and such.
 pub const App = struct {
     name: String,
@@ -1998,6 +2004,1087 @@ fn suggestProbe(
     }
 }
 
+/// One command level in the completion table: its tree rank and usage path,
+/// the effective flag set (ancestors first, injected help deduplicated), and
+/// the arguments and commands owned by the level itself.
+const CompletionLevel = struct {
+    rank: usize,
+    path: String,
+    flags: []const Spec,
+    arguments: []const Spec,
+    commands: []const CommandEntry,
+};
+
+/// Walk `NS` and every command below it in declaration pre-order and describe
+/// each level. `inherited_flags` is the ancestor flag chain, root first; the
+/// injected builtin help is dropped when an ancestor already contributed it.
+fn completionLevels(
+    comptime NS: type,
+    comptime inherited_flags: []const Spec,
+) []const CompletionLevel {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+
+        var flags = inherited_flags;
+        for (NS.specs) |s| {
+            if (s.kind != .flag) continue;
+            var duplicate = false;
+            for (flags) |prev| {
+                if (std.mem.eql(u8, prev.long, s.long)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) flags = flags ++ &[_]Spec{s};
+        }
+
+        var arguments: []const Spec = &.{};
+        for (NS.specs) |s| {
+            if (s.kind == .argument) arguments = arguments ++ &[_]Spec{s};
+        }
+
+        var levels: []const CompletionLevel = &[_]CompletionLevel{.{
+            .rank = NS.app_meta._command_rank,
+            .path = NS.app_meta.name,
+            .flags = flags,
+            .arguments = arguments,
+            .commands = NS.commands,
+        }};
+        for (NS.commands) |c| {
+            levels = levels ++ completionLevels(
+                Sub(c.Cmd, subApp(NS.app_meta, c)),
+                flags,
+            );
+        }
+        return levels;
+    }
+}
+
+/// Wire names of a structurally enumerable value type, in declaration order.
+/// Non-struct types and the empty `Enumeration` result expose no names, so
+/// they contribute no value candidates.
+fn enumWireNames(comptime T: type) []const String {
+    if (@typeInfo(T) != .@"struct") return &.{};
+    if (!@hasDecl(T, "EnumView") or !@hasDecl(T, "names")) return &.{};
+    return &T.names;
+}
+
+/// Whether `app_name` is a safe registered command name: non-empty ASCII from
+/// `A-Za-z0-9._+-`, not starting with `-`. Runs before any allocation.
+fn isValidCompletionAppName(name: String) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '-') return false;
+    for (name) |c| {
+        if (c >= 0x80) return false;
+        if (c <= 0x20 or c == 0x7f) return false;
+        const allowed = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '.' or c == '_' or c == '+' or c == '-';
+        if (!allowed) return false;
+    }
+    return true;
+}
+
+/// Derive the shell identifier stem from a validated `app_name`: every byte
+/// outside `[A-Za-z0-9_]` becomes `_`. The caller frees the result.
+fn completionIdent(allocator: std.mem.Allocator, app_name: String) std.mem.Allocator.Error![]u8 {
+    const ident = try allocator.alloc(u8, app_name.len);
+    for (app_name, ident) |c, *d| {
+        const keep = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '_';
+        d.* = if (keep) c else '_';
+    }
+    return ident;
+}
+
+const CompletionQuote = enum { posix, fish };
+
+/// Append the bytes of `s` as literal characters, escaping only what the
+/// quote mode requires. The caller supplies the surrounding quotes.
+fn appendQuotedBytes(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    s: String,
+    quote: CompletionQuote,
+) std.mem.Allocator.Error!void {
+    for (s) |c| switch (quote) {
+        .posix => {
+            if (c == '\'') {
+                try out.appendSlice(allocator, "'\\''");
+            } else {
+                try out.append(allocator, c);
+            }
+        },
+        .fish => {
+            if (c == '\'' or c == '\\') try out.append(allocator, '\\');
+            try out.append(allocator, c);
+        },
+    };
+}
+
+/// Append `parts` joined by `sep` as one shell literal.
+fn appendQuotedJoined(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    parts: []const String,
+    sep: String,
+    quote: CompletionQuote,
+) std.mem.Allocator.Error!void {
+    try out.append(allocator, '\'');
+    for (parts, 0..) |part, i| {
+        if (i != 0) try appendQuotedBytes(out, allocator, sep, quote);
+        try appendQuotedBytes(out, allocator, part, quote);
+    }
+    try out.append(allocator, '\'');
+}
+
+/// Append `s` as one shell literal. POSIX wraps in `'...'` and rewrites `'` as
+/// `'\''`; fish wraps in `'...'` and backslash-escapes `\` and `'`.
+fn appendQuoted(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    s: String,
+    quote: CompletionQuote,
+) std.mem.Allocator.Error!void {
+    try appendQuotedJoined(out, allocator, &.{s}, "", quote);
+}
+
+/// Append `s` with `\n`, `\r` and `\t` replaced by a space, for level markers
+/// and descriptions. Candidates are never sanitized this way.
+fn appendSanitized(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    s: String,
+) std.mem.Allocator.Error!void {
+    for (s) |c| {
+        try out.append(allocator, switch (c) {
+            '\n', '\r', '\t' => ' ',
+            else => c,
+        });
+    }
+}
+
+/// Append the `# dap: level <rank> <path>` comment that precedes a level's
+/// block in a generated dispatch. Never carries shell syntax.
+fn appendLevelMarker(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    level: CompletionLevel,
+) std.mem.Allocator.Error!void {
+    try out.print(allocator, "# dap: level {} ", .{level.rank});
+    try appendSanitized(out, allocator, level.path);
+    try out.append(allocator, '\n');
+}
+
+/// Every value-taking flag spelling of the tree (`--long` and `-short`), in
+/// first-seen order and without duplicates. Boolean flags never consume the
+/// next word, so they are excluded. Long and short names are globally unique,
+/// which makes the table exact.
+fn valueFlagSpellings(comptime levels: []const CompletionLevel) []const String {
+    comptime {
+        var spellings: []const String = &.{};
+        for (levels) |level| {
+            for (level.flags) |s| {
+                if (s.vtype == bool) continue;
+                const longs: []const String = if (s.long.len == 0)
+                    &.{}
+                else
+                    &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
+                const shorts: []const String = if (s.short) |sh|
+                    if (sh.len == 0) &.{} else &[_]String{std.fmt.comptimePrint("-{s}", .{sh})}
+                else
+                    &.{};
+                for (longs ++ shorts) |spelling| {
+                    var seen = false;
+                    for (spellings) |prev| {
+                        if (std.mem.eql(u8, prev, spelling)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) spellings = spellings ++ &[_]String{spelling};
+                }
+            }
+        }
+        return spellings;
+    }
+}
+
+/// One value-taking flag spelling and its value type, for the shell emitters'
+/// value-position arms.
+const CompletionValueArm = struct {
+    spelling: String,
+    vtype: type,
+};
+
+/// Every value-taking spelling of `level`, long before short, in effective
+/// flag order and without duplicates. Boolean flags never enter a value
+/// position.
+fn completionValueArms(comptime level: CompletionLevel) []const CompletionValueArm {
+    comptime {
+        var arms: []const CompletionValueArm = &.{};
+        for (level.flags) |s| {
+            if (s.vtype == bool) continue;
+            var spellings: []const String = &.{};
+            if (s.long.len != 0) {
+                spellings = spellings ++ &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
+            }
+            if (s.short) |sh| {
+                if (sh.len != 0) {
+                    spellings = spellings ++ &[_]String{std.fmt.comptimePrint("-{s}", .{sh})};
+                }
+            }
+            for (spellings) |spelling| {
+                var seen = false;
+                for (arms) |prev| {
+                    if (std.mem.eql(u8, prev.spelling, spelling)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    arms = arms ++ &[_]CompletionValueArm{.{ .spelling = spelling, .vtype = s.vtype }};
+                }
+            }
+        }
+        return arms;
+    }
+}
+
+/// Commands of `level` that the completion script can offer: empty names and
+/// dash-leading names are unreachable, because flag matching runs first.
+fn completionCommands(comptime level: CompletionLevel) []const CommandEntry {
+    comptime {
+        var cmds: []const CommandEntry = &.{};
+        for (level.commands) |c| {
+            if (c.name.len == 0 or c.name[0] == '-') continue;
+            cmds = cmds ++ &[_]CommandEntry{c};
+        }
+        return cmds;
+    }
+}
+
+/// Effective flag candidate spellings of `level`: `--long`, then `-short`
+/// immediately after it, in effective order.
+fn completionFlagCandidates(comptime level: CompletionLevel) []const String {
+    comptime {
+        var cands: []const String = &.{};
+        for (level.flags) |s| {
+            if (s.long.len != 0) {
+                cands = cands ++ &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
+            }
+            if (s.short) |sh| {
+                if (sh.len != 0) {
+                    cands = cands ++ &[_]String{std.fmt.comptimePrint("-{s}", .{sh})};
+                }
+            }
+        }
+        return cands;
+    }
+}
+
+/// Ordinary candidates of `level`: effective flags, then its own commands.
+fn completionCandidates(comptime level: CompletionLevel) []const String {
+    comptime {
+        var cands: []const String = completionFlagCandidates(level);
+        for (completionCommands(level)) |c| cands = cands ++ &[_]String{c.name};
+        return cands;
+    }
+}
+
+/// Enumeration wire names of `T` prefixed by `prefix`, for inline value forms.
+fn enumSpellings(comptime T: type, comptime prefix: String) []const String {
+    comptime {
+        var out: []const String = &.{};
+        for (enumWireNames(T)) |name| out = out ++ &[_]String{prefix ++ name};
+        return out;
+    }
+}
+
+/// One completion candidate with its display description.
+const CompletionCandidate = struct {
+    spelling: String,
+    help: String,
+};
+
+/// Ordinary candidates of `level` paired with descriptions: effective flags
+/// (long then short, both carrying the flag's help), then the level's own
+/// commands with their `CommandMeta.help`.
+fn completionCandidateHelp(comptime level: CompletionLevel) []const CompletionCandidate {
+    comptime {
+        var cands: []const CompletionCandidate = &.{};
+        for (level.flags) |s| {
+            if (s.long.len != 0) {
+                cands = cands ++ &[_]CompletionCandidate{.{
+                    .spelling = std.fmt.comptimePrint("--{s}", .{s.long}),
+                    .help = s.help,
+                }};
+            }
+            if (s.short) |sh| {
+                if (sh.len != 0) {
+                    cands = cands ++ &[_]CompletionCandidate{.{
+                        .spelling = std.fmt.comptimePrint("-{s}", .{sh}),
+                        .help = s.help,
+                    }};
+                }
+            }
+        }
+        for (completionCommands(level)) |c| {
+            cands = cands ++ &[_]CompletionCandidate{.{
+                .spelling = c.name,
+                .help = c.Cmd.cmd_meta.help,
+            }};
+        }
+        return cands;
+    }
+}
+
+/// Enumeration values of `T` prefixed by `prefix`, as description-free
+/// candidates. `prefix` is empty for bare values and carries the flag spelling
+/// plus `=` for inline forms.
+fn enumCandidates(comptime T: type, comptime prefix: String) []const CompletionCandidate {
+    comptime {
+        var cands: []const CompletionCandidate = &.{};
+        for (enumWireNames(T)) |name| {
+            cands = cands ++ &[_]CompletionCandidate{.{
+                .spelling = prefix ++ name,
+                .help = "",
+            }};
+        }
+        return cands;
+    }
+}
+
+/// Append `_<ident><suffix>` to `out`.
+fn appendZshFnName(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    ident: String,
+    suffix: String,
+) std.mem.Allocator.Error!void {
+    try out.append(allocator, '_');
+    try out.appendSlice(allocator, ident);
+    try out.appendSlice(allocator, suffix);
+}
+
+/// Append the `cands`/`displays` pair for `cands` and the `compadd` call that
+/// consumes them. Candidates carrying help are aligned to the widest spelling,
+/// separated from it by `  -- ` and listed one per line (`-V '' -l`), so the
+/// descriptions form a column instead of packing into the terminal width. A
+/// candidate with empty help displays as itself; when no candidate carries help
+/// (enumeration values) the list stays packed in columns.
+fn appendZshCandidates(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    indent: String,
+    cands: []const CompletionCandidate,
+) std.mem.Allocator.Error!void {
+    if (cands.len == 0) {
+        try out.appendSlice(allocator, indent);
+        try out.appendSlice(allocator, "return 1\n");
+        return;
+    }
+
+    var width: usize = 0;
+    var any_help = false;
+    for (cands) |c| {
+        if (c.spelling.len > width) width = c.spelling.len;
+        if (c.help.len != 0) any_help = true;
+    }
+
+    try out.appendSlice(allocator, indent);
+    try out.appendSlice(allocator, "cands=(");
+    for (cands, 0..) |c, i| {
+        if (i != 0) try out.append(allocator, ' ');
+        try appendQuoted(out, allocator, c.spelling, .posix);
+    }
+    try out.appendSlice(allocator, ")\n");
+
+    try out.appendSlice(allocator, indent);
+    try out.appendSlice(allocator, "displays=(");
+    for (cands, 0..) |c, i| {
+        if (i != 0) try out.append(allocator, ' ');
+        if (c.help.len == 0) {
+            try appendQuoted(out, allocator, c.spelling, .posix);
+        } else {
+            var display: std.ArrayList(u8) = .empty;
+            defer display.deinit(allocator);
+            try display.appendSlice(allocator, c.spelling);
+            var pad = width - c.spelling.len;
+            while (pad > 0) : (pad -= 1) try display.append(allocator, ' ');
+            try display.appendSlice(allocator, "  -- ");
+            try appendSanitized(&display, allocator, c.help);
+            try appendQuoted(out, allocator, display.items, .posix);
+        }
+    }
+    try out.appendSlice(allocator, ")\n");
+
+    try out.appendSlice(allocator, indent);
+    if (any_help) {
+        try out.appendSlice(allocator, "compadd -V '' -l -d displays -- \"${cands[@]}\"\n");
+    } else {
+        try out.appendSlice(allocator, "compadd -o nosort -d displays -- \"${cands[@]}\"\n");
+    }
+}
+
+/// Append `_dap_<ident><suffix>` to `out`.
+fn appendBashFnName(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    ident: String,
+    suffix: String,
+) std.mem.Allocator.Error!void {
+    try out.appendSlice(allocator, "_dap_");
+    try out.appendSlice(allocator, ident);
+    try out.appendSlice(allocator, suffix);
+}
+
+/// Append one `_dap_<ident>_filter <prefix> 'candidate'...` call with no
+/// trailing newline. `prefix` is a raw shell expression.
+fn appendBashFilterCall(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    ident: String,
+    prefix: String,
+    candidates: []const String,
+) std.mem.Allocator.Error!void {
+    try appendBashFnName(out, allocator, ident, "_filter ");
+    try out.appendSlice(allocator, prefix);
+    for (candidates) |c| {
+        try out.append(allocator, ' ');
+        try appendQuoted(out, allocator, c, .posix);
+    }
+}
+
+/// Render a completion script for every level of `NS`'s tree.
+fn completionScript(
+    allocator: std.mem.Allocator,
+    comptime NS: type,
+    app_name: String,
+    shell: CompletionShell,
+) CompletionError!String {
+    if (!isValidCompletionAppName(app_name)) return error.InvalidAppName;
+    const ident = try completionIdent(allocator, app_name);
+    defer allocator.free(ident);
+
+    const levels = comptime completionLevels(NS, &.{});
+    return switch (shell) {
+        .bash => emitBash(allocator, levels, ident, app_name),
+        .zsh => emitZsh(allocator, levels, ident, app_name),
+        .fish => emitFish(allocator, levels, ident, app_name),
+    };
+}
+
+fn emitBash(
+    allocator: std.mem.Allocator,
+    comptime levels: []const CompletionLevel,
+    ident: String,
+    app_name: String,
+) std.mem.Allocator.Error!String {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try appendBashFnName(&out, allocator, ident, "_filter() {\n");
+    try out.appendSlice(allocator,
+        \\    local cur=$1; shift
+        \\    COMPREPLY=()
+        \\    local c
+        \\    for c in "$@"; do
+        \\        [[ $c == "$cur"* ]] && COMPREPLY+=("$c")
+        \\    done
+        \\}
+        \\
+        \\
+    );
+
+    try appendBashFnName(&out, allocator, ident, "_value_flag() {\n");
+    try out.appendSlice(allocator,
+        \\    case "$1" in
+        \\    *=*) return 1 ;;
+        \\
+    );
+    inline for (comptime valueFlagSpellings(levels)) |spelling| {
+        try out.appendSlice(allocator, "    ");
+        try appendQuoted(&out, allocator, spelling, .posix);
+        try out.appendSlice(allocator, ") return 0 ;;\n");
+    }
+    try out.appendSlice(allocator,
+        \\    esac
+        \\    return 1
+        \\}
+        \\
+        \\
+    );
+
+    try appendBashFnName(&out, allocator, ident, "() {\n");
+    try out.appendSlice(allocator,
+        \\    local cur prev level=0 literal=0
+        \\    local vflag= vform=bare
+        \\    local i tok end
+        \\    COMPREPLY=()
+        \\    cur=${COMP_WORDS[COMP_CWORD]}
+        \\    prev=
+        \\    if (( COMP_CWORD >= 1 )); then
+        \\        prev=${COMP_WORDS[COMP_CWORD-1]}
+        \\    fi
+        \\    end=$((COMP_CWORD - 1))
+        \\    i=1
+        \\    while (( i <= end )); do
+        \\        tok=${COMP_WORDS[i]}
+        \\        if (( literal )); then
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == '--' ]]; then
+        \\            literal=1
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && $tok == *=* ]]; then
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        if 
+    );
+    try appendBashFnName(&out, allocator, ident, "_value_flag \"$tok\"; then\n");
+    try out.appendSlice(allocator,
+        \\            if (( i + 1 <= end )) && [[ ${COMP_WORDS[i+1]} == '=' ]]; then
+        \\                i=$((i + 3))
+        \\            else
+        \\                i=$((i + 2))
+        \\            fi
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && ${#tok} -gt 1 ]]; then
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        case "$level" in
+        \\
+    );
+    inline for (levels) |level| {
+        try out.print(allocator, "        {})\n", .{level.rank});
+        const cmds = comptime completionCommands(level);
+        if (cmds.len != 0) {
+            try out.appendSlice(allocator, "            case \"$tok\" in\n");
+            inline for (cmds) |c| {
+                try out.appendSlice(allocator, "            ");
+                try appendQuoted(&out, allocator, c.name, .posix);
+                try out.print(allocator, ") level={} ;;\n", .{c.rank});
+            }
+            try out.appendSlice(allocator, "            esac\n");
+        }
+        try out.appendSlice(allocator, "            ;;\n");
+    }
+    try out.appendSlice(allocator,
+        \\        esac
+        \\        i=$((i + 1))
+        \\    done
+        \\    if (( literal )); then
+        \\        return
+        \\    fi
+        \\    if [[ $cur == '=' ]] && 
+    );
+    try appendBashFnName(&out, allocator, ident, "_value_flag \"$prev\"; then\n");
+    try out.appendSlice(allocator,
+        \\        vflag=$prev
+        \\        vform=eq
+        \\    elif [[ $prev == '=' ]] && (( COMP_CWORD >= 2 )); then
+        \\        vflag=${COMP_WORDS[COMP_CWORD-2]}
+        \\    elif 
+    );
+    try appendBashFnName(&out, allocator, ident, "_value_flag \"$prev\"; then\n");
+    try out.appendSlice(allocator,
+        \\        vflag=$prev
+        \\    elif [[ $cur == -* && $cur == *=* ]]; then
+        \\        vflag=${cur%%=*}
+        \\        vform=full
+        \\    fi
+        \\    case "$level" in
+        \\
+    );
+    inline for (levels) |level| {
+        const arms = comptime completionValueArms(level);
+        const cands = comptime completionCandidates(level);
+        try out.print(allocator, "    {})\n", .{level.rank});
+        try appendLevelMarker(&out, allocator, level);
+        if (arms.len != 0) {
+            try out.appendSlice(allocator, "        case \"$vflag\" in\n");
+            inline for (arms) |arm| {
+                try out.appendSlice(allocator, "        ");
+                try appendQuoted(&out, allocator, arm.spelling, .posix);
+                try out.appendSlice(allocator, ")\n");
+                const names = comptime enumWireNames(arm.vtype);
+                if (names.len == 0) {
+                    try out.appendSlice(allocator, "            return\n");
+                } else {
+                    try out.appendSlice(allocator, "            case \"$vform\" in\n");
+                    try out.appendSlice(allocator, "            eq) ");
+                    try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime enumSpellings(arm.vtype, "="));
+                    try out.appendSlice(allocator, " ;;\n");
+                    const full_prefix = comptime std.fmt.comptimePrint("{s}=", .{arm.spelling});
+                    try out.appendSlice(allocator, "            full) ");
+                    try appendBashFilterCall(&out, allocator, ident, "\"$vflag=\"", comptime enumSpellings(arm.vtype, full_prefix));
+                    try out.appendSlice(allocator, " ;;\n");
+                    try out.appendSlice(allocator, "            *) ");
+                    try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", names);
+                    try out.appendSlice(allocator, " ;;\n");
+                    try out.appendSlice(allocator, "            esac\n");
+                    try out.appendSlice(allocator, "            return\n");
+                }
+                try out.appendSlice(allocator, "            ;;\n");
+            }
+            try out.appendSlice(allocator, "        esac\n");
+        }
+        try out.appendSlice(allocator, "        ");
+        try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", cands);
+        try out.appendSlice(allocator, "\n        ;;\n");
+    }
+    try out.appendSlice(allocator,
+        \\    esac
+        \\}
+        \\
+        \\complete -o default -F 
+    );
+    try appendBashFnName(&out, allocator, ident, " ");
+    try appendQuoted(&out, allocator, app_name, .posix);
+    try out.append(allocator, '\n');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn emitZsh(
+    allocator: std.mem.Allocator,
+    comptime levels: []const CompletionLevel,
+    ident: String,
+    app_name: String,
+) std.mem.Allocator.Error!String {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "#compdef ");
+    try out.appendSlice(allocator, app_name);
+    try out.append(allocator, '\n');
+
+    try appendZshFnName(&out, allocator, ident, "_value_flag() {\n");
+    try out.appendSlice(allocator, "    case \"$1\" in\n    *=*) return 1 ;;\n");
+    inline for (comptime valueFlagSpellings(levels)) |spelling| {
+        try out.appendSlice(allocator, "    ");
+        try appendQuoted(&out, allocator, spelling, .posix);
+        try out.appendSlice(allocator, ") return 0 ;;\n");
+    }
+    try out.appendSlice(allocator, "    esac\n    return 1\n}\n\n");
+
+    try appendZshFnName(&out, allocator, ident, "() {\n");
+    try out.appendSlice(allocator,
+        \\    emulate -L zsh
+        \\    local level=0 literal=0 vflag= vform=bare i tok end
+        \\    local -a cands displays
+        \\    end=$(( CURRENT - 1 ))
+        \\    i=2
+        \\    while (( i <= end )); do
+        \\        tok=${words[i]}
+        \\        if (( literal )); then
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == '--' ]]; then
+        \\            literal=1
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && $tok == *=* ]]; then
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        if 
+    );
+    try appendZshFnName(&out, allocator, ident, "_value_flag \"$tok\"; then\n");
+    try out.appendSlice(allocator,
+        \\            if (( i + 1 <= end )) && [[ ${words[i+1]} == '=' ]]; then
+        \\                i=$(( i + 3 ))
+        \\            else
+        \\                i=$(( i + 2 ))
+        \\            fi
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && ${#tok} -gt 1 ]]; then
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        case "$level" in
+        \\
+    );
+    inline for (levels) |level| {
+        try out.print(allocator, "        {})\n", .{level.rank});
+        const cmds = comptime completionCommands(level);
+        if (cmds.len != 0) {
+            try out.appendSlice(allocator, "            case \"$tok\" in\n");
+            inline for (cmds) |c| {
+                try out.appendSlice(allocator, "            ");
+                try appendQuoted(&out, allocator, c.name, .posix);
+                try out.print(allocator, ") level={} ;;\n", .{c.rank});
+            }
+            try out.appendSlice(allocator, "            esac\n");
+        }
+        try out.appendSlice(allocator, "            ;;\n");
+    }
+    try out.appendSlice(allocator,
+        \\        esac
+        \\        i=$(( i + 1 ))
+        \\    done
+        \\    if (( literal )); then
+        \\        return 1
+        \\    fi
+        \\    if (( CURRENT >= 2 )); then
+        \\        if [[ $PREFIX == '=' ]] && 
+    );
+    try appendZshFnName(&out, allocator, ident, "_value_flag \"$words[CURRENT-1]\"; then\n");
+    try out.appendSlice(allocator,
+        \\            vflag=$words[CURRENT-1]
+        \\            vform=eq
+        \\        elif [[ $words[CURRENT-1] == '=' ]] && (( CURRENT >= 3 )); then
+        \\            vflag=$words[CURRENT-2]
+        \\        elif 
+    );
+    try appendZshFnName(&out, allocator, ident, "_value_flag \"$words[CURRENT-1]\"; then\n");
+    try out.appendSlice(allocator,
+        \\            vflag=$words[CURRENT-1]
+        \\        fi
+        \\    fi
+        \\    if [[ -z $vflag && $PREFIX == -* && $PREFIX == *=* ]]; then
+        \\        vflag=${PREFIX%%=*}
+        \\        vform=full
+        \\    fi
+        \\    case "$level" in
+        \\
+    );
+    inline for (levels) |level| {
+        try out.print(allocator, "    {})\n", .{level.rank});
+        try appendLevelMarker(&out, allocator, level);
+        const arms = comptime completionValueArms(level);
+        if (arms.len != 0) {
+            try out.appendSlice(allocator, "        case \"$vflag\" in\n");
+            inline for (arms) |arm| {
+                try out.appendSlice(allocator, "        ");
+                try appendQuoted(&out, allocator, arm.spelling, .posix);
+                try out.appendSlice(allocator, ")\n");
+                const names = comptime enumWireNames(arm.vtype);
+                if (names.len == 0) {
+                    try out.appendSlice(allocator, "            return 1\n");
+                } else {
+                    try out.appendSlice(allocator, "            case \"$vform\" in\n");
+
+                    try out.appendSlice(allocator, "            eq)\n");
+                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, "="));
+                    try out.appendSlice(allocator, "                ;;\n");
+
+                    const full_prefix = comptime std.fmt.comptimePrint("{s}=", .{arm.spelling});
+                    try out.appendSlice(allocator, "            full)\n");
+                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, full_prefix));
+                    try out.appendSlice(allocator, "                ;;\n");
+
+                    try out.appendSlice(allocator, "            *)\n");
+                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, ""));
+                    try out.appendSlice(allocator, "                ;;\n");
+
+                    try out.appendSlice(allocator, "            esac\n            return\n");
+                }
+                try out.appendSlice(allocator, "            ;;\n");
+            }
+            try out.appendSlice(allocator, "        esac\n");
+        }
+        try appendZshCandidates(&out, allocator, "        ", comptime completionCandidateHelp(level));
+        try out.appendSlice(allocator, "        return\n        ;;\n");
+    }
+    try out.appendSlice(allocator,
+        \\    esac
+        \\    return 1
+        \\}
+        \\
+    );
+
+    try out.appendSlice(allocator, "if [[ $funcstack[1] == '");
+    try appendZshFnName(&out, allocator, ident, "' ]]; then\n    ");
+    try appendZshFnName(&out, allocator, ident, " \"$@\"\nelse\n    compdef ");
+    try appendZshFnName(&out, allocator, ident, " ");
+    try appendQuoted(&out, allocator, app_name, .posix);
+    try out.appendSlice(allocator, "\nfi\n");
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Append `__dap_<ident><suffix>` to `out`.
+fn appendFishFnName(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    ident: String,
+    suffix: String,
+) std.mem.Allocator.Error!void {
+    try out.appendSlice(allocator, "__dap_");
+    try out.appendSlice(allocator, ident);
+    try out.appendSlice(allocator, suffix);
+}
+
+/// Whether `word` is representable in fish's candidate line protocol, which
+/// separates the candidate from its description with a tab and candidates with
+/// newlines.
+fn fishWordIsRepresentable(word: String) bool {
+    return std.mem.indexOfAny(u8, word, "\t\n") == null;
+}
+
+/// Commands of `level` whose names fish can match: names with a tab or newline
+/// cannot appear in a `case` pattern or a printed candidate.
+fn fishCommands(comptime level: CompletionLevel) []const CommandEntry {
+    comptime {
+        var cmds: []const CommandEntry = &.{};
+        for (completionCommands(level)) |c| {
+            if (!fishWordIsRepresentable(c.name)) continue;
+            cmds = cmds ++ &[_]CommandEntry{c};
+        }
+        return cmds;
+    }
+}
+
+/// Append one `printf '%s\n' 'word'...` line of bare fish candidates.
+fn appendFishWords(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    indent: String,
+    words: []const String,
+) std.mem.Allocator.Error!void {
+    var any = false;
+    for (words) |word| {
+        if (fishWordIsRepresentable(word)) any = true;
+    }
+    if (!any) return;
+
+    try out.appendSlice(allocator, indent);
+    try out.appendSlice(allocator, "printf '%s\\n'");
+    for (words) |word| {
+        if (!fishWordIsRepresentable(word)) continue;
+        try out.append(allocator, ' ');
+        try appendQuoted(out, allocator, word, .fish);
+    }
+    try out.append(allocator, '\n');
+}
+
+/// Append one fish candidate line: `candidate<TAB>description`, or the
+/// candidate alone when its sanitized description is empty. A spelling with a
+/// tab or newline is skipped, since fish reads one candidate per line and
+/// splits the description on the first tab.
+fn appendFishCandidate(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    indent: String,
+    candidate: CompletionCandidate,
+) std.mem.Allocator.Error!void {
+    if (!fishWordIsRepresentable(candidate.spelling)) return;
+
+    var display: std.ArrayList(u8) = .empty;
+    defer display.deinit(allocator);
+    try appendSanitized(&display, allocator, candidate.help);
+
+    try out.appendSlice(allocator, indent);
+    if (display.items.len == 0) {
+        try out.appendSlice(allocator, "printf '%s\\n' ");
+        try appendQuoted(out, allocator, candidate.spelling, .fish);
+    } else {
+        try out.appendSlice(allocator, "printf '%s\\t%s\\n' ");
+        try appendQuoted(out, allocator, candidate.spelling, .fish);
+        try out.append(allocator, ' ');
+        try appendQuoted(out, allocator, display.items, .fish);
+    }
+    try out.append(allocator, '\n');
+}
+
+fn emitFish(
+    allocator: std.mem.Allocator,
+    comptime levels: []const CompletionLevel,
+    ident: String,
+    app_name: String,
+) std.mem.Allocator.Error!String {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "function ");
+    try appendFishFnName(&out, allocator, ident, "_value_flag\n");
+    try out.appendSlice(allocator,
+        \\    switch $argv[1]
+        \\    case '*=*'
+        \\        return 1
+        \\
+    );
+    const spellings = comptime valueFlagSpellings(levels);
+    if (spellings.len != 0) {
+        try out.appendSlice(allocator, "    case");
+        inline for (spellings) |spelling| {
+            try out.append(allocator, ' ');
+            try appendQuoted(&out, allocator, spelling, .fish);
+        }
+        try out.appendSlice(allocator, "\n        return 0\n");
+    }
+    try out.appendSlice(allocator,
+        \\    end
+        \\    return 1
+        \\end
+        \\
+        \\
+    );
+
+    try out.appendSlice(allocator, "function ");
+    try appendFishFnName(&out, allocator, ident, "_complete\n");
+    try out.appendSlice(allocator,
+        \\    set -l toks (commandline -opc)
+        \\    set -e toks[1]
+        \\    set -l cur (commandline -ct)
+        \\    set -l prev ''
+        \\    if test (count $toks) -ge 1
+        \\        set prev $toks[-1]
+        \\    end
+        \\    set -l level 0
+        \\    set -l literal 0
+        \\    set -l i 1
+        \\    set -l end (count $toks)
+        \\    while test $i -le $end
+        \\        set -l tok $toks[$i]
+        \\        if test $literal -eq 1
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        if test "$tok" = '--'
+        \\            set literal 1
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        if string match -qr '^-.*=' -- $tok
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        if 
+    );
+    try appendFishFnName(&out, allocator, ident, "_value_flag $tok\n");
+    try out.appendSlice(allocator,
+        \\            set i (math $i + 2)
+        \\            continue
+        \\        end
+        \\        if string match -qr '^-' -- $tok
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\
+    );
+
+    const has_descent = comptime blk: {
+        for (levels) |level| {
+            if (fishCommands(level).len != 0) break :blk true;
+        }
+        break :blk false;
+    };
+    if (has_descent) {
+        try out.appendSlice(allocator, "        switch $level\n");
+        inline for (levels) |level| {
+            const cmds = comptime fishCommands(level);
+            if (cmds.len != 0) {
+                try out.print(allocator, "        case {}\n", .{level.rank});
+                try out.appendSlice(allocator, "            switch $tok\n");
+                inline for (cmds) |c| {
+                    try out.appendSlice(allocator, "            case ");
+                    try appendQuoted(&out, allocator, c.name, .fish);
+                    try out.print(allocator, "\n                set level {}\n", .{c.rank});
+                }
+                try out.appendSlice(allocator, "            end\n");
+            }
+        }
+        try out.appendSlice(allocator, "        end\n");
+    }
+
+    try out.appendSlice(allocator,
+        \\        set i (math $i + 1)
+        \\    end
+        \\    if test $literal -eq 1
+        \\        return
+        \\    end
+        \\    set -l vflag ''
+        \\    set -l vform bare
+        \\    if string match -qr '^-.*=' -- $cur
+        \\        set vflag (string split -m 1 '=' -- $cur)[1]
+        \\        set vform full
+        \\    else if test -n "$prev"
+        \\        if 
+    );
+    try appendFishFnName(&out, allocator, ident, "_value_flag $prev\n");
+    try out.appendSlice(allocator,
+        \\            set vflag $prev
+        \\        end
+        \\    end
+        \\    switch $level
+        \\
+    );
+
+    inline for (levels) |level| {
+        try out.appendSlice(allocator, "    ");
+        try appendLevelMarker(&out, allocator, level);
+        try out.print(allocator, "    case {}\n", .{level.rank});
+
+        const arms = comptime completionValueArms(level);
+        if (arms.len != 0) {
+            try out.appendSlice(allocator,
+                \\        if test -n "$vflag"
+                \\            switch $vflag
+                \\
+            );
+            inline for (arms) |arm| {
+                try out.appendSlice(allocator, "            case ");
+                try appendQuoted(&out, allocator, arm.spelling, .fish);
+                try out.append(allocator, '\n');
+                const bare = comptime enumSpellings(arm.vtype, "");
+                const full_prefix = comptime std.fmt.comptimePrint("{s}=", .{arm.spelling});
+                const full = comptime enumSpellings(arm.vtype, full_prefix);
+                if (bare.len == 0) {
+                    try out.appendSlice(allocator, "                return\n");
+                } else {
+                    try out.appendSlice(allocator,
+                        \\                switch $vform
+                        \\                case full
+                        \\
+                    );
+                    try appendFishWords(&out, allocator, "                    ", full);
+                    try out.appendSlice(allocator,
+                        \\                case '*'
+                        \\
+                    );
+                    try appendFishWords(&out, allocator, "                    ", bare);
+                    try out.appendSlice(allocator,
+                        \\                end
+                        \\                return
+                        \\
+                    );
+                }
+            }
+            try out.appendSlice(allocator,
+                \\            end
+                \\            return
+                \\        end
+                \\
+            );
+        }
+
+        const candidates = comptime completionCandidateHelp(level);
+        inline for (candidates) |candidate| {
+            try appendFishCandidate(&out, allocator, "        ", candidate);
+        }
+    }
+
+    try out.appendSlice(allocator, "    end\nend\n\n");
+    try out.appendSlice(allocator, "complete -c ");
+    try appendQuoted(&out, allocator, app_name, .fish);
+    try out.appendSlice(allocator, " -a '(");
+    try appendFishFnName(&out, allocator, ident, "_complete)'\n");
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn generate(comptime app: App, comptime def: anytype) type {
     @setEvalBranchQuota(1_000_000);
     const merged = withBuiltinHelp(def);
@@ -2335,6 +3422,36 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             var stdout_writer = stdout_file.writer(std.Options.debug_io, &stdout_buffer);
             stdout_writer.interface.print("{s}\n", .{text}) catch {};
             stdout_writer.interface.flush() catch {};
+        }
+
+        /// Render a completion script for this declaration.
+        ///
+        /// `app_name` is the command name the script registers (a bare binary
+        /// name, not the declaration's usage path). The script is a snapshot
+        /// of the declaration; regenerate it when flags or commands change.
+        /// The caller owns the returned string and releases it with the same
+        /// allocator.
+        ///
+        /// ```
+        /// var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        /// defer arena.deinit();
+        /// const script = try CLI.completion(arena.allocator(), "app", .zsh);
+        /// ```
+        ///
+        /// The root level is the only caller: a subcommand level cannot
+        /// reconstruct its ancestors, so a non-root call is a compile error.
+        pub fn completion(
+            allocator: std.mem.Allocator,
+            app_name: String,
+            shell: CompletionShell,
+        ) CompletionError!String {
+            comptime {
+                if (app._command_rank != 0) {
+                    @compileError("dap.completion: call it on the root namespace, got '" ++
+                        app.name ++ "'");
+                }
+            }
+            return completionScript(allocator, @This(), app_name, shell);
         }
 
         /// Render one flag entry into `HelpData`, duplicating every string.
@@ -2767,6 +3884,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         pub const helpData = Base.helpData;
         pub const helpText = Base.helpText;
         pub const usage = Base.usage;
+        pub const completion = Base.completion;
         pub const deinit = Base.deinit;
 
         pub const CommandPayload = CommandPayloadOf(app, cmd_entries);
@@ -7406,4 +8524,1670 @@ test "M18: twin subtrees keep distinct View types and dispatch independently" {
     switch (M18Twin.command(bv) orelse return error.TestUnexpectedResult) {
         .go => |g| try std.testing.expectEqual(@as(u8, 9), g.n),
     }
+}
+
+// ---------------------------------------------------------------------------
+// M19: completion scripts.
+// ---------------------------------------------------------------------------
+
+const M19Mode = Enumeration(.{
+    .fast = Enum{},
+    .slow = Enum{ .name = "glacial" },
+});
+
+const M19Def = .{
+    .verbose = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "Verbose." },
+    .mode = Flag(M19Mode){
+        .long = "mode",
+        .default = Default(M19Mode){ .direct = .{} },
+        .help = "Mode.",
+    },
+    .run = Command(.{ .help = "Run." }, .{
+        .go = Command(.{ .name = "go", .help = "Go." }, .{
+            .n = Argument(u8){ .help = "N." },
+        }),
+    }),
+};
+
+const M19 = generate(App{ .name = "m19", .help = "M19 root." }, M19Def);
+
+const M19BigDef = .{
+    .verbose = Flag(bool){
+        .short = "v",
+        .default = Default(bool){ .direct = false },
+        .help = "Verbose.",
+    },
+    .config = Flag([]const u8){ .long = "config", .help = "Config." },
+    .server = Group(.{
+        .host = Flag([]const u8){ .long = "host", .help = "Host." },
+        .port = Flag(u16){
+            .long = "port",
+            .default = Default(u16){ .direct = 8080 },
+            .help = "Port.",
+        },
+    }, "Server"),
+    .optional = Optional(Flag(u8){ .long = "optional", .help = "Optional." }),
+    .mode = Alt(.{
+        .fast = .{
+            .fast = Flag(bool){
+                .long = "fast",
+                .help = "Fast.",
+            },
+        },
+        .slow = .{
+            .slow = Flag(bool){
+                .long = "slow",
+                .help = "Slow.",
+            },
+        },
+    }),
+    .build = Command(.{ .help = "Build." }, .{
+        .target = Argument([]const u8){ .help = "Target." },
+    }),
+    .serve = Command(.{ .help = "Serve." }, .{
+        .serve_port = Flag(u16){
+            .long = "serve_port",
+            .default = Default(u16){ .direct = 9000 },
+            .help = "Serve port.",
+        },
+        .nested = Command(.{ .help = "Nested." }, .{
+            .x = Argument(u8){ .help = "X." },
+        }),
+    }),
+};
+
+const M19Big = generate(App{ .name = "m19-big", .help = "M19 big root." }, M19BigDef);
+
+const M19ShortDef = .{
+    .level = Flag(M19Mode){
+        .long = "level",
+        .short = "l",
+        .default = Default(M19Mode){ .direct = .{} },
+        .help = "Level.",
+    },
+};
+
+const M19Short = generate(App{ .name = "m19-short", .help = "M19 short root." }, M19ShortDef);
+
+fn m19Expect(comptime ok: bool, comptime msg: []const u8) void {
+    if (!ok) @compileError("M19: " ++ msg);
+}
+
+fn m19CountLong(comptime specs: []const Spec, comptime long: String) usize {
+    comptime var n: usize = 0;
+    inline for (specs) |s| {
+        if (std.mem.eql(u8, s.long, long)) n += 1;
+    }
+    return n;
+}
+
+fn m19IndexOfLong(comptime specs: []const Spec, comptime long: String) ?usize {
+    comptime var found: ?usize = null;
+    inline for (specs, 0..) |s, i| {
+        if (std.mem.eql(u8, s.long, long)) found = i;
+    }
+    return found;
+}
+
+fn m19HasArgument(comptime specs: []const Spec, comptime name: String) bool {
+    comptime var found = false;
+    inline for (specs) |s| {
+        if (std.mem.eql(u8, s.name, name)) found = true;
+    }
+    return found;
+}
+
+fn m19HasCommand(comptime cmds: []const CommandEntry, comptime name: String) bool {
+    comptime var found = false;
+    inline for (cmds) |c| {
+        if (std.mem.eql(u8, c.name, name)) found = true;
+    }
+    return found;
+}
+
+/// Slice of `script` between the `# dap: level <rank> ` marker and the next
+/// level marker (or the end of the script).
+fn m19LevelBlock(script: String, comptime rank: usize) String {
+    const marker = std.fmt.comptimePrint("# dap: level {d} ", .{rank});
+    const start = std.mem.indexOf(u8, script, marker) orelse return "";
+    const after_marker = start + marker.len;
+    const line_end = std.mem.indexOfScalar(u8, script[after_marker..], '\n') orelse return "";
+    const body = script[after_marker + line_end + 1 ..];
+    const next = std.mem.indexOf(u8, body, "# dap: level ") orelse body.len;
+    return body[0..next];
+}
+
+test "M19: completion public types" {
+    const shell_names = @typeInfo(CompletionShell).@"enum".field_names;
+    try std.testing.expectEqual(@as(usize, 3), shell_names.len);
+    try std.testing.expectEqualStrings("bash", shell_names[0]);
+    try std.testing.expectEqualStrings("zsh", shell_names[1]);
+    try std.testing.expectEqualStrings("fish", shell_names[2]);
+
+    const invalid: CompletionError = error.InvalidAppName;
+    try std.testing.expect(invalid == error.InvalidAppName);
+}
+
+test "M19: level table" {
+    comptime {
+        const levels = completionLevels(M19, &.{});
+        m19Expect(levels.len == 3, "minimal tree level count");
+
+        m19Expect(levels[0].rank == 0, "root rank");
+        m19Expect(std.mem.eql(u8, levels[0].path, "m19"), "root path");
+        m19Expect(levels[0].flags.len == 3, "root effective flags");
+        m19Expect(levels[0].arguments.len == 0, "root arguments");
+        m19Expect(levels[0].commands.len == 1, "root commands");
+        m19Expect(std.mem.eql(u8, levels[0].commands[0].name, "run"), "root command name");
+
+        m19Expect(levels[1].rank == 1, "run rank");
+        m19Expect(std.mem.eql(u8, levels[1].path, "m19 run"), "run path");
+        m19Expect(levels[1].flags.len == 3, "run effective flags");
+        m19Expect(levels[1].arguments.len == 0, "run arguments");
+        m19Expect(levels[1].commands.len == 1, "run commands");
+        m19Expect(std.mem.eql(u8, levels[1].commands[0].name, "go"), "run command name");
+
+        m19Expect(levels[2].rank == 2, "go rank");
+        m19Expect(std.mem.eql(u8, levels[2].path, "m19 run go"), "go path");
+        m19Expect(levels[2].flags.len == 3, "go effective flags");
+        m19Expect(levels[2].arguments.len == 1, "go arguments");
+        m19Expect(std.mem.eql(u8, levels[2].arguments[0].name, "n"), "go argument name");
+        m19Expect(levels[2].commands.len == 0, "go commands");
+
+        // The effective flag set starts with the injected builtin, exactly once.
+        m19Expect(std.mem.eql(u8, levels[0].flags[0].long, "help"), "builtin help first");
+        m19Expect(std.mem.eql(u8, levels[0].flags[0].short.?, "h"), "builtin help short");
+        m19Expect(std.mem.eql(u8, levels[0].flags[1].long, "verbose"), "declaration order");
+        m19Expect(std.mem.eql(u8, levels[0].flags[2].long, "mode"), "declaration order");
+        for (levels) |level| {
+            m19Expect(m19CountLong(level.flags, "help") == 1, "builtin help duplicates");
+        }
+    }
+}
+
+test "M19: larger tree levels" {
+    comptime {
+        const levels = completionLevels(M19Big, &.{});
+        m19Expect(levels.len == 4, "larger tree level count");
+
+        const want_paths = [_]String{ "m19-big", "m19-big build", "m19-big serve", "m19-big serve nested" };
+        for (levels, 0..) |level, i| {
+            m19Expect(level.rank == i, "pre-order rank");
+            m19Expect(std.mem.eql(u8, level.path, want_paths[i]), "level path");
+        }
+
+        const root = levels[0];
+        const want_root_flags = [_]String{ "help", "verbose", "config", "host", "port", "optional", "fast", "slow" };
+        m19Expect(root.flags.len == want_root_flags.len, "root flag count");
+        for (want_root_flags, 0..) |long, i| {
+            m19Expect(std.mem.eql(u8, root.flags[i].long, long), "root flag order");
+        }
+        m19Expect(root.arguments.len == 0, "root arguments");
+        m19Expect(root.commands.len == 2, "root commands");
+        m19Expect(std.mem.eql(u8, root.commands[0].name, "build"), "first sibling");
+        m19Expect(std.mem.eql(u8, root.commands[1].name, "serve"), "second sibling");
+
+        // Group, Alt, and optional members are ordinary flags in the table.
+        const host = root.flags[m19IndexOfLong(root.flags, "host").?];
+        m19Expect(std.mem.eql(u8, host.group.?, "Server"), "group member flag");
+        const fast = root.flags[m19IndexOfLong(root.flags, "fast").?];
+        m19Expect(std.mem.eql(u8, fast.alt.?, "mode"), "alt owner");
+        m19Expect(std.mem.eql(u8, fast.alt_branch.?, "fast"), "alt branch");
+        m19Expect(root.flags[m19IndexOfLong(root.flags, "optional").?].optional, "optional flag");
+
+        // Ancestor-first inheritance: each level extends its parent's chain by
+        // its own flags, and the builtin never duplicates.
+        const build = levels[1];
+        m19Expect(build.flags.len == root.flags.len, "build effective flags");
+        for (root.flags, build.flags) |want, got| {
+            m19Expect(std.mem.eql(u8, want.long, got.long), "build inherited order");
+        }
+        m19Expect(build.arguments.len == 1, "build arguments");
+        m19Expect(std.mem.eql(u8, build.arguments[0].name, "target"), "build argument name");
+        m19Expect(build.commands.len == 0, "build commands");
+
+        const serve = levels[2];
+        m19Expect(serve.flags.len == root.flags.len + 1, "serve effective flags");
+        for (root.flags, serve.flags[0..root.flags.len]) |want, got| {
+            m19Expect(std.mem.eql(u8, want.long, got.long), "serve inherited order");
+        }
+        m19Expect(std.mem.eql(u8, serve.flags[root.flags.len].long, "serve_port"), "serve own flag");
+        m19Expect(serve.arguments.len == 0, "serve arguments");
+        m19Expect(serve.commands.len == 1, "serve commands");
+        m19Expect(std.mem.eql(u8, serve.commands[0].name, "nested"), "serve command name");
+
+        const nested = levels[3];
+        m19Expect(nested.flags.len == serve.flags.len, "nested effective flags");
+        for (serve.flags, nested.flags) |want, got| {
+            m19Expect(std.mem.eql(u8, want.long, got.long), "nested inherited order");
+        }
+        m19Expect(nested.arguments.len == 1, "nested arguments");
+        m19Expect(std.mem.eql(u8, nested.arguments[0].name, "x"), "nested argument name");
+        m19Expect(nested.commands.len == 0, "nested commands");
+    }
+}
+
+test "M19: sibling isolation" {
+    comptime {
+        const levels = completionLevels(M19Big, &.{});
+        const build = levels[1];
+        const serve = levels[2];
+        const nested = levels[3];
+
+        // A level inherits ancestors only: no sibling flags, arguments, or commands.
+        m19Expect(m19IndexOfLong(build.flags, "serve_port") == null, "sibling flag leaked");
+        m19Expect(!m19HasCommand(build.commands, "nested"), "sibling command leaked");
+        m19Expect(!m19HasArgument(build.arguments, "x"), "sibling argument leaked");
+
+        m19Expect(m19IndexOfLong(serve.flags, "target") == null, "sibling flag leaked");
+        m19Expect(!m19HasArgument(serve.arguments, "target"), "sibling argument leaked");
+        m19Expect(!m19HasCommand(serve.commands, "build"), "sibling command leaked");
+
+        m19Expect(!m19HasArgument(nested.arguments, "target"), "sibling argument leaked");
+        m19Expect(m19IndexOfLong(nested.flags, "serve_port") != null, "ancestor flag missing");
+    }
+}
+
+test "M19: enum wire names" {
+    comptime {
+        const wire_names = enumWireNames(M19Mode);
+        m19Expect(wire_names.len == 2, "enumeration name count");
+        m19Expect(std.mem.eql(u8, wire_names[0], "fast"), "enumeration declaration order");
+        m19Expect(std.mem.eql(u8, wire_names[1], "glacial"), "enumeration wire name");
+
+        m19Expect(enumWireNames(Enumeration(.{})).len == 0, "empty enumeration");
+        m19Expect(enumWireNames(u8).len == 0, "scalar type");
+        m19Expect(enumWireNames(bool).len == 0, "bool type");
+        m19Expect(enumWireNames(String).len == 0, "string type");
+
+        const Custom = struct { value: u8 };
+        m19Expect(enumWireNames(Custom).len == 0, "custom struct");
+
+        // Detection is structural: both declarations are required.
+        const NamesOnly = struct {
+            pub const names = [_]String{"leak"};
+        };
+        m19Expect(enumWireNames(NamesOnly).len == 0, "names without EnumView");
+        const EnumViewOnly = struct {
+            pub const EnumView = enum { leak };
+        };
+        m19Expect(enumWireNames(EnumViewOnly).len == 0, "EnumView without names");
+    }
+}
+
+test "M19: invalid app name allocates nothing" {
+    const invalid = [_]String{
+        "",        "-app",        "a/b",     "my app",
+        "my\tapp", "my\napp",     "my\rapp", "app\x00",
+        "app\x7f", "app\xc3\xa9",
+    };
+    for (invalid) |name| {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.InvalidAppName, M19.completion(fa.allocator(), name, .bash));
+        try std.testing.expectEqual(@as(usize, 0), fa.allocations);
+    }
+}
+
+test "M19: valid app names are accepted" {
+    const valid = [_]String{ "app", "my-app", "a.b_c+d", "A9" };
+    for (valid) |name| {
+        const script = try M19.completion(std.testing.allocator, name, .bash);
+        defer std.testing.allocator.free(script);
+        try std.testing.expect(script.len > 0);
+    }
+}
+
+test "M19: determinism and one trailing newline" {
+    inline for (.{ CompletionShell.bash, CompletionShell.zsh, CompletionShell.fish }) |shell| {
+        const a = try M19.completion(std.testing.allocator, "my-app", shell);
+        defer std.testing.allocator.free(a);
+        const b = try M19.completion(std.testing.allocator, "my-app", shell);
+        defer std.testing.allocator.free(b);
+
+        try std.testing.expectEqualStrings(a, b);
+        try std.testing.expect(a.len >= 2);
+        try std.testing.expectEqual(@as(u8, '\n'), a[a.len - 1]);
+        try std.testing.expect(a[a.len - 2] != '\n');
+    }
+}
+
+test "M19: shell dispatch picks the matching registration" {
+    inline for (.{ CompletionShell.bash, CompletionShell.zsh, CompletionShell.fish }) |shell| {
+        const script = try M19.completion(std.testing.allocator, "tool", shell);
+        defer std.testing.allocator.free(script);
+
+        switch (shell) {
+            .bash => {
+                try std.testing.expect(std.mem.endsWith(u8, script, "complete -o default -F _dap_tool 'tool'\n"));
+                try std.testing.expect(std.mem.indexOf(u8, script, "#compdef") == null);
+            },
+            .zsh => {
+                try std.testing.expect(std.mem.startsWith(u8, script, "#compdef tool\n"));
+                try std.testing.expect(std.mem.indexOf(u8, script, "compdef _tool 'tool'\n") != null);
+            },
+            .fish => {
+                try std.testing.expect(std.mem.endsWith(u8, script, "complete -c 'tool' -a '(__dap_tool_complete)'\n"));
+                try std.testing.expect(std.mem.indexOf(u8, script, "function __dap_tool_complete\n") != null);
+            },
+        }
+    }
+}
+
+test "M19: identifier and registration use app_name, not App.name" {
+    const bash = try M19.completion(std.testing.allocator, "my-app", .bash);
+    defer std.testing.allocator.free(bash);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "_dap_my_app() {\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bash, "complete -o default -F _dap_my_app 'my-app'\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bash, "'m19'") == null);
+
+    const zsh_script = try M19.completion(std.testing.allocator, "my.app", .zsh);
+    defer std.testing.allocator.free(zsh_script);
+    try std.testing.expect(std.mem.startsWith(u8, zsh_script, "#compdef my.app\n"));
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "_my_app() {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdef _my_app 'my.app'\n") != null);
+
+    const fish_script = try M19.completion(std.testing.allocator, "my-app", .fish);
+    defer std.testing.allocator.free(fish_script);
+    try std.testing.expect(std.mem.indexOf(u8, fish_script, "function __dap_my_app_complete\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, fish_script, "complete -c 'my-app' -a '(__dap_my_app_complete)'\n"));
+}
+
+test "M19: every generated namespace exposes completion" {
+    comptime {
+        const nodes = commandNodes(M19);
+        m19Expect(nodes.len == 3, "node count");
+        for (nodes) |NS| {
+            m19Expect(@hasDecl(NS, "completion"), "completion missing");
+            m19Expect(@TypeOf(NS.completion) ==
+                fn (std.mem.Allocator, String, CompletionShell) CompletionError!String, "completion signature");
+        }
+    }
+}
+
+test "M19: completion is root-only" {
+    comptime {
+        const nodes = commandNodes(M19);
+        m19Expect(nodes[0].app_meta._command_rank == 0, "root rank");
+        m19Expect(nodes[1].app_meta._command_rank != 0, "child rank");
+        m19Expect(nodes[2].app_meta._command_rank != 0, "grandchild rank");
+    }
+
+    // Compile-fail case, verified by enabling it: the child's `completion`
+    // rejects the call in its body, not in the forwarded alias.
+    // comptime {
+    //     const run_level = commandNodes(M19)[1];
+    //     _ = run_level.completion(std.testing.allocator, "m19", .bash);
+    // }
+    // error: dap.completion: call it on the root namespace, got 'm19 run'
+}
+
+test "M19: skeletons carry one level marker per level" {
+    const script = try M19.completion(std.testing.allocator, "app", .bash);
+    defer std.testing.allocator.free(script);
+
+    const markers = [_]String{
+        "# dap: level 0 m19\n",
+        "# dap: level 1 m19 run\n",
+        "# dap: level 2 m19 run go\n",
+    };
+    for (markers) |marker| {
+        try std.testing.expect(std.mem.indexOf(u8, script, marker) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, script, marker));
+    }
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, script, "# dap: level "));
+}
+
+test "M19: level markers sanitize the path" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try appendLevelMarker(&out, std.testing.allocator, .{
+        .rank = 3,
+        .path = "a\tb\nc\r",
+        .flags = &.{},
+        .arguments = &.{},
+        .commands = &.{},
+    });
+    try std.testing.expectEqualStrings("# dap: level 3 a b c \n", out.items);
+}
+
+test "M19: posix and fish quoting" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendQuoted(&out, std.testing.allocator, "a'b", .posix);
+    try std.testing.expectEqualStrings("'a'\\''b'", out.items);
+
+    out.clearRetainingCapacity();
+    try appendQuoted(&out, std.testing.allocator, "a'b\\c", .fish);
+    try std.testing.expectEqualStrings("'a\\'b\\\\c'", out.items);
+
+    out.clearRetainingCapacity();
+    try appendQuoted(&out, std.testing.allocator, "", .posix);
+    try std.testing.expectEqualStrings("''", out.items);
+}
+
+test "M19: description sanitization" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSanitized(&out, std.testing.allocator, "a\nb\rc\td");
+    try std.testing.expectEqualStrings("a b c d", out.items);
+}
+
+test "M19: value flag spellings" {
+    comptime {
+        const small = valueFlagSpellings(completionLevels(M19, &.{}));
+        m19Expect(small.len == 1, "minimal value spelling count");
+        m19Expect(std.mem.eql(u8, small[0], "--mode"), "minimal value spelling");
+
+        const big = valueFlagSpellings(completionLevels(M19Big, &.{}));
+        const want = [_]String{ "--config", "--host", "--port", "--optional", "--serve_port" };
+        m19Expect(big.len == want.len, "value spelling count");
+        for (want, big) |w, g| m19Expect(std.mem.eql(u8, w, g), "value spelling order");
+    }
+}
+
+test "M19: bash candidates by level" {
+    const script = try M19.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    try std.testing.expect(std.mem.indexOf(u8, root, "\n        _dap_tool_filter \"$cur\" '--help' '-h' '--verbose' '--mode' 'run'\n") != null);
+
+    const run_level = m19LevelBlock(script, 1);
+    try std.testing.expect(std.mem.indexOf(u8, run_level, "\n        _dap_tool_filter \"$cur\" '--help' '-h' '--verbose' '--mode' 'go'\n") != null);
+    // A sibling's commands are not offered after a handoff.
+    try std.testing.expect(std.mem.indexOf(u8, run_level, "'run'") == null);
+
+    const go_level = m19LevelBlock(script, 2);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "\n        _dap_tool_filter \"$cur\" '--help' '-h' '--verbose' '--mode'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "'go'") == null);
+}
+
+test "M19: bash enumeration value positions" {
+    const script = try M19.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    const want =
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq) _dap_tool_filter "$cur" '=fast' '=glacial' ;;
+        \\            full) _dap_tool_filter "$vflag=" '--mode=fast' '--mode=glacial' ;;
+        \\            *) _dap_tool_filter "$cur" 'fast' 'glacial' ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, root, want) != null);
+}
+
+test "M19: bash non-enum and empty enumeration value positions" {
+    const big_script = try M19Big.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(big_script);
+
+    const root = m19LevelBlock(big_script, 0);
+    const arms = [_]String{
+        "        '--config')\n            return\n            ;;\n",
+        "        '--host')\n            return\n            ;;\n",
+        "        '--port')\n            return\n            ;;\n",
+        "        '--optional')\n            return\n            ;;\n",
+    };
+    for (arms) |arm| try std.testing.expect(std.mem.indexOf(u8, root, arm) != null);
+    // Boolean flags never enter a value arm.
+    for ([_]String{ "'--verbose')", "'-v')", "'--fast')", "'--slow')" }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, root, arm) == null);
+    }
+
+    const Empty = Enumeration(.{});
+    const empty_flags = [_]Spec{.{
+        .name = "e",
+        .kind = .flag,
+        .vtype = Empty,
+        .long = "e",
+        .short = null,
+        .required = false,
+        .default = null,
+        .default_env = null,
+        .validation = null,
+        .help = "",
+        .i18n = null,
+        .group = null,
+    }};
+    const empty_levels = [_]CompletionLevel{.{
+        .rank = 0,
+        .path = "empty",
+        .flags = &empty_flags,
+        .arguments = &.{},
+        .commands = &.{},
+    }};
+    const empty_script = try emitBash(std.testing.allocator, &empty_levels, "x", "app");
+    defer std.testing.allocator.free(empty_script);
+    try std.testing.expect(std.mem.indexOf(u8, empty_script, "        '--e')\n            return\n            ;;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_script, "case \"$vform\"") == null);
+}
+
+test "M19: bash value flag table" {
+    const script = try M19Big.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(script);
+
+    const start = std.mem.indexOf(u8, script, "_dap_tool_value_flag() {\n") orelse return error.TestUnexpectedResult;
+    const rest = script[start..];
+    const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.TestUnexpectedResult;
+    const helper = rest[0..end];
+
+    const guard = std.mem.indexOf(u8, helper, "    *=*) return 1 ;;\n") orelse return error.TestUnexpectedResult;
+    const arms = [_]String{
+        "    '--config') return 0 ;;\n",
+        "    '--host') return 0 ;;\n",
+        "    '--port') return 0 ;;\n",
+        "    '--optional') return 0 ;;\n",
+        "    '--serve_port') return 0 ;;\n",
+    };
+    for (arms) |arm| {
+        const at = std.mem.indexOf(u8, helper, arm) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(at > guard);
+    }
+    for ([_]String{ "    '--verbose')", "    '-v')", "    '--fast')", "    '--slow')", "    '--help')" }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, helper, arm) == null);
+    }
+}
+
+test "M19: bash literal terminator" {
+    const script = try M19.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "        if [[ $tok == '--' ]]; then\n            literal=1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "    if (( literal )); then\n        return\n    fi\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, script, "complete -o default -F _dap_tool 'tool'\n"));
+}
+
+test "M19: bash quotes candidates as shell literals" {
+    const weird_flags = [_]Spec{.{
+        .name = "weird",
+        .kind = .flag,
+        .vtype = bool,
+        .long = "a'b",
+        .short = "x y",
+        .required = false,
+        .default = null,
+        .default_env = null,
+        .validation = null,
+        .help = "",
+        .i18n = null,
+        .group = null,
+    }};
+    const weird_commands = [_]CommandEntry{.{
+        .field = "c",
+        .view_field = "_c",
+        .name = "c d",
+        .rank = 1,
+        .Cmd = void,
+    }};
+    const weird_levels = [_]CompletionLevel{.{
+        .rank = 0,
+        .path = "weird\troot",
+        .flags = &weird_flags,
+        .arguments = &.{},
+        .commands = &weird_commands,
+    }};
+
+    const script = try emitBash(std.testing.allocator, &weird_levels, "weird", "app");
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "_dap_weird_filter \"$cur\" '--a'\\''b' '-x y' 'c d'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "# dap: level 0 weird root\n") != null);
+}
+
+test "M19: zsh candidates by level" {
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    try std.testing.expect(std.mem.indexOf(u8, root, "\n        cands=('--help' '-h' '--verbose' '--mode' 'run')\n") != null);
+    const want_displays =
+        "\n        displays=('--help     -- Show context-sensitive help.'" ++
+        " '-h         -- Show context-sensitive help.'" ++
+        " '--verbose  -- Verbose.' '--mode     -- Mode.' 'run        -- Run.')\n";
+    try std.testing.expect(std.mem.indexOf(u8, root, want_displays) != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "compadd -V '' -l -d displays -- \"${cands[@]}\"\n") != null);
+
+    const run_level = m19LevelBlock(script, 1);
+    try std.testing.expect(std.mem.indexOf(u8, run_level, "\n        cands=('--help' '-h' '--verbose' '--mode' 'go')\n") != null);
+    // A sibling's commands are not offered after a handoff.
+    try std.testing.expect(std.mem.indexOf(u8, run_level, "'run'") == null);
+
+    const go_level = m19LevelBlock(script, 2);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "\n        cands=('--help' '-h' '--verbose' '--mode')\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "'go'") == null);
+}
+
+test "M19: zsh enumeration value positions" {
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    const want =
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq)
+        \\                cands=('=fast' '=glacial')
+        \\                displays=('=fast' '=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            full)
+        \\                cands=('--mode=fast' '--mode=glacial')
+        \\                displays=('--mode=fast' '--mode=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            *)
+        \\                cands=('fast' 'glacial')
+        \\                displays=('fast' 'glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, root, want) != null);
+}
+
+test "M19: zsh non-enum value positions return non-zero" {
+    const script = try M19Big.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    const arms = [_]String{
+        "        '--config')\n            return 1\n            ;;\n",
+        "        '--host')\n            return 1\n            ;;\n",
+        "        '--port')\n            return 1\n            ;;\n",
+        "        '--optional')\n            return 1\n            ;;\n",
+    };
+    for (arms) |arm| try std.testing.expect(std.mem.indexOf(u8, root, arm) != null);
+    // Boolean flags never enter a value arm.
+    for ([_]String{ "'--verbose')", "'-v')", "'--fast')", "'--slow')" }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, root, arm) == null);
+    }
+}
+
+test "M19: zsh value flag table" {
+    const script = try M19Big.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(script);
+
+    const start = std.mem.indexOf(u8, script, "_tool_value_flag() {\n") orelse return error.TestUnexpectedResult;
+    const rest = script[start..];
+    const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.TestUnexpectedResult;
+    const helper = rest[0..end];
+
+    const guard = std.mem.indexOf(u8, helper, "    *=*) return 1 ;;\n") orelse return error.TestUnexpectedResult;
+    const arms = [_]String{
+        "    '--config') return 0 ;;\n",
+        "    '--host') return 0 ;;\n",
+        "    '--port') return 0 ;;\n",
+        "    '--optional') return 0 ;;\n",
+        "    '--serve_port') return 0 ;;\n",
+    };
+    for (arms) |arm| {
+        const at = std.mem.indexOf(u8, helper, arm) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(at > guard);
+    }
+    for ([_]String{ "    '--verbose')", "    '-v')", "    '--fast')", "    '--slow')", "    '--help')" }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, helper, arm) == null);
+    }
+}
+
+test "M19: zsh literal terminator returns before dispatch" {
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "        if [[ $tok == '--' ]]; then\n            literal=1\n") != null);
+    const literal_at = std.mem.indexOf(u8, script, "    if (( literal )); then\n        return 1\n    fi\n") orelse
+        return error.TestUnexpectedResult;
+    const dispatch_at = std.mem.indexOf(u8, script, "\n    case \"$level\" in\n") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(literal_at < dispatch_at);
+}
+
+test "M19: zsh header, locals, and guard" {
+    const script = try M19.completion(std.testing.allocator, "my-app", .zsh);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.startsWith(u8, script, "#compdef my-app\n"));
+    try std.testing.expect(std.mem.indexOf(u8, script, "_my_app() {\n    emulate -L zsh\n    local level=0 literal=0 vflag= vform=bare i tok end\n    local -a cands displays\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, script, "if [[ $funcstack[1] == '_my_app' ]]; then\n    _my_app \"$@\"\nelse\n    compdef _my_app 'my-app'\nfi\n"));
+}
+
+test "M19: zsh level markers" {
+    const script = try M19.completion(std.testing.allocator, "app", .zsh);
+    defer std.testing.allocator.free(script);
+
+    const markers = [_]String{
+        "# dap: level 0 m19\n",
+        "# dap: level 1 m19 run\n",
+        "# dap: level 2 m19 run go\n",
+    };
+    for (markers) |marker| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, script, marker));
+    }
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, script, "# dap: level "));
+}
+
+test "M19: zsh quotes candidates and sanitizes descriptions" {
+    const weird_flags = [_]Spec{.{
+        .name = "weird",
+        .kind = .flag,
+        .vtype = bool,
+        .long = "a'b",
+        .short = "x y",
+        .required = false,
+        .default = null,
+        .default_env = null,
+        .validation = null,
+        .help = "Tab\there\nnext",
+        .i18n = null,
+        .group = null,
+    }};
+    const WeirdCmd = struct {
+        pub const cmd_meta = CommandMeta{ .help = "Cmd 'help'." };
+    };
+    const weird_commands = [_]CommandEntry{.{
+        .field = "c",
+        .view_field = "_c",
+        .name = "c d",
+        .rank = 1,
+        .Cmd = WeirdCmd,
+    }};
+    const weird_levels = [_]CompletionLevel{.{
+        .rank = 0,
+        .path = "weird\troot",
+        .flags = &weird_flags,
+        .arguments = &.{},
+        .commands = &weird_commands,
+    }};
+
+    const script = try emitZsh(std.testing.allocator, &weird_levels, "weird", "app");
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "\n        cands=('--a'\\''b' '-x y' 'c d')\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\n        displays=('--a'\\''b  -- Tab here next' '-x y   -- Tab here next' 'c d    -- Cmd '\\''help'\\''.')\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "compadd -V '' -l -d displays -- \"${cands[@]}\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "# dap: level 0 weird root\n") != null);
+}
+
+test "M19: zsh candidate help pairs flags and commands" {
+    comptime {
+        const levels = completionLevels(M19, &.{});
+        const root = completionCandidateHelp(levels[0]);
+        m19Expect(root.len == 5, "root candidate count");
+        const want = [_]String{ "--help", "-h", "--verbose", "--mode", "run" };
+        for (want, root) |w, c| m19Expect(std.mem.eql(u8, w, c.spelling), "candidate order");
+        m19Expect(std.mem.eql(u8, root[0].help, "Show context-sensitive help."), "builtin help");
+        m19Expect(std.mem.eql(u8, root[1].help, "Show context-sensitive help."), "short builtin help");
+        m19Expect(std.mem.eql(u8, root[2].help, "Verbose."), "flag help");
+        m19Expect(std.mem.eql(u8, root[4].help, "Run."), "command help");
+
+        const run_level = completionCandidateHelp(levels[1]);
+        m19Expect(run_level.len == 5, "run candidate count");
+        m19Expect(std.mem.eql(u8, run_level[4].spelling, "go"), "command candidate");
+        m19Expect(std.mem.eql(u8, run_level[4].help, "Go."), "command help text");
+    }
+}
+
+test "M19: fish candidates by level" {
+    const script = try M19.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    const want_root =
+        "\n        printf '%s\\t%s\\n' '--help' 'Show context-sensitive help.'\n" ++
+        "        printf '%s\\t%s\\n' '-h' 'Show context-sensitive help.'\n" ++
+        "        printf '%s\\t%s\\n' '--verbose' 'Verbose.'\n" ++
+        "        printf '%s\\t%s\\n' '--mode' 'Mode.'\n" ++
+        "        printf '%s\\t%s\\n' 'run' 'Run.'\n";
+    try std.testing.expect(std.mem.indexOf(u8, root, want_root) != null);
+
+    const run_level = m19LevelBlock(script, 1);
+    const want_run =
+        "\n        printf '%s\\t%s\\n' '--help' 'Show context-sensitive help.'\n" ++
+        "        printf '%s\\t%s\\n' '-h' 'Show context-sensitive help.'\n" ++
+        "        printf '%s\\t%s\\n' '--verbose' 'Verbose.'\n" ++
+        "        printf '%s\\t%s\\n' '--mode' 'Mode.'\n" ++
+        "        printf '%s\\t%s\\n' 'go' 'Go.'\n";
+    try std.testing.expect(std.mem.indexOf(u8, run_level, want_run) != null);
+    // A sibling's commands are not offered after a handoff.
+    try std.testing.expect(std.mem.indexOf(u8, run_level, "'run'") == null);
+
+    const go_level = m19LevelBlock(script, 2);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "\n        printf '%s\\t%s\\n' '--mode' 'Mode.'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "'go'") == null);
+
+    // Command descent is a nested switch keyed by the level rank.
+    try std.testing.expect(std.mem.indexOf(u8, script,
+        \\        switch $level
+        \\        case 0
+        \\            switch $tok
+        \\            case 'run'
+        \\                set level 1
+        \\            end
+        \\        case 1
+        \\            switch $tok
+        \\            case 'go'
+        \\                set level 2
+        \\            end
+        \\        end
+        \\
+    ) != null);
+}
+
+test "M19: fish enumeration value positions" {
+    const script = try M19.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    const want =
+        \\        if test -n "$vflag"
+        \\            switch $vflag
+        \\            case '--mode'
+        \\                switch $vform
+        \\                case full
+        \\                    printf '%s\n' '--mode=fast' '--mode=glacial'
+        \\                case '*'
+        \\                    printf '%s\n' 'fast' 'glacial'
+        \\                end
+        \\                return
+        \\            end
+        \\            return
+        \\        end
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, root, want) != null);
+}
+
+test "M19: fish non-enum value positions emit nothing" {
+    const script = try M19Big.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(script);
+
+    const root = m19LevelBlock(script, 0);
+    const arms = [_]String{
+        "            case '--config'\n                return\n",
+        "            case '--host'\n                return\n",
+        "            case '--port'\n                return\n",
+        "            case '--optional'\n                return\n",
+    };
+    for (arms) |arm| try std.testing.expect(std.mem.indexOf(u8, root, arm) != null);
+    // Boolean flags never enter a value arm.
+    for ([_]String{ "            case '--verbose'", "            case '-v'", "            case '--fast'", "            case '--slow'" }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, root, arm) == null);
+    }
+}
+
+test "M19: fish value flag table" {
+    const script = try M19Big.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(script);
+
+    const start = std.mem.indexOf(u8, script, "function __dap_tool_value_flag\n") orelse
+        return error.TestUnexpectedResult;
+    const rest = script[start..];
+    const end = std.mem.indexOf(u8, rest, "\nend\n") orelse return error.TestUnexpectedResult;
+    const helper = rest[0..end];
+
+    const guard = std.mem.indexOf(u8, helper, "    case '*=*'\n        return 1\n") orelse
+        return error.TestUnexpectedResult;
+    const arm = std.mem.indexOf(u8, helper, "    case '--config' '--host' '--port' '--optional' '--serve_port'\n        return 0\n") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(arm > guard);
+    for ([_]String{ "'--verbose'", "'-v'", "'--fast'", "'--slow'", "'--help'" }) |absent| {
+        try std.testing.expect(std.mem.indexOf(u8, helper, absent) == null);
+    }
+}
+
+test "M19: fish literal terminator and file fallback" {
+    const script = try M19.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "        if test \"$tok\" = '--'\n            set literal 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\n    if test $literal -eq 1\n        return\n    end\n") != null);
+    // No `-f` on registration: file completion stays available.
+    try std.testing.expect(std.mem.endsWith(u8, script, "complete -c 'tool' -a '(__dap_tool_complete)'\n"));
+    try std.testing.expect(std.mem.indexOf(u8, script, " -f ") == null);
+}
+
+test "M19: fish quotes candidates and skips unrepresentable names" {
+    const weird_flags = [_]Spec{.{
+        .name = "weird",
+        .kind = .flag,
+        .vtype = bool,
+        .long = "a'b",
+        .short = "x y",
+        .required = false,
+        .default = null,
+        .default_env = null,
+        .validation = null,
+        .help = "Tab\there\nnext",
+        .i18n = null,
+        .group = null,
+    }};
+    const WeirdCmd = struct {
+        pub const cmd_meta = CommandMeta{ .help = "Cmd 'help'." };
+    };
+    const weird_commands = [_]CommandEntry{
+        .{
+            .field = "c",
+            .view_field = "_c",
+            .name = "c d",
+            .rank = 1,
+            .Cmd = WeirdCmd,
+        },
+        .{
+            .field = "bad",
+            .view_field = "_bad",
+            .name = "bad\ttab",
+            .rank = 2,
+            .Cmd = WeirdCmd,
+        },
+        .{
+            .field = "bad2",
+            .view_field = "_bad2",
+            .name = "bad\nline",
+            .rank = 3,
+            .Cmd = WeirdCmd,
+        },
+    };
+    const weird_levels = [_]CompletionLevel{.{
+        .rank = 0,
+        .path = "weird\troot",
+        .flags = &weird_flags,
+        .arguments = &.{},
+        .commands = &weird_commands,
+    }};
+
+    const script = try emitFish(std.testing.allocator, &weird_levels, "weird", "app");
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "        printf '%s\\t%s\\n' '--a\\'b' 'Tab here next'\n" ++
+            "        printf '%s\\t%s\\n' '-x y' 'Tab here next'\n" ++
+            "        printf '%s\\t%s\\n' 'c d' 'Cmd \\'help\\'.'\n",
+    ) != null);
+    // A tab or newline cannot cross fish's line protocol: the candidate and
+    // its descent case are both dropped.
+    try std.testing.expect(std.mem.indexOf(u8, script, "bad\t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "bad\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "case 'bad") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "# dap: level 0 weird root\n") != null);
+}
+
+test "M19: short enum spelling" {
+    const bash = try M19Short.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(bash);
+    const bash_root = m19LevelBlock(bash, 0);
+    const bash_want =
+        \\        case "$vflag" in
+        \\        '--level')
+        \\            case "$vform" in
+        \\            eq) _dap_tool_filter "$cur" '=fast' '=glacial' ;;
+        \\            full) _dap_tool_filter "$vflag=" '--level=fast' '--level=glacial' ;;
+        \\            *) _dap_tool_filter "$cur" 'fast' 'glacial' ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        '-l')
+        \\            case "$vform" in
+        \\            eq) _dap_tool_filter "$cur" '=fast' '=glacial' ;;
+        \\            full) _dap_tool_filter "$vflag=" '-l=fast' '-l=glacial' ;;
+        \\            *) _dap_tool_filter "$cur" 'fast' 'glacial' ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, bash_root, bash_want) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_root, "_dap_tool_filter \"$cur\" '--help' '-h' '--level' '-l'\n") != null);
+    // Both spellings skip a following value word.
+    const bash_helper_at = std.mem.indexOf(u8, bash, "_dap_tool_value_flag() {\n") orelse
+        return error.TestUnexpectedResult;
+    const bash_helper = bash[bash_helper_at..];
+    try std.testing.expect(std.mem.indexOf(u8, bash_helper, "    '--level') return 0 ;;\n    '-l') return 0 ;;\n") != null);
+
+    const zsh = try M19Short.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(zsh);
+    const zsh_root = m19LevelBlock(zsh, 0);
+    const zsh_want =
+        \\        case "$vflag" in
+        \\        '--level')
+        \\            case "$vform" in
+        \\            eq)
+        \\                cands=('=fast' '=glacial')
+        \\                displays=('=fast' '=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            full)
+        \\                cands=('--level=fast' '--level=glacial')
+        \\                displays=('--level=fast' '--level=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            *)
+        \\                cands=('fast' 'glacial')
+        \\                displays=('fast' 'glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        '-l')
+        \\            case "$vform" in
+        \\            eq)
+        \\                cands=('=fast' '=glacial')
+        \\                displays=('=fast' '=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            full)
+        \\                cands=('-l=fast' '-l=glacial')
+        \\                displays=('-l=fast' '-l=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            *)
+        \\                cands=('fast' 'glacial')
+        \\                displays=('fast' 'glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, zsh_root, zsh_want) != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_root, "\n        cands=('--help' '-h' '--level' '-l')\n") != null);
+
+    const fish = try M19Short.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(fish);
+    const fish_root = m19LevelBlock(fish, 0);
+    const fish_want =
+        \\            case '--level'
+        \\                switch $vform
+        \\                case full
+        \\                    printf '%s\n' '--level=fast' '--level=glacial'
+        \\                case '*'
+        \\                    printf '%s\n' 'fast' 'glacial'
+        \\                end
+        \\                return
+        \\            case '-l'
+        \\                switch $vform
+        \\                case full
+        \\                    printf '%s\n' '-l=fast' '-l=glacial'
+        \\                case '*'
+        \\                    printf '%s\n' 'fast' 'glacial'
+        \\                end
+        \\                return
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, fish_root, fish_want) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish, "    case '--level' '-l'\n        return 0\n") != null);
+}
+
+test "M19: empty enumeration value positions" {
+    const Empty = Enumeration(.{});
+    const empty_flags = [_]Spec{.{
+        .name = "e",
+        .kind = .flag,
+        .vtype = Empty,
+        .long = "e",
+        .short = null,
+        .required = false,
+        .default = null,
+        .default_env = null,
+        .validation = null,
+        .help = "",
+        .i18n = null,
+        .group = null,
+    }};
+    const empty_levels = [_]CompletionLevel{.{
+        .rank = 0,
+        .path = "empty",
+        .flags = &empty_flags,
+        .arguments = &.{},
+        .commands = &.{},
+    }};
+
+    const bash = try emitBash(std.testing.allocator, &empty_levels, "x", "app");
+    defer std.testing.allocator.free(bash);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "        '--e')\n            return\n            ;;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "case \"$vform\"") == null);
+
+    const zsh = try emitZsh(std.testing.allocator, &empty_levels, "x", "app");
+    defer std.testing.allocator.free(zsh);
+    try std.testing.expect(std.mem.indexOf(u8, zsh, "        '--e')\n            return 1\n            ;;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh, "case \"$vform\"") == null);
+
+    const fish = try emitFish(std.testing.allocator, &empty_levels, "x", "app");
+    defer std.testing.allocator.free(fish);
+    try std.testing.expect(std.mem.indexOf(u8, fish, "            case '--e'\n                return\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish, "switch $vform") == null);
+}
+
+test "M19: identifier sanitization collisions" {
+    // Every byte outside `[A-Za-z0-9_]` maps to `_`, so distinct names can
+    // share one function stem. Registration still differs, but sourcing both
+    // scripts at once is unsupported; this test pins that documented limit.
+    const a = try M19.completion(std.testing.allocator, "a-b", .bash);
+    defer std.testing.allocator.free(a);
+    const b = try M19.completion(std.testing.allocator, "a_b", .bash);
+    defer std.testing.allocator.free(b);
+
+    try std.testing.expect(std.mem.indexOf(u8, a, "_dap_a_b() {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "_dap_a_b() {\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, a, "complete -o default -F _dap_a_b 'a-b'\n"));
+    try std.testing.expect(std.mem.endsWith(u8, b, "complete -o default -F _dap_a_b 'a_b'\n"));
+
+    const zsh = try M19.completion(std.testing.allocator, "a.b", .zsh);
+    defer std.testing.allocator.free(zsh);
+    try std.testing.expect(std.mem.startsWith(u8, zsh, "#compdef a.b\n"));
+    try std.testing.expect(std.mem.indexOf(u8, zsh, "_a_b() {\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, zsh, "compdef _a_b 'a.b'\nfi\n"));
+
+    const fish = try M19.completion(std.testing.allocator, "a+b", .fish);
+    defer std.testing.allocator.free(fish);
+    try std.testing.expect(std.mem.indexOf(u8, fish, "function __dap_a_b_complete\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, fish, "complete -c 'a+b' -a '(__dap_a_b_complete)'\n"));
+}
+
+test "M19: out of memory sweep" {
+    const FailingAllocator = std.testing.FailingAllocator;
+
+    inline for (.{ CompletionShell.bash, CompletionShell.zsh, CompletionShell.fish }) |shell| {
+        const total = blk: {
+            var probe = FailingAllocator.init(std.testing.allocator, .{});
+            const script = try M19.completion(probe.allocator(), "m19", shell);
+            probe.allocator().free(script);
+            break :blk probe.allocations;
+        };
+        try std.testing.expect(total > 0);
+
+        var fi: usize = 0;
+        while (fi <= total) : (fi += 1) {
+            var fa = FailingAllocator.init(std.testing.allocator, .{ .fail_index = fi });
+            if (M19.completion(fa.allocator(), "m19", shell)) |script| {
+                fa.allocator().free(script);
+            } else |e| {
+                try std.testing.expectEqual(std.mem.Allocator.Error.OutOfMemory, e);
+            }
+            try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+        }
+    }
+}
+
+test "M19: bash golden" {
+    const script = try M19.completion(std.testing.allocator, "m19", .bash);
+    defer std.testing.allocator.free(script);
+    const want =
+        \\_dap_m19_filter() {
+        \\    local cur=$1; shift
+        \\    COMPREPLY=()
+        \\    local c
+        \\    for c in "$@"; do
+        \\        [[ $c == "$cur"* ]] && COMPREPLY+=("$c")
+        \\    done
+        \\}
+        \\
+        \\_dap_m19_value_flag() {
+        \\    case "$1" in
+        \\    *=*) return 1 ;;
+        \\    '--mode') return 0 ;;
+        \\    esac
+        \\    return 1
+        \\}
+        \\
+        \\_dap_m19() {
+        \\    local cur prev level=0 literal=0
+        \\    local vflag= vform=bare
+        \\    local i tok end
+        \\    COMPREPLY=()
+        \\    cur=${COMP_WORDS[COMP_CWORD]}
+        \\    prev=
+        \\    if (( COMP_CWORD >= 1 )); then
+        \\        prev=${COMP_WORDS[COMP_CWORD-1]}
+        \\    fi
+        \\    end=$((COMP_CWORD - 1))
+        \\    i=1
+        \\    while (( i <= end )); do
+        \\        tok=${COMP_WORDS[i]}
+        \\        if (( literal )); then
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == '--' ]]; then
+        \\            literal=1
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && $tok == *=* ]]; then
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        if _dap_m19_value_flag "$tok"; then
+        \\            if (( i + 1 <= end )) && [[ ${COMP_WORDS[i+1]} == '=' ]]; then
+        \\                i=$((i + 3))
+        \\            else
+        \\                i=$((i + 2))
+        \\            fi
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && ${#tok} -gt 1 ]]; then
+        \\            i=$((i + 1))
+        \\            continue
+        \\        fi
+        \\        case "$level" in
+        \\        0)
+        \\            case "$tok" in
+        \\            'run') level=1 ;;
+        \\            esac
+        \\            ;;
+        \\        1)
+        \\            case "$tok" in
+        \\            'go') level=2 ;;
+        \\            esac
+        \\            ;;
+        \\        2)
+        \\            ;;
+        \\        esac
+        \\        i=$((i + 1))
+        \\    done
+        \\    if (( literal )); then
+        \\        return
+        \\    fi
+        \\    if [[ $cur == '=' ]] && _dap_m19_value_flag "$prev"; then
+        \\        vflag=$prev
+        \\        vform=eq
+        \\    elif [[ $prev == '=' ]] && (( COMP_CWORD >= 2 )); then
+        \\        vflag=${COMP_WORDS[COMP_CWORD-2]}
+        \\    elif _dap_m19_value_flag "$prev"; then
+        \\        vflag=$prev
+        \\    elif [[ $cur == -* && $cur == *=* ]]; then
+        \\        vflag=${cur%%=*}
+        \\        vform=full
+        \\    fi
+        \\    case "$level" in
+        \\    0)
+        \\# dap: level 0 m19
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq) _dap_m19_filter "$cur" '=fast' '=glacial' ;;
+        \\            full) _dap_m19_filter "$vflag=" '--mode=fast' '--mode=glacial' ;;
+        \\            *) _dap_m19_filter "$cur" 'fast' 'glacial' ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\        _dap_m19_filter "$cur" '--help' '-h' '--verbose' '--mode' 'run'
+        \\        ;;
+        \\    1)
+        \\# dap: level 1 m19 run
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq) _dap_m19_filter "$cur" '=fast' '=glacial' ;;
+        \\            full) _dap_m19_filter "$vflag=" '--mode=fast' '--mode=glacial' ;;
+        \\            *) _dap_m19_filter "$cur" 'fast' 'glacial' ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\        _dap_m19_filter "$cur" '--help' '-h' '--verbose' '--mode' 'go'
+        \\        ;;
+        \\    2)
+        \\# dap: level 2 m19 run go
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq) _dap_m19_filter "$cur" '=fast' '=glacial' ;;
+        \\            full) _dap_m19_filter "$vflag=" '--mode=fast' '--mode=glacial' ;;
+        \\            *) _dap_m19_filter "$cur" 'fast' 'glacial' ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\        _dap_m19_filter "$cur" '--help' '-h' '--verbose' '--mode'
+        \\        ;;
+        \\    esac
+        \\}
+        \\
+        \\complete -o default -F _dap_m19 'm19'
+        \\
+    ;
+    try std.testing.expectEqualStrings(want, script);
+}
+
+test "M19: zsh golden" {
+    const script = try M19.completion(std.testing.allocator, "m19", .zsh);
+    defer std.testing.allocator.free(script);
+    const want =
+        \\#compdef m19
+        \\_m19_value_flag() {
+        \\    case "$1" in
+        \\    *=*) return 1 ;;
+        \\    '--mode') return 0 ;;
+        \\    esac
+        \\    return 1
+        \\}
+        \\
+        \\_m19() {
+        \\    emulate -L zsh
+        \\    local level=0 literal=0 vflag= vform=bare i tok end
+        \\    local -a cands displays
+        \\    end=$(( CURRENT - 1 ))
+        \\    i=2
+        \\    while (( i <= end )); do
+        \\        tok=${words[i]}
+        \\        if (( literal )); then
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == '--' ]]; then
+        \\            literal=1
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && $tok == *=* ]]; then
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        if _m19_value_flag "$tok"; then
+        \\            if (( i + 1 <= end )) && [[ ${words[i+1]} == '=' ]]; then
+        \\                i=$(( i + 3 ))
+        \\            else
+        \\                i=$(( i + 2 ))
+        \\            fi
+        \\            continue
+        \\        fi
+        \\        if [[ $tok == -* && ${#tok} -gt 1 ]]; then
+        \\            i=$(( i + 1 ))
+        \\            continue
+        \\        fi
+        \\        case "$level" in
+        \\        0)
+        \\            case "$tok" in
+        \\            'run') level=1 ;;
+        \\            esac
+        \\            ;;
+        \\        1)
+        \\            case "$tok" in
+        \\            'go') level=2 ;;
+        \\            esac
+        \\            ;;
+        \\        2)
+        \\            ;;
+        \\        esac
+        \\        i=$(( i + 1 ))
+        \\    done
+        \\    if (( literal )); then
+        \\        return 1
+        \\    fi
+        \\    if (( CURRENT >= 2 )); then
+        \\        if [[ $PREFIX == '=' ]] && _m19_value_flag "$words[CURRENT-1]"; then
+        \\            vflag=$words[CURRENT-1]
+        \\            vform=eq
+        \\        elif [[ $words[CURRENT-1] == '=' ]] && (( CURRENT >= 3 )); then
+        \\            vflag=$words[CURRENT-2]
+        \\        elif _m19_value_flag "$words[CURRENT-1]"; then
+        \\            vflag=$words[CURRENT-1]
+        \\        fi
+        \\    fi
+        \\    if [[ -z $vflag && $PREFIX == -* && $PREFIX == *=* ]]; then
+        \\        vflag=${PREFIX%%=*}
+        \\        vform=full
+        \\    fi
+        \\    case "$level" in
+        \\    0)
+        \\# dap: level 0 m19
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq)
+        \\                cands=('=fast' '=glacial')
+        \\                displays=('=fast' '=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            full)
+        \\                cands=('--mode=fast' '--mode=glacial')
+        \\                displays=('--mode=fast' '--mode=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            *)
+        \\                cands=('fast' 'glacial')
+        \\                displays=('fast' 'glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\        cands=('--help' '-h' '--verbose' '--mode' 'run')
+        \\        displays=('--help     -- Show context-sensitive help.' '-h         -- Show context-sensitive help.' '--verbose  -- Verbose.' '--mode     -- Mode.' 'run        -- Run.')
+        \\        compadd -V '' -l -d displays -- "${cands[@]}"
+        \\        return
+        \\        ;;
+        \\    1)
+        \\# dap: level 1 m19 run
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq)
+        \\                cands=('=fast' '=glacial')
+        \\                displays=('=fast' '=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            full)
+        \\                cands=('--mode=fast' '--mode=glacial')
+        \\                displays=('--mode=fast' '--mode=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            *)
+        \\                cands=('fast' 'glacial')
+        \\                displays=('fast' 'glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\        cands=('--help' '-h' '--verbose' '--mode' 'go')
+        \\        displays=('--help     -- Show context-sensitive help.' '-h         -- Show context-sensitive help.' '--verbose  -- Verbose.' '--mode     -- Mode.' 'go         -- Go.')
+        \\        compadd -V '' -l -d displays -- "${cands[@]}"
+        \\        return
+        \\        ;;
+        \\    2)
+        \\# dap: level 2 m19 run go
+        \\        case "$vflag" in
+        \\        '--mode')
+        \\            case "$vform" in
+        \\            eq)
+        \\                cands=('=fast' '=glacial')
+        \\                displays=('=fast' '=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            full)
+        \\                cands=('--mode=fast' '--mode=glacial')
+        \\                displays=('--mode=fast' '--mode=glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            *)
+        \\                cands=('fast' 'glacial')
+        \\                displays=('fast' 'glacial')
+        \\                compadd -o nosort -d displays -- "${cands[@]}"
+        \\                ;;
+        \\            esac
+        \\            return
+        \\            ;;
+        \\        esac
+        \\        cands=('--help' '-h' '--verbose' '--mode')
+        \\        displays=('--help     -- Show context-sensitive help.' '-h         -- Show context-sensitive help.' '--verbose  -- Verbose.' '--mode     -- Mode.')
+        \\        compadd -V '' -l -d displays -- "${cands[@]}"
+        \\        return
+        \\        ;;
+        \\    esac
+        \\    return 1
+        \\}
+        \\if [[ $funcstack[1] == '_m19' ]]; then
+        \\    _m19 "$@"
+        \\else
+        \\    compdef _m19 'm19'
+        \\fi
+        \\
+    ;
+    try std.testing.expectEqualStrings(want, script);
+}
+
+test "M19: fish golden" {
+    const script = try M19.completion(std.testing.allocator, "m19", .fish);
+    defer std.testing.allocator.free(script);
+    const want =
+        \\function __dap_m19_value_flag
+        \\    switch $argv[1]
+        \\    case '*=*'
+        \\        return 1
+        \\    case '--mode'
+        \\        return 0
+        \\    end
+        \\    return 1
+        \\end
+        \\
+        \\function __dap_m19_complete
+        \\    set -l toks (commandline -opc)
+        \\    set -e toks[1]
+        \\    set -l cur (commandline -ct)
+        \\    set -l prev ''
+        \\    if test (count $toks) -ge 1
+        \\        set prev $toks[-1]
+        \\    end
+        \\    set -l level 0
+        \\    set -l literal 0
+        \\    set -l i 1
+        \\    set -l end (count $toks)
+        \\    while test $i -le $end
+        \\        set -l tok $toks[$i]
+        \\        if test $literal -eq 1
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        if test "$tok" = '--'
+        \\            set literal 1
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        if string match -qr '^-.*=' -- $tok
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        if __dap_m19_value_flag $tok
+        \\            set i (math $i + 2)
+        \\            continue
+        \\        end
+        \\        if string match -qr '^-' -- $tok
+        \\            set i (math $i + 1)
+        \\            continue
+        \\        end
+        \\        switch $level
+        \\        case 0
+        \\            switch $tok
+        \\            case 'run'
+        \\                set level 1
+        \\            end
+        \\        case 1
+        \\            switch $tok
+        \\            case 'go'
+        \\                set level 2
+        \\            end
+        \\        end
+        \\        set i (math $i + 1)
+        \\    end
+        \\    if test $literal -eq 1
+        \\        return
+        \\    end
+        \\    set -l vflag ''
+        \\    set -l vform bare
+        \\    if string match -qr '^-.*=' -- $cur
+        \\        set vflag (string split -m 1 '=' -- $cur)[1]
+        \\        set vform full
+        \\    else if test -n "$prev"
+        \\        if __dap_m19_value_flag $prev
+        \\            set vflag $prev
+        \\        end
+        \\    end
+        \\    switch $level
+        \\    # dap: level 0 m19
+        \\    case 0
+        \\        if test -n "$vflag"
+        \\            switch $vflag
+        \\            case '--mode'
+        \\                switch $vform
+        \\                case full
+        \\                    printf '%s\n' '--mode=fast' '--mode=glacial'
+        \\                case '*'
+        \\                    printf '%s\n' 'fast' 'glacial'
+        \\                end
+        \\                return
+        \\            end
+        \\            return
+        \\        end
+        \\        printf '%s\t%s\n' '--help' 'Show context-sensitive help.'
+        \\        printf '%s\t%s\n' '-h' 'Show context-sensitive help.'
+        \\        printf '%s\t%s\n' '--verbose' 'Verbose.'
+        \\        printf '%s\t%s\n' '--mode' 'Mode.'
+        \\        printf '%s\t%s\n' 'run' 'Run.'
+        \\    # dap: level 1 m19 run
+        \\    case 1
+        \\        if test -n "$vflag"
+        \\            switch $vflag
+        \\            case '--mode'
+        \\                switch $vform
+        \\                case full
+        \\                    printf '%s\n' '--mode=fast' '--mode=glacial'
+        \\                case '*'
+        \\                    printf '%s\n' 'fast' 'glacial'
+        \\                end
+        \\                return
+        \\            end
+        \\            return
+        \\        end
+        \\        printf '%s\t%s\n' '--help' 'Show context-sensitive help.'
+        \\        printf '%s\t%s\n' '-h' 'Show context-sensitive help.'
+        \\        printf '%s\t%s\n' '--verbose' 'Verbose.'
+        \\        printf '%s\t%s\n' '--mode' 'Mode.'
+        \\        printf '%s\t%s\n' 'go' 'Go.'
+        \\    # dap: level 2 m19 run go
+        \\    case 2
+        \\        if test -n "$vflag"
+        \\            switch $vflag
+        \\            case '--mode'
+        \\                switch $vform
+        \\                case full
+        \\                    printf '%s\n' '--mode=fast' '--mode=glacial'
+        \\                case '*'
+        \\                    printf '%s\n' 'fast' 'glacial'
+        \\                end
+        \\                return
+        \\            end
+        \\            return
+        \\        end
+        \\        printf '%s\t%s\n' '--help' 'Show context-sensitive help.'
+        \\        printf '%s\t%s\n' '-h' 'Show context-sensitive help.'
+        \\        printf '%s\t%s\n' '--verbose' 'Verbose.'
+        \\        printf '%s\t%s\n' '--mode' 'Mode.'
+        \\    end
+        \\end
+        \\
+        \\complete -c 'm19' -a '(__dap_m19_complete)'
+        \\
+    ;
+    try std.testing.expectEqualStrings(want, script);
 }

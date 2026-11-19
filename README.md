@@ -213,9 +213,83 @@ the sections. Brackets stay inside their highlight blocks and the flag list
 wraps each short/long name separately. Column widths are measured on the raw
 text, so the codes never disturb alignment.
 
+## Completion
+
+`CLI.completion(allocator, app_name, shell)` renders a complete completion
+script for the whole command tree. It is a pure function of the declaration:
+it takes no `View`, never parses, reads no environment and does no file I/O.
+
+```zig
+const dap = @import("dap");
+
+const script = try CLI.completion(arena.allocator(), "app", .zsh);
+```
+
+`CompletionShell` is `.bash`, `.zsh` or `.fish`; the result is a caller-owned
+`[]const u8` (a `dap.String`) with exactly one trailing newline, and failures
+are `OutOfMemory` or `dap.CompletionError.InvalidAppName`. The output is
+deterministic, so it can be regenerated and diffed.
+
+`app_name` is the name the script **registers**, not `App.name` (which is the
+possibly multi-word usage path). It is validated before any allocation: it
+must be non-empty ASCII, must not start with `-`, must not contain `/`,
+whitespace or control bytes, and may only use `A-Za-z0-9._+-`. Passing a
+different name than the installed binary is the intended way to install under
+an alias.
+
+`completion` exists on every generated namespace but may only be called on the
+root one: a call from a subcommand level is a compile error, because a subtree
+cannot reconstruct its ancestors' flags.
+
+A typical `completion` subcommand in `main` prints the script and returns
+before doing anything else:
+
+```zig
+if (CLI.command(cli)) |cmd| switch (cmd) {
+    .completion => |c| {
+        const script = try CLI.completion(arena, "app", switch (c.shell.view) {
+            .bash => .bash,
+            .zsh => .zsh,
+            .fish => .fish,
+        });
+        try stdout.writeAll(script);
+        return;
+    },
+    else => {},
+};
+```
+
+The library only returns the script; saving it is up to the program. With the
+script written to a file:
+
+```sh
+app completion bash > /etc/bash_completion.d/app
+app completion zsh  > "${fpath[1]}/_app"
+app completion fish > ~/.config/fish/completions/app.fish
+```
+
+The zsh file name must match the autoload function `_<ident>`, where `ident`
+is `app_name` with every byte outside `[A-Za-z0-9_]` replaced by `_`
+(`my-app` -> `_my_app`). The registration itself always uses `app_name`
+verbatim: bash's trailing `complete` line and fish's `complete -c` need no
+external file naming, and a single script registers exactly one name.
+
+Regenerate the script whenever flags or commands change; it is a snapshot, not
+a runtime query. Limitations: identifier sanitization is not injective
+(`my-app` and `my_app` both map to `_my_app`), so two `dap` CLIs sourced into
+one bash or fish session can collide; zsh is namespaced by the function name.
+zsh completion is covered by a syntax and autoload smoke test only, not by a
+semantic autotest (bash and fish have running semantic tests).
+
 ## Building and testing
 
 ```sh
-zig build        # compile the module
-zig build test   # run the unit tests in src/dap.zig
+zig build                  # compile the module
+zig build test             # run the unit tests in src/dap.zig
+zig build completion-test  # run generated scripts through real shells
 ```
+
+`completion-test` is opt-in: `zig build test` never compiles the shell
+integration file or spawns a shell. The completion test runs `bash -n`,
+`zsh -n` and `fish -n`, semantic bash and fish cases, and a zsh sourcing smoke
+test; a missing shell prints a notice and skips that shell.

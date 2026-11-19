@@ -38,4 +38,18 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_dap_tests.step);
+
+    const completion_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/completion_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    completion_tests.root_module.addImport("dap", dap_module);
+
+    const run_completion_tests = b.addRunArtifact(completion_tests);
+
+    const completion_test_step = b.step("completion-test", "Run shell completion integration tests");
+    completion_test_step.dependOn(&run_completion_tests.step);
 }

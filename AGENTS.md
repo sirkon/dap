@@ -10,30 +10,37 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (210 tests, the milestone-tagged M1–M18
+`zig test src/dap.zig` both pass (257 tests, the milestone-tagged M1–M19
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
   `Enumeration`, `Command`, `Alt`, runtime help (`HelpData` +
-  `renderHelpWithStyle`/`renderCompact`), typo suggestions (`SuggestValid`/
-  `Suggest` + the `suggest*` family), `DecodeError`/`ParseError`, `Diag`,
-  and the test suite.
+  `renderHelpWithStyle`/`renderCompact`), completion scripts
+  (`CompletionShell`/`CompletionError` + the emitters), typo suggestions
+  (`SuggestValid`/`Suggest` + the `suggest*` family), `DecodeError`/
+  `ParseError`, `Diag`, and the test suite.
 - `src/stdcompare.zig` holds the private `levenshtein` helper the suggester
   ranks with; it is imported directly by `dap.zig` (not re-exported).
+- `src/completion_test.zig` is the opt-in shell integration suite; it imports
+  the public module and is compiled only by the `completion-test` step.
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
   `usingnamespace`; exports are explicit).
 - `build.zig` exposes a public `dap` module rooted at `src/root.zig`, builds a
-  `dap-example` executable from `src/main.zig` with a `run` step, and a `test`
-  step compiling/running tests from `src/dap.zig`.
+  `dap-example` executable from `src/main.zig` with a `run` step, a `test` step
+  compiling/running tests from `src/dap.zig`, and a separate `completion-test`
+  step for `src/completion_test.zig`. `test` never depends on
+  `completion-test`, so it never spawns a shell.
 - `build.zig.zon` sets `.name = .dap` and `.minimum_zig_version = "0.17.0"`.
   Match that version.
 
-Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
+Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
+`zig build run -- --help`.
 
 ## Layout
 
 - `src/dap.zig` — core implementation. Public data types (`Kind`,
-  `HelpRendererStyle`, `HelpRendererHighlight`, `App`, `HelpHighlight`,
+  `HelpRendererStyle`, `HelpRendererHighlight`, `CompletionShell`,
+  `CompletionError`, `App`, `HelpHighlight`,
   `String`, `Default(T)`, `defaultValue`, `Flag(T)`, `Optional`, `Group`,
   `Argument(T)`, `Enumeration`, `Enum`, `CommandMeta`, `Command`,
   `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`,
@@ -47,6 +54,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `dedupeBuiltinHelp`, `appendActiveScopes`, `contextHelpText`) and the
   builtin-help injection helpers (`builtin_help_field`, `BuiltinHelp`,
   `MergedDecl`, `withBuiltinHelp`, `renderHelpWithStyle`) follow.
+- The private `suggest*` family follows, then the private completion
+  scaffolding (`CompletionLevel`, `completionLevels`, `enumWireNames`,
+  `isValidCompletionAppName`, `completionIdent`, `CompletionQuote`,
+  `appendQuoted`, `appendSanitized`, `appendLevelMarker`,
+  `valueFlagSpellings`, `completionCommands`/`completionFlagCandidates`/
+  `completionCandidates`, `completionCandidateHelp`, `enumCandidates`,
+  `completionScript`, `emitBash`/`emitZsh`/`emitFish`). `Base.completion` sits
+  beside `helpData`/`helpText`/`usage`, and the command shell aliases it.
 - Then the public `generate` entry point (its namespace body named `Base`, plus
   the conditional forwarding shell that adds `CommandPayload`/`command` when
   commands exist), then the private normalization/decode helpers (`Spec`,
@@ -57,6 +72,9 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
   `Sub`/`subApp`/`CommandPayloadOf`/`commandNodes`), then
   the test blocks.
+- `src/completion_test.zig` — opt-in shell integration tests (syntax checks,
+  semantic bash/fish cases, zsh sourcing smoke test); imports the public
+  `dap` module and never runs under `zig build test`.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`.
 
 ## Conventions
@@ -257,9 +275,38 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   otherwise prints the block standalone (`printDiagnosticsStandalone`); a
   failed render or diagnostic build falls back to the standalone lines so
   diagnostics are never lost.
+- Completion is static. `CLI.completion(allocator, app_name, shell)` (beside
+  `helpData`/`helpText`/`usage`) takes no `View`, never parses, reads no
+  environment and does no file I/O; `app_name` is the only runtime input
+  besides the allocator and shell. It exists on every generated namespace but
+  a non-root call is a compile error (`app._command_rank != 0` in a comptime
+  block); the command shell aliases it without analyzing the body.
+  `app_name` is the registered name, never `App.name`; it is validated before
+  any allocation by `isValidCompletionAppName` (non-empty ASCII, no whitespace
+  or control bytes, no `/`, not starting `-`, only `A-Za-z0-9._+-`), otherwise
+  `error.InvalidAppName`. Registration quotes `app_name` verbatim; shell
+  identifiers come only from `completionIdent` (bytes outside `[A-Za-z0-9_]`
+  become `_`): bash `_dap_<ident>`, zsh `_<ident>`, fish
+  `__dap_<ident>_complete`. `completionLevels(NS, &.{})` builds a pre-order
+  `CompletionLevel` table by re-instantiating `Sub(c.Cmd, subApp(NS.app_meta,
+  c))`: each level carries its rank, usage path, effective flags
+  (ancestors first, own after, injected builtin once), own arguments, and own
+  commands. All three emitters share the script contract: a level marker
+  comment per level, ordinary candidates from flags (long then non-empty
+  short) then commands (skipping empty and `-`-leading names), enumeration
+  values via `enumWireNames` only for enumerable `vtype`s, no `Alt` pruning,
+  no argument completion, no library candidates after `--`, deterministic
+  bytes and exactly one trailing `\n`. The caller owns the result. The example
+  tree declares a `completion` command whose `main` prints the script and
+  returns before any other output, so
+  `zig build run -- --required 0 completion <shell>` pipes cleanly. Two test
+  surfaces with a hard split: the M19 block in `src/dap.zig` is pure Zig under
+  `zig build test`; real shells are exercised only by
+  `src/completion_test.zig` under optional `zig build completion-test`.
 - Ordering inside `src/dap.zig`: public data types first, then private
-  help/builtin scaffolding, then the private `suggest*` family, then the public
-  `generate` entry point, then private normalization/decode helpers, then tests.
+  help/builtin scaffolding, then the private `suggest*` family, then the
+  completion scaffolding, then the public `generate` entry point, then private
+  normalization/decode helpers, then tests.
 
 ## Notes
 
