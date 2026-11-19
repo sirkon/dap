@@ -475,6 +475,7 @@ Generated namespace members:
 | `parse(alloc, environ, args, diag) ParseError!View` | Parse and return `View` (exits on help/failure). |
 | `helpText(alloc) !String`       | Caller-owned rendered help using `app.help_renderer.style`. |
 | `helpData(alloc) !HelpData`     | Runtime description; `HelpData.renderCompact(alloc)` renders it. |
+| `usage(view) !void`             | Print context-sensitive help for a `View` of **any level** (like `command`): the scopes from this namespace's level down to that view's level, then the descendants still active in it. |
 | `app_meta`                      | The `App` passed in.                                     |
 | `specs`                         | Normalized comptime spec table.                          |
 | `commands`                      | The detected command entries (slice; empty when none).   |
@@ -778,6 +779,33 @@ Rendering then reuses the same `renderCompact` (or `.custom` renderer)
 unchanged. Root-scope help is byte-identical to a non-merged rendering. On a
 *parse failure* (not a help request) the help stays root-scoped, since the
 command path is not reconstructed from `Diag`.
+
+`CLI.usage(view)` prints exactly this merged text. It is generic over the
+`View` type, like `command`: a sub-view from any level is accepted, the
+namespaces on the path from the root down to that level are merged in, and
+the descendants still active in `view` are appended. Calling it on the root
+namespace with either the root view or a dispatched sub-view yields the same
+help, so a "no subcommand given" branch can print its own level's usage with
+`CLI.usage(c)`:
+
+```zig
+if (CLI.command(cli)) |cmd| switch (cmd) {
+    .config => |c| {
+        if (CLI.command(c)) |sub| switch (sub) {
+            .validate => |v| try validate(v.path),
+            .show_dev => try showDefaultConfig(),
+        } else {
+            try CLI.usage(c); // Usage: app config <command> [flags]
+            std.process.exit(1);
+        }
+    },
+    .run => |r| try run(r),
+    .version => printVersion(),
+} else {
+    try CLI.usage(cli);
+    std.process.exit(1);
+}
+```
 
 ```text
 $ app svc build -h

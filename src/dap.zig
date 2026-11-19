@@ -1418,6 +1418,30 @@ fn dedupeBuiltinHelp(allocator: std.mem.Allocator, group: *HelpData.FlagGroup) s
     group.flags = shrunk;
 }
 
+/// The struct type behind a value or pointer used as a command View.
+fn viewValueType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| viewValueType(p.child),
+        else => T,
+    };
+}
+
+/// The generated namespaces from `NS` down to the level whose `View` is `V`,
+/// root first; `null` when this tree owns no such level. It mirrors the
+/// runtime walk `appendActiveScopes` does, keyed by type instead of a value,
+/// so a View from any level identifies its scope (and its ancestors) exactly.
+fn usageChain(comptime NS: type, comptime V: type) ?[]const type {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        if (NS.View == V) return &.{NS};
+        for (NS.commands) |c| {
+            const S = Sub(c.Cmd, subApp(NS.app_meta, c));
+            if (usageChain(S, V)) |rest| return &[_]type{NS} ++ rest;
+        }
+        return null;
+    }
+}
+
 /// Append the [`HelpData`] of every active sub-scope (the caller adds the
 /// root scope first), comptime-recursing through the generated namespaces
 /// along the runtime View chain.
@@ -1441,30 +1465,36 @@ fn appendActiveScopes(
     }
 }
 
-/// The context-sensitive help of a parsed view: build every active level's
-/// [`HelpData`], fold them into the deepest scope, render once with the app's
-/// configured renderer. Nothing public changes shape; this is called from
-/// `parse`'s help intercept.
+/// The context-sensitive help of a parsed view: build every scope on the path
+/// from `NS` down to the level of `v` (plus the descendants still active in
+/// `v`), fold them into the deepest scope, render once with the app's
+/// configured renderer. `v` may be a `View` from any level, and may be passed
+/// by value or by pointer. Nothing public changes shape; this is called from
+/// `usage` and from `parse`'s help intercept.
 fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) std.mem.Allocator.Error!String {
+    const chain = comptime (usageChain(NS, viewValueType(@TypeOf(v))) orelse
+        @compileError("dap.usage: argument is not a command View of '" ++ NS.app_meta.name ++ "'"));
     var scopes: std.ArrayList(HelpData) = .empty;
     defer {
         for (scopes.items) |*d| d.deinit(allocator);
         scopes.deinit(allocator);
     }
-    const root_scope = try NS.helpData(allocator);
-    scopes.append(allocator, root_scope) catch |e| {
-        var d = root_scope;
-        d.deinit(allocator);
-        return e;
-    };
-    try appendActiveScopes(NS, allocator, &scopes, v);
+    inline for (chain) |A| {
+        const scope = try A.helpData(allocator);
+        scopes.append(allocator, scope) catch |e| {
+            var d = scope;
+            d.deinit(allocator);
+            return e;
+        };
+    }
+    try appendActiveScopes(chain[chain.len - 1], allocator, &scopes, v);
 
     var merged: HelpData = emptyHelpData();
     defer merged.deinit(allocator);
     for (scopes.items) |*d| try absorbScope(allocator, &merged, d);
     // The ungrouped bucket is always present and always index 0.
     try dedupeBuiltinHelp(allocator, &merged.flag_groups[0]);
-    return renderHelpWithStyle(NS.app_meta.help_renderer.style, allocator, &merged);
+    return renderHelpWithStyle(chain[0].app_meta.help_renderer.style, allocator, &merged);
 }
 
 /// Generate the *parser* and the *view* type for a declaration. `generate`
@@ -2271,17 +2301,25 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
         /// Print the context-sensitive help of a parsed `View` to stdout: the
         /// same text the builtin `-h`/`--help` intercept would print for the
-        /// command chain activated in `view`. Rendering allocations use an
-        /// internal allocator and are freed before returning; only a write to
-        /// stdout is ignored, matching the parse intercept.
+        /// command chain activated in `view`. Accepts a `View` from any level
+        /// of the tree, like `command`: the text merges the scopes from this
+        /// namespace's level down to that view's level, then the descendants
+        /// still active in it. Calling it on the root namespace with a
+        /// sub-view therefore reproduces the intercept's full merged help.
+        /// Rendering allocations use an internal allocator and are freed
+        /// before returning; only a write to stdout is ignored, matching the
+        /// parse intercept.
         ///
         /// ```
-        /// const cli = try CLI.parse(arena.allocator(), environ, args, &diag);
-        /// try CLI.usage(cli);
+        /// const cli = try CLI.parse(allocator, environ, args, &diag);
+        /// if (CLI.command(cli)) |cmd| switch (cmd) {
+        ///     .config => |c| try CLI.usage(c),
+        ///     else => try CLI.usage(cli),
+        /// }
         /// ```
-        pub fn usage(v: View) std.mem.Allocator.Error!void {
+        pub fn usage(view: anytype) std.mem.Allocator.Error!void {
             const allocator = std.heap.page_allocator;
-            const text = try contextHelpText(@This(), allocator, &v);
+            const text = try contextHelpText(@This(), allocator, view);
             defer allocator.free(text);
             var stdout_buffer: [0x1000]u8 = undefined;
             const stdout_file = std.Io.File.stdout();
@@ -6394,10 +6432,60 @@ test "M14: merged help frees everything when an allocation fails" {
 }
 
 test "M14: generated namespace exposes usage" {
-    // Not invoked: writing to stdout in a test can hang the runner. Only the
-    // declaration is checked here; `zig build run` exercises the printing.
+    // The rendering is asserted through `contextHelpText` (what `usage`
+    // prints); here only the declaration and its generic shape are checked.
     try std.testing.expect(@hasDecl(M14, "usage"));
-    comptime try std.testing.expect(@TypeOf(M14.usage) == fn (M14.View) std.mem.Allocator.Error!void);
+    comptime {
+        if (@TypeOf(M14.usage) != fn (anytype) std.mem.Allocator.Error!void)
+            @compileError("M14: usage must accept a View of any level");
+    }
+}
+
+test "M14: usage of a sub-view merges the same scopes as the root view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+
+    const vbuild = try m14Parse(&arena, &.{ "--config", "c", "--host", "h", "svc", "--token", "t", "build", "x" }, &diag);
+    const build = vbuild._svc.?._build.?;
+    const from_sub = try contextHelpText(M14, arena.allocator(), &build);
+    const from_root = try contextHelpText(M14, arena.allocator(), &vbuild);
+    try std.testing.expectEqualStrings(M14BuildGolden, from_sub);
+    try std.testing.expectEqualStrings(from_root, from_sub);
+
+    // A mid-level sub-view stops at its own level's scope.
+    const vsvc = try m14Parse(&arena, &.{ "--config", "c", "--host", "h", "svc", "--token", "t" }, &diag);
+    const svc = vsvc._svc.?;
+    const mid = try contextHelpText(M14, arena.allocator(), &svc);
+    try std.testing.expectEqualStrings(M14SvcGolden, mid);
+}
+
+test "M14: usage of a commandless view keeps its own scope" {
+    const C = generate(App{ .name = "leaf", .help = "Leaf." }, .{
+        .path = Argument([]const u8){ .help = "Path." },
+    });
+    comptime {
+        if (@TypeOf(C.usage) != fn (anytype) std.mem.Allocator.Error!void)
+            @compileError("M14: usage must be generic on a commandless level");
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{"p"}, &diag);
+    const ctx = try contextHelpText(C, arena.allocator(), &v);
+    const plain = try C.helpText(arena.allocator());
+    try std.testing.expectEqualStrings(plain, ctx);
+}
+
+test "M14: usage on a foreign view is a compile error" {
+    if (false) {
+        // Enabling this must fail to compile: 'dap.usage: argument is not a
+        // command View of 'm14''. Unlike `command`, a leaf view of this tree
+        // is accepted: it has its own scope even with no subcommands.
+        const Other = generate(App{ .name = "other", .help = "" }, .{});
+        const other: Other.View = undefined;
+        _ = M14.usage(other);
+    }
 }
 
 test "M14: duplicate long flag across levels is a compile error" {

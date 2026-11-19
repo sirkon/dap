@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (207 tests, the milestone-tagged M1–M18
+`zig test src/dap.zig` both pass (210 tests, the milestone-tagged M1–M18
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
@@ -221,6 +221,12 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   reads `app svc build`), dedupes the repeated injected builtin via
   `dedupeBuiltinHelp`, and renders once. Root-scope help is byte-identical to
   the pre-merge path; failure help (`printFailureExit`) stays root-scoped.
+  `usage(view)` prints that same text and is generic over the view type, like
+  `command`: `usageChain` resolves which level of the tree owns the `View` and
+  returns the namespace chain from the current namespace down to it, so
+  `CLI.usage(cli)` and `CLI.usage(sub)` produce the same merged help when
+  called on the root namespace (a call inside a subcommand branch can pass the
+  sub-view directly).
 - Typo suggestions ride on `Diag`. When a flag token matches no declaration
   (`consumeLongFlag`/`consumeShortFlag` fall-through) or a bare token overflows
   a level's argument slots (`assignPositional`), the failure site calls
