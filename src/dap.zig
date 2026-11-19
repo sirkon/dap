@@ -437,6 +437,27 @@ pub const CommandMeta = struct {
 ///     // root level execution
 /// }
 /// ```
+///
+/// The same accessor accepts a `View` from any level of the tree, so dispatch
+/// nests; each level's union carries its own tags:
+///
+/// ```
+/// if (CLI.command(cli)) |cmd| switch (cmd) {
+///     .body => |b| {
+///         if (CLI.command(b)) |subcmd| switch (subcmd) {
+///             .left => |l| runLeft(l),
+///             .right => |r| runRight(r),
+///         } else {
+///             // `body` with no subcommand token
+///         }
+///     },
+/// } else {
+///     // root level execution
+/// }
+/// ```
+///
+/// A `View` whose level declares no subcommands (a leaf) is a compile error,
+/// as is a value that is not a `View` of this tree.
 pub fn Command(comptime meta: CommandMeta, comptime def: anytype) type {
     return struct {
         pub const dap_kind: Kind = .command;
@@ -1463,6 +1484,26 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// if (CLI.command(cli)) |cmd| switch (cmd) {
 ///     .start => |s| try serve(s.name),
 ///     .stop => try shutdown(),
+/// } else {
+///     // root level execution
+/// }
+/// ```
+///
+///   The accessor is generic over the `View`: a sub-view from any level of
+///   the tree resolves to that level's payload union, so dispatch nests. A
+///   leaf (a level declaring no subcommands) and a foreign value are compile
+///   errors.
+///
+/// ```
+/// if (CLI.command(cli)) |cmd| switch (cmd) {
+///     .body => |b| {
+///         if (CLI.command(b)) |subcmd| switch (subcmd) {
+///             .left => |l| runLeft(l),
+///             .right => |r| runRight(r),
+///         } else {
+///             // `body` with no subcommand token
+///         }
+///     },
 /// } else {
 ///     // root level execution
 /// }
@@ -2630,12 +2671,38 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
         pub const CommandPayload = CommandPayloadOf(app, cmd_entries);
 
+        /// Every command node of this tree, this level first, in declaration
+        /// pre-order. A `View` type identifies the level it was parsed from.
+        const Nodes: []const type = blk: {
+            const nodes = commandNodes(@This());
+            checkCommandNodes(nodes);
+            break :blk nodes;
+        };
+
+        /// Resolve a `View` type back to the command level it belongs to. A
+        /// leaf (no further commands) and a foreign view are compile errors,
+        /// matching how a commandless level has no `command` member at all.
+        fn NodeOf(comptime V: type) type {
+            inline for (Nodes) |NS| {
+                if (NS.View == V) {
+                    if (NS.commands.len == 0) {
+                        @compileError("dap.command: '" ++ NS.app_meta.name ++
+                            "' declares no subcommands");
+                    }
+                    return NS;
+                }
+            }
+            @compileError("dap.command: argument is not a command View of '" ++ app.name ++ "'");
+        }
+
         /// D9/D10: wrap the active subcommand's View into the optional
-        /// tagged union of this level's commands; `null` when no command
-        /// field was activated.
-        pub fn command(view: View) ?CommandPayload {
-            inline for (cmd_entries) |c| {
-                if (@field(view, c.view_field)) |sub| return @unionInit(CommandPayload, c.field, sub);
+        /// tagged union of its level; `null` when no command field was
+        /// activated. Accepts a `View` from any level of this tree, so
+        /// dispatch nests: `CLI.command(body)`, `CLI.command(leaf)`, ...
+        pub fn command(view: anytype) ?NodeOf(@TypeOf(view)).CommandPayload {
+            const NS = NodeOf(@TypeOf(view));
+            inline for (NS.commands) |c| {
+                if (@field(view, c.view_field)) |sub| return @unionInit(NS.CommandPayload, c.field, sub);
             }
             return null;
         }
@@ -2724,6 +2791,42 @@ fn CommandPayloadOf(comptime app: App, comptime cmd_entries: []const CommandEntr
         break :blk &a;
     });
     return @Union(.auto, Tag, &names, &types, &attrs);
+}
+
+/// `NS` followed by every command node below it, depth-first in declaration
+/// order. Child namespaces are rebuilt with the same `Sub(c.Cmd,
+/// subApp(...))` expression `View` and `CommandPayload` use, so the types are
+/// identical: Zig caches a generic instantiation per comptime argument tuple.
+/// A level is identified by its `View` type, so every node must own a distinct
+/// one; unique full command paths guarantee it, and the guard below enforces
+/// it.
+fn commandNodes(comptime NS: type) []const type {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var nodes: []const type = &[_]type{NS};
+        for (NS.commands) |c| {
+            nodes = nodes ++ commandNodes(Sub(c.Cmd, subApp(NS.app_meta, c)));
+        }
+        return nodes;
+    }
+}
+
+/// Defensive guard for the invariant dispatch depends on: two levels sharing
+/// a `View` type would make a `View` an ambiguous level identifier, silently
+/// dispatching the wrong payload. Provably dead today (unique full paths give
+/// unique `generate` instantiations), kept to catch a future regression with a
+/// clear message instead of a wrong branch.
+fn checkCommandNodes(comptime nodes: []const type) void {
+    comptime {
+        for (nodes, 0..) |a, i| {
+            for (nodes[i + 1 ..]) |b| {
+                if (a.View == b.View) {
+                    @compileError("dap.command: levels '" ++ a.app_meta.name ++ "' and '" ++
+                        b.app_meta.name ++ "' share a View type; subcommand dispatch would be ambiguous");
+                }
+            }
+        }
+    }
 }
 
 /// Normalized, comptime-only description of a single flag or argument.
@@ -6809,4 +6912,142 @@ test "M17: nested command deinit recurses" {
     try std.testing.expectEqualStrings("/etc/x", v.config);
     try std.testing.expectEqualStrings("hello", v._svc.?._build.?.target);
     M17Cmd.deinit(&v, std.testing.allocator);
+}
+
+// ---------------------------------------------------------------------------
+// M18: switch-shaped dispatch at every level of the command tree.
+// ---------------------------------------------------------------------------
+
+const M18Def = .{
+    .body = Command(.{ .help = "Body." }, .{
+        .left = Command(.{ .help = "Left." }, .{
+            .x = Flag(u8){ .long = "x" },
+        }),
+        .right = Command(.{ .help = "Right." }, .{
+            .y = Argument([]const u8){},
+        }),
+    }),
+};
+const M18 = generate(App{ .name = "m18", .help = "m18" }, M18Def);
+
+const M18DeepDef = .{
+    .body = Command(.{ .help = "Body." }, .{
+        .left = Command(.{ .help = "Left." }, .{
+            .go = Command(.{ .help = "Go." }, .{
+                .n = Argument(u8){},
+            }),
+        }),
+    }),
+};
+const M18Deep = generate(App{ .name = "m18-deep", .help = "m18 deep" }, M18DeepDef);
+
+test "M18: dispatch through two levels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try M18.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "body", "left", "--x", "3" }, &diag);
+    switch (M18.command(v) orelse return error.TestUnexpectedResult) {
+        .body => |b| switch (M18.command(b) orelse return error.TestUnexpectedResult) {
+            .left => |l| try std.testing.expectEqual(@as(u8, 3), l.x),
+            .right => return error.TestUnexpectedResult,
+        },
+    }
+}
+
+test "M18: intermediate view with no active child dispatches to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try M18.parseInner(arena.allocator(), std.process.Environ.empty, &.{"body"}, &diag);
+    const b = switch (M18.command(v).?) {
+        .body => |body| body,
+    };
+    try std.testing.expect(M18.command(b) == null);
+}
+
+test "M18: three levels dispatch through each accessor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try M18Deep.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "body", "left", "go", "7" }, &diag);
+    const b = switch (M18Deep.command(v).?) {
+        .body => |body| body,
+    };
+    const l = switch (M18Deep.command(b).?) {
+        .left => |left| left,
+    };
+    switch (M18Deep.command(l).?) {
+        .go => |g| try std.testing.expectEqual(@as(u8, 7), g.n),
+    }
+}
+
+test "M18: a mid-level view dispatches from the root accessor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const a = try m7Parse(&arena, &.{ "--needed", "v", "nested", "deep", "5" }, &diag);
+    switch (M7.command(a._nested.?).?) {
+        .deep => |d| try std.testing.expectEqual(@as(u8, 5), d.n),
+    }
+}
+
+test "M18: root flags after a deep handoff still land on the root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const v = try m7Parse(&arena, &.{ "--needed", "v", "nested", "--verbose", "deep", "5" }, &diag);
+    try std.testing.expect(v.verbose);
+    const n = switch (M7.command(v).?) {
+        .nested => |nested| nested,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (M7.command(n).?) {
+        .deep => |d| try std.testing.expectEqual(@as(u8, 5), d.n),
+    }
+}
+
+test "M18: dispatch does not disturb deinit" {
+    var diag: Diag = .{};
+    var v = try M18.parseInner(std.testing.allocator, std.process.Environ.empty, &.{ "body", "right", "hello" }, &diag);
+    const b = switch (M18.command(v).?) {
+        .body => |body| body,
+    };
+    switch (M18.command(b).?) {
+        .right => |r| try std.testing.expectEqualStrings("hello", r.y),
+        .left => return error.TestUnexpectedResult,
+    }
+    M18.deinit(&v, std.testing.allocator);
+}
+
+test "M18: registry covers the tree and View types are unique" {
+    comptime {
+        const nodes = commandNodes(M18);
+        if (nodes.len != 4) @compileError("M18: unexpected node count");
+        const want = [_]String{ "m18", "m18 body", "m18 body left", "m18 body right" };
+        for (nodes, want) |n, name| {
+            if (!std.mem.eql(u8, n.app_meta.name, name))
+                @compileError("M18: unexpected node path '" ++ n.app_meta.name ++ "'");
+        }
+        checkCommandNodes(nodes);
+    }
+}
+
+test "M18: dispatch into a leaf is a compile error" {
+    if (false) {
+        // enabling this must fail to compile: '"m18 body left" declares no
+        // subcommands'
+        // var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        // defer arena.deinit();
+        // var diag: Diag = .{};
+        // const v = try M18.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "body", "left", "--x", "3" }, &diag);
+        // _ = M18.command(v._body.?._left.?);
+    }
+}
+
+test "M18: dispatch on a non-view is a compile error" {
+    if (false) {
+        // enabling this must fail to compile: 'argument is not a command View
+        // of 'm18''
+        // _ = M18.command(0);
+    }
 }

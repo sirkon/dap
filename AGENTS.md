@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (195 tests, the milestone-tagged M1–M17
+`zig test src/dap.zig` both pass (204 tests, the milestone-tagged M1–M18
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
@@ -54,7 +54,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `helpRequested`,
   `validateAlt`, `resolveAbsent`, the `check*` validators plus
   `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
-  `Sub`/`subApp`/`CommandPayloadOf`), then the test blocks.
+  `Sub`/`subApp`/`CommandPayloadOf`/`commandNodes`/`checkCommandNodes`), then
+  the test blocks.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`.
 
 ## Conventions
@@ -163,17 +164,27 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   `commands`, `View`, `parse`, `helpData`, `helpText` (plus non-pub
   `parseInner`/`parseInnerHelp`, preserving same-file visibility and the parent
   handoff), and the `pub const CommandPayload` / `pub fn command(view)
-  ?CommandPayload` pair. `CommandPayloadOf(app, cmd_entries)` (beside
+  anytype` pair. `CommandPayloadOf(app, cmd_entries)` (beside
   `Sub`/`subApp`) synthesizes the union with the same `@Enum`/`@Union(.auto,
   ...)` machinery `Alt` uses: one member per `CommandEntry`, tag = `c.field`
   (plain declaration field name, neither the wire name nor the `_`-prefixed
   `View` field), payload = `Sub(c.Cmd, subApp(app, c)).View`, the exact
   expression the `View` field type uses, so identities match bit-for-bit.
-  `command` is infallible and allocation-free: it `inline for`s the command
-  fields (reading `c.view_field`), and `@unionInit`s the first non-null one
-  (the single handoff guarantees at most one is set), returning `null` when
-  none was activated. Zero commands never synthesize the union (a zero-field
-  `@Union` is illegal); one command uses `std.math.IntFittingRange(0, 0)`.
+  The accessor is generic over the `View` so dispatch nests at every level:
+  the shell's `Nodes` decl is `commandNodes(@This())`, a pre-order registry of
+  the level and every descendant namespace rebuilt with the same
+  `Sub(c.Cmd, subApp(...))` expression (so `View` types identify levels), and
+  `NodeOf(V)` resolves a `View` type back to its node (`@compileError` for a
+  leaf level or a foreign type). `checkCommandNodes` guards the invariant
+  pairwise: two nodes must never share a `View` type. `command` is infallible
+  and allocation-free: it `inline for`s the resolved level's command fields
+  (reading `c.view_field`), and `@unionInit`s the first non-null one into that
+  level's `CommandPayload` (the single handoff guarantees at most one is set),
+  returning `null` when none was activated. Zero commands never synthesize the
+  union (a zero-field `@Union` is illegal); one command uses
+  `std.math.IntFittingRange(0, 0)`. The registry is only analysed when
+  `command` is instantiated, and child `Nodes` decls stay lazy, so no recursion
+  loop forms.
 - A `-h, --help` bool flag is injected as `.builtin_help` at index 0 of every
   declaration before normalization (`BuiltinHelp` / `withBuiltinHelp`), so it
   appears first in `View` and in the flags section. It carries

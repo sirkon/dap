@@ -75,6 +75,9 @@ std.debug.print("{} {}\n", .{ cli.login, cli.path });
   plain declaration field names (no `_`): `if (CLI.command(cli)) |cmd| switch
   (cmd) { ... } else { ... }`. It is present only when the level declares
   subcommands; `--` disables handoff so command-like literals can be passed.
+  The same accessor accepts a sub-`View` from any level, so dispatch nests:
+  `if (CLI.command(body)) |sub| switch (sub) { ... } else { ... }`. A leaf
+  view (a level with no subcommands) is a compile error.
   A flag token after the command that matches no sub flag is retried against
   every ancestor level, so parent flags (advertised in deep help, globally
   unique) resolve wherever they are typed.

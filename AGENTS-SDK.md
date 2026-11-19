@@ -293,6 +293,29 @@ and cannot fail. A declaration with no commands exposes neither `command` nor
 `CommandPayload` (a reference is a compile error), so the accessor is always
 safe to call where a level declares subcommands and simply absent otherwise.
 
+The accessor is generic over the `View`: pass a sub-`View` from any level of
+the tree and it resolves that level's union, so dispatch nests as deep as the
+commands go. The registry of levels is comptime-only; a `View` type is the
+level's identity.
+
+```zig
+if (CLI.command(cli)) |cmd| switch (cmd) {
+    .body => |b| {
+        if (CLI.command(b)) |subcmd| switch (subcmd) {
+            .left => |l| runLeft(l),
+            .right => |r| runRight(r),
+        } else {
+            // `body` with no subcommand token
+        }
+    },
+} else {
+    // root level execution
+}
+```
+
+A leaf `View` (a level declaring no subcommands) is a compile error, as is a
+value that is not a `View` of this command tree.
+
 Flag long names and short aliases must be **globally unique across the entire
 command tree**, not merely within a level: whenever help is requested, flags
 from every ancestor level merge into the active scope (see §10.5), so a name
@@ -448,7 +471,7 @@ Generated namespace members:
 | `specs`                         | Normalized comptime spec table.                          |
 | `commands`                      | The detected command entries (slice; empty when none).   |
 | `CommandPayload`                | Tagged union of command fields; **only when subcommands exist**. |
-| `command(view) ?CommandPayload` | Wrap the active subcommand's `View`, else `null`; **only when subcommands exist**. |
+| `command(view) ?CommandPayload` | Wrap the active subcommand's `View` of **any level** into that level's union, else `null`; **only when subcommands exist**. |
 | `deinit(&view, alloc)`           | Release every owned field of a `View` from a successful parse (see §12). |
 
 `deinit` is a **namespace-level function**, not a method on `View`. `View` is a
@@ -866,7 +889,8 @@ These mistakes are compile errors, not runtime errors:
   disables it.
 - `CLI.command(cli) ?CommandPayload` switches on the active subcommand (tags
   are the plain declaration field names; the `View` stores it `_`-prefixed);
-  present only when the level declares commands.
+  present only when the level declares commands. The accessor accepts a
+  `View` of any level, so dispatch nests; a leaf view is a compile error.
 - `Alt`: one active branch max; `ConflictingAlt` otherwise; all members of the
   active branch are required.
 - Optional flags yield `?T`; defaults forbidden; validation skipped when null.
