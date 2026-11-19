@@ -157,8 +157,12 @@ Consequences:
   namespace down. The root namespace is the canonical form because it can
   reproduce the parse intercept's full ancestor chain.
 
-On a parse failure (not a help request) help stays root-scoped, because the
-command path is not reconstructed from `Diag`.
+On a parse failure (not a help request) the page is that of the deepest
+command entered. `parseInnerHelp` writes its partially built View to an
+out-pointer on the error path, and the handoff stores a child's partial View
+in the parent's command field before rethrowing, so the failure page walks the
+same command chain the help intercept does. A failure before any handoff
+renders the unchanged root page.
 
 ## Surfaces left unchanged
 
@@ -168,4 +172,5 @@ command path is not reconstructed from `Diag`.
 - The wire scan, ancestor flag retry, required/validation phases, typo
   suggestions, help data collection, and `deinitValue` are untouched.
 - `parse` keeps its terminating contract: help prints to stdout and exits `0`;
-  failure prints diagnostics plus root-scoped help to stderr and exits `1`.
+  failure prints diagnostics plus the deepest entered command's help to stderr
+  and exits `1`.

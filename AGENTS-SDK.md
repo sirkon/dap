@@ -777,8 +777,10 @@ per active level (root first), and folds them with `absorbScope`:
 
 Rendering then reuses the same `renderCompact` (or `.custom` renderer)
 unchanged. Root-scope help is byte-identical to a non-merged rendering. On a
-*parse failure* (not a help request) the help stays root-scoped, since the
-command path is not reconstructed from `Diag`.
+*parse failure* (not a help request) the help page is that of the deepest
+command entered: every level entered before the error stays linked from its
+parent's View, so the same merge reconstructs the command path; a failure
+before any handoff renders the unchanged root page.
 
 `CLI.usage(view)` prints exactly this merged text. It is generic over the
 `View` type, like `command`: a sub-view from any level is accepted, the

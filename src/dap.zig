@@ -1465,13 +1465,12 @@ fn appendActiveScopes(
     }
 }
 
-/// The context-sensitive help of a parsed view: build every scope on the path
-/// from `NS` down to the level of `v` (plus the descendants still active in
-/// `v`), fold them into the deepest scope, render once with the app's
-/// configured renderer. `v` may be a `View` from any level, and may be passed
-/// by value or by pointer. Nothing public changes shape; this is called from
-/// `usage` and from `parse`'s help intercept.
-fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) std.mem.Allocator.Error!String {
+/// The context-sensitive description of a parsed view: build every scope on
+/// the path from `NS` down to the level of `v` (plus the descendants still
+/// active in `v`) and fold them into the deepest scope. `v` may be a `View`
+/// from any level, and may be passed by value or by pointer. The caller owns
+/// the returned [`HelpData`] and releases it with `deinit`.
+fn contextHelpData(comptime NS: type, allocator: std.mem.Allocator, v: anytype) std.mem.Allocator.Error!HelpData {
     const chain = comptime (usageChain(NS, viewValueType(@TypeOf(v))) orelse
         @compileError("dap.usage: argument is not a command View of '" ++ NS.app_meta.name ++ "'"));
     var scopes: std.ArrayList(HelpData) = .empty;
@@ -1490,10 +1489,20 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
     try appendActiveScopes(chain[chain.len - 1], allocator, &scopes, v);
 
     var merged: HelpData = emptyHelpData();
-    defer merged.deinit(allocator);
+    errdefer merged.deinit(allocator);
     for (scopes.items) |*d| try absorbScope(allocator, &merged, d);
     // The ungrouped bucket is always present and always index 0.
     try dedupeBuiltinHelp(allocator, &merged.flag_groups[0]);
+    return merged;
+}
+
+/// Render [`contextHelpData`] once with the app's configured renderer. Called
+/// from `usage`, from `parse`'s help intercept, and from the failure path.
+fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) std.mem.Allocator.Error!String {
+    const chain = comptime (usageChain(NS, viewValueType(@TypeOf(v))) orelse
+        @compileError("dap.usage: argument is not a command View of '" ++ NS.app_meta.name ++ "'"));
+    var merged = try contextHelpData(NS, allocator, v);
+    defer merged.deinit(allocator);
     return renderHelpWithStyle(chain[0].app_meta.help_renderer.style, allocator, &merged);
 }
 
@@ -1570,7 +1579,7 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 /// declaration tree; a collision is a compile error. `Group`/`Alt` groups
 /// sharing a name across levels merge into one visual block. Any syntax,
 /// decode, required or validation failure prints the diagnostics plus the
-/// (root-scoped) help text to stderr and exits with code `1`.
+/// help text of the deepest command entered to stderr and exits with code `1`.
 ///
 /// Every `parse` — the root and each subcommand alike — treats `args` as pure
 /// payload: iteration starts at index `0` and nothing is skipped. Pass the
@@ -2374,12 +2383,17 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         }
 
         /// Print the parse diagnostics and the help text to stderr, then exit with
-        /// code 1. The compact renderer leads its view with the diagnostics
-        /// (highlighted with the error token); a custom renderer, or a render
-        /// failure, falls back to plain diagnostic lines so they are never
-        /// lost. Write errors are ignored: there is no sensible fallback once
-        /// stderr is gone, and `std.process.exit` must still run.
-        fn printFailureExit(allocator: std.mem.Allocator, diag: ?*const Diag) noreturn {
+        /// code 1. The help is the context-sensitive page of `view`, the
+        /// partially parsed View: on a failed sub-parse every level that was
+        /// entered stays linked from its parent, so the merged page describes
+        /// the deepest active command (its usage header reconstructs the
+        /// command path), not the root. The compact renderer leads its view
+        /// with the diagnostics (highlighted with the error token); a custom
+        /// renderer, or a render failure, falls back to plain diagnostic lines
+        /// so they are never lost. Write errors are ignored: there is no
+        /// sensible fallback once stderr is gone, and `std.process.exit` must
+        /// still run.
+        fn printFailureExit(allocator: std.mem.Allocator, diag: ?*const Diag, view: anytype) noreturn {
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
             const error_text: ?String = blk: {
@@ -2397,7 +2411,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             const standalone = !compact or error_text == null;
             if (standalone) printDiagnosticsStandalone(diag);
 
-            if (helpTextWithStyle(allocator, if (compact) error_text else null)) |text| {
+            if (failureHelpText(allocator, view, if (compact) error_text else null)) |text| {
                 defer allocator.free(text);
                 std.debug.print("{s}\n", .{text});
             } else |_| {
@@ -2405,6 +2419,16 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                 if (compact) if (error_text) |e| std.debug.print("{s}\n", .{e});
             }
             std.process.exit(1);
+        }
+
+        /// Render the context-sensitive help of the partially parsed `view`,
+        /// most specific command first, with `error_text` (when set) leading
+        /// the compact view.
+        fn failureHelpText(allocator: std.mem.Allocator, view: anytype, error_text: ?String) std.mem.Allocator.Error!String {
+            var data = try contextHelpData(@This(), allocator, view);
+            defer data.deinit(allocator);
+            data.error_text = error_text;
+            return renderHelpWithStyle(app.help_renderer.style, allocator, &data);
         }
 
         /// Render the failure diagnostic block into `buf` as one plain-text
@@ -2479,13 +2503,17 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         }
 
         pub fn parse(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!View {
-            const result = parseInner(allocator, environ, args, diag) catch {
-                printFailureExit(allocator, diag);
+            // `failed` receives the partially built View on the error path, so
+            // the failure page can describe the deepest command that was
+            // actually entered instead of the root.
+            var failed: View = undefined;
+            const result = parseInnerHelp(allocator, environ, args, diag, false, null, &failed) catch {
+                printFailureExit(allocator, diag, &failed);
             };
 
             // HELP REQUESTED INTERCEPT: a requested help flag — at this level or
             // anywhere in the active command chain — bypassed every required
-            // check and validation inside `parseInner`. Render the merged,
+            // check and validation inside `parseInnerHelp`. Render the merged,
             // context-sensitive help with the app's renderer, print it to
             // stdout, and exit cleanly.
             if (helpRequested(@This(), &result)) {
@@ -2505,11 +2533,12 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
         /// The parse pipeline without the builtin help flow: scan the wire,
         /// intercept a requested help flag, resolve absent fields, validate.
-        /// Errors propagate to the caller together with a filled `diag`;
-        /// `parse` turns them into stderr diagnostics plus help text and a
-        /// nonzero exit.
+        /// Errors propagate to the caller together with a filled `diag`; the
+        /// partial View of the failure path is discarded here, because this
+        /// entry is for callers that handle errors themselves.
         fn parseInner(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!View {
-            return parseInnerHelp(allocator, environ, args, diag, false, null);
+            var failed: View = undefined;
+            return parseInnerHelp(allocator, environ, args, diag, false, null, &failed);
         }
 
         /// The parse pipeline. `ancestor_help` records that a help flag was seen on
@@ -2520,10 +2549,16 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// flag token that matches no local spec is resolved against them,
         /// mirroring the merged help and the global flag-name uniqueness rule,
         /// so `app sub --root-flag` assigns into the ancestor's `View`.
-        fn parseInnerHelp(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag, ancestor_help: bool, up: ?*const Ancestor) ParseError!View {
+        /// `out` is written on the error path with the partially built View, so
+        /// every level that was entered remains reachable from its parent's
+        /// command field and the failure page can merge the whole active chain.
+        fn parseInnerHelp(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag, ancestor_help: bool, up: ?*const Ancestor, out: *View) ParseError!View {
             if (diag) |d| d.* = .{};
 
             var v: View = undefined;
+            // Fires on every error return below: Phase 0 has already run, so
+            // the View is safe to walk for help before it is handed to `out`.
+            errdefer out.* = v;
             var seen: [all_specs.len]bool = @splat(false);
             var pos: usize = 0;
             var handed_off = false;
@@ -2579,7 +2614,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                                     .assign_long = ancestorFns(@This()).assignLong,
                                     .assign_short = ancestorFns(@This()).assignShort,
                                 };
-                                @field(v, c.view_field) = try S.parseInnerHelp(allocator, environ, args[i + 1 ..], diag, help_seen, &chain);
+                                var sub: S.View = undefined;
+                                @field(v, c.view_field) = S.parseInnerHelp(allocator, environ, args[i + 1 ..], diag, help_seen, &chain, &sub) catch |err| {
+                                    // Link the partially built sub-View before
+                                    // unwinding so the failure page of an
+                                    // ancestor can descend into it.
+                                    @field(v, c.view_field) = sub;
+                                    return err;
+                                };
                                 handed_off = true;
                                 matched = true;
                             }
@@ -6334,6 +6376,73 @@ test "M14: root help stays root-scoped and byte-identical" {
     const ctx = try contextHelpText(M14, arena.allocator(), &vroot);
     const root = try M14.helpText(arena.allocator());
     try std.testing.expectEqualStrings(root, ctx);
+}
+
+test "M14: a parse failure keeps the deepest entered command scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // `svc --nope` fails in the `svc` level: the partial View links the sub
+    // scope, so the failure page is the `svc` page, not the root one.
+    var diag: Diag = .{};
+    var mid: M14.View = undefined;
+    try std.testing.expectError(
+        error.UnknownFlag,
+        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &.{ "svc", "--nope" }, &diag, false, null, &mid),
+    );
+    try std.testing.expect(mid._svc != null);
+    try std.testing.expect(mid._svc.?._build == null);
+    try std.testing.expectEqualStrings(
+        M14SvcGolden,
+        try contextHelpText(M14, arena.allocator(), &mid),
+    );
+
+    // `svc build` fails one level deeper (missing <target>): the chain must
+    // reach `build` so the failure page names `m14 svc build`.
+    var deep_diag: Diag = .{};
+    var deep: M14.View = undefined;
+    try std.testing.expectError(
+        error.MissingRequired,
+        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &.{ "svc", "build" }, &deep_diag, false, null, &deep),
+    );
+    try std.testing.expect(deep._svc != null);
+    try std.testing.expect(deep._svc.?._build != null);
+    try std.testing.expectEqualStrings("target", deep_diag.field.?);
+    try std.testing.expectEqualStrings(
+        M14BuildGolden,
+        try contextHelpText(M14, arena.allocator(), &deep),
+    );
+
+    // The compact failure view leads with the diagnostics.
+    const merged = try contextHelpData(M14, arena.allocator(), &deep);
+    try std.testing.expectEqualStrings(M14BuildGolden, try merged.renderCompact(arena.allocator()));
+    var data = merged;
+    data.error_text = "error: field 'target' is invalid or missing";
+    const with_error = try data.renderCompact(arena.allocator());
+    try std.testing.expectEqualStrings(
+        "error: field 'target' is invalid or missing\n" ++ M14BuildGolden,
+        with_error,
+    );
+}
+
+test "M14: a root-level parse failure keeps the root page" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+
+    // No command token was entered, so the partial View carries no active
+    // sub scope and the failure page is the unchanged root page.
+    var partial: M14.View = undefined;
+    try std.testing.expectError(
+        error.MissingRequired,
+        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &.{}, &diag, false, null, &partial),
+    );
+    try std.testing.expect(partial._svc == null);
+    try std.testing.expect(partial._one == null);
+    try std.testing.expectEqualStrings(
+        try M14.helpText(arena.allocator()),
+        try contextHelpText(M14, arena.allocator(), &partial),
+    );
 }
 
 test "M14: usage header reconstructs the command path" {

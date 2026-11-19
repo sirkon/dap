@@ -214,13 +214,18 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   fields); `parseInnerHelp` carries an `ancestor_help` flag through the handoff
   so a help token before the commands is honoured too, and Phase 2 of every
   `parseInner` early-returns on it, bypassing all required checks and
-  validations. `contextHelpText` then builds one `HelpData` per active level
+  validations. `contextHelpData` then builds one `HelpData` per active level
   (root first) via `appendActiveScopes`, folds them with `absorbScope` (flag
   groups merge by name with move semantics, `usage_alts` append, and arg
   groups/commands/info/name come from the deepest scope so the usage header
-  reads `app svc build`), dedupes the repeated injected builtin via
-  `dedupeBuiltinHelp`, and renders once. Root-scope help is byte-identical to
-  the pre-merge path; failure help (`printFailureExit`) stays root-scoped.
+  reads `app svc build`) and dedupes the repeated injected builtin via
+  `dedupeBuiltinHelp`; `contextHelpText` renders it once. Root-scope help is
+  byte-identical to the pre-merge path. Failure help is context-sensitive too:
+  `parseInnerHelp` takes an `out: *View` and its `errdefer` copies the partial
+  View there, the handoff stores the child's partial View in the parent's
+  command field before rethrowing, so `printFailureExit` receives a root View
+  whose active command chain reaches the failing level and `failureHelpText`
+  renders that level's merged page (plus the diagnostics).
   `usage(view)` prints that same text and is generic over the view type, like
   `command`: `usageChain` resolves which level of the tree owns the `View` and
   returns the namespace chain from the current namespace down to it, so
@@ -247,10 +252,11 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
 - `HelpData.error_text` (optional) leads `renderCompact`'s view, wrapped in
   the new `HelpStyle.error_msg` category (scheme `usage.error_msg`).
   `printFailureExit` builds the diagnostic block once (`buildErrorText` from
-  `Diag.field`/`token`/`message`/`unknown`), passes it to `helpTextWithStyle`
-  for the `.compact` renderer, and otherwise prints it standalone
-  (`printDiagnosticsStandalone`); a failed render or diagnostic build falls
-  back to the standalone lines so diagnostics are never lost.
+  `Diag.field`/`token`/`message`/`unknown`), passes it to `failureHelpText`
+  (the merged failure page plus the block) for the `.compact` renderer, and
+  otherwise prints the block standalone (`printDiagnosticsStandalone`); a
+  failed render or diagnostic build falls back to the standalone lines so
+  diagnostics are never lost.
 - Ordering inside `src/dap.zig`: public data types first, then private
   help/builtin scaffolding, then the private `suggest*` family, then the public
   `generate` entry point, then private normalization/decode helpers, then tests.
