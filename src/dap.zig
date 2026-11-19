@@ -86,6 +86,12 @@ pub const App = struct {
         style: HelpRendererStyle = @unionInit(HelpRendererStyle, "compact", {}),
         highlight: HelpRendererHighlight = @unionInit(HelpRendererHighlight, "bold", {}),
     } = .{},
+
+    /// Internal: pre-order rank of this level in the command tree. `subApp`
+    /// assigns it to every command level; the generated `View` carries a
+    /// zero-sized tag field named after it, so levels with otherwise equal
+    /// layouts get distinct (non-interned) types.
+    _command_rank: usize = 0,
 };
 
 // Help text highlighting definition and ready schemes.
@@ -1466,8 +1472,10 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 ///
 /// - `pub const View` — the strongly-typed view, a struct with one field per
 ///   declaration field (in declaration order, with the injected
-///   `builtin_help: bool` first), one `?Union` per `Alt` field, and one
-///   `?View` per command field under a `_`-prefixed name (`_stop`);
+///   `builtin_help: bool` first), a zero-sized `__commandN` tag after the
+///   spec fields that keeps each level's type nominally distinct, one
+///   `?Union` per `Alt` field, and one `?View` per command field under a
+///   `_`-prefixed name (`_stop`);
 /// - `pub fn parse(allocator, environ, args, diag) ParseError!View`;
 /// - `app_meta`, `specs`, `commands` metadata;
 /// - `pub fn helpData(allocator) !HelpData` — runtime-filled description;
@@ -1492,7 +1500,13 @@ fn contextHelpText(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 ///   The accessor is generic over the `View`: a sub-view from any level of
 ///   the tree resolves to that level's payload union, so dispatch nests. A
 ///   leaf (a level declaring no subcommands) and a foreign value are compile
-///   errors.
+///   errors, and the leaf message names that leaf's own level path.
+///
+///   `View` is an `@Struct`, so Zig would otherwise intern it structurally
+///   and two levels with the same field layout would share one type. The
+///   generated tag field (`__commandN`, `N` the level's pre-order rank)
+///   makes every level's `View` nominally distinct, so a `View` value
+///   identifies exactly one level.
 ///
 /// ```
 /// if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -1948,7 +1962,7 @@ fn suggestProbe(
 pub fn generate(comptime app: App, comptime def: anytype) type {
     @setEvalBranchQuota(1_000_000);
     const merged = withBuiltinHelp(def);
-    const norm = normalize(merged);
+    const norm = normalizeRanked(merged, app._command_rank);
     const all_specs = norm.specs;
     const cmd_entries = norm.commands;
     const alts = norm.alts;
@@ -1962,6 +1976,11 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     const field_names = blk: {
         var names: []const String = &.{};
         for (all_specs) |s| names = names ++ &[_]String{s.name};
+        // Zero-sized nominal tag: its name carries the level's pre-order rank,
+        // so levels with otherwise equal layouts do not intern to one `View`
+        // type. Commands are `_`-prefixed and declaration names may not start
+        // with `_`, so `__command...` cannot collide with a real field.
+        names = names ++ &[_]String{std.fmt.comptimePrint("__command{}", .{app._command_rank})};
         for (alts) |a| names = names ++ &[_]String{a.field};
         for (cmd_entries) |c| names = names ++ &[_]String{c.view_field};
         break :blk names;
@@ -1969,6 +1988,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     const field_types = blk: {
         var ts: []const type = &.{};
         for (all_specs) |s| ts = ts ++ &[_]type{specViewType(s)};
+        ts = ts ++ &[_]type{u0};
         for (alts) |a| ts = ts ++ &[_]type{?a.AT.Union};
         for (cmd_entries) |c| ts = ts ++ &[_]type{?Sub(c.Cmd, subApp(app, c)).View};
         break :blk ts;
@@ -2673,20 +2693,18 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
         /// Every command node of this tree, this level first, in declaration
         /// pre-order. A `View` type identifies the level it was parsed from.
-        const Nodes: []const type = blk: {
-            const nodes = commandNodes(@This());
-            checkCommandNodes(nodes);
-            break :blk nodes;
-        };
+        const Nodes: []const type = commandNodes(@This());
 
         /// Resolve a `View` type back to the command level it belongs to. A
         /// leaf (no further commands) and a foreign view are compile errors,
         /// matching how a commandless level has no `command` member at all.
+        /// Every level's `View` carries a rank-named zero-sized tag field, so
+        /// the mapping is exact: no two levels share a `View` type.
         fn NodeOf(comptime V: type) type {
             inline for (Nodes) |NS| {
                 if (NS.View == V) {
                     if (NS.commands.len == 0) {
-                        @compileError("dap.command: '" ++ NS.app_meta.name ++
+                        @compileError("dap.command: a leaf View of '" ++ NS.app_meta.name ++
                             "' declares no subcommands");
                     }
                     return NS;
@@ -2762,6 +2780,7 @@ fn subApp(comptime parent: App, comptime c: CommandEntry) App {
         .help = c.Cmd.cmd_meta.help,
         .i18n = c.Cmd.cmd_meta.i18n,
         .help_renderer = parent.help_renderer,
+        ._command_rank = c.rank,
     };
 }
 
@@ -2797,9 +2816,11 @@ fn CommandPayloadOf(comptime app: App, comptime cmd_entries: []const CommandEntr
 /// order. Child namespaces are rebuilt with the same `Sub(c.Cmd,
 /// subApp(...))` expression `View` and `CommandPayload` use, so the types are
 /// identical: Zig caches a generic instantiation per comptime argument tuple.
-/// A level is identified by its `View` type, so every node must own a distinct
-/// one; unique full command paths guarantee it, and the guard below enforces
-/// it.
+///
+/// A level is identified for dispatch by its `View` type. `View` is an
+/// `@Struct`, which Zig interns structurally, but every level's `View` carries
+/// a zero-sized field named after its pre-order rank (`__commandN`), so two
+/// levels never intern to one type. `NodeOf` can therefore match exactly.
 fn commandNodes(comptime NS: type) []const type {
     comptime {
         @setEvalBranchQuota(1_000_000);
@@ -2808,24 +2829,6 @@ fn commandNodes(comptime NS: type) []const type {
             nodes = nodes ++ commandNodes(Sub(c.Cmd, subApp(NS.app_meta, c)));
         }
         return nodes;
-    }
-}
-
-/// Defensive guard for the invariant dispatch depends on: two levels sharing
-/// a `View` type would make a `View` an ambiguous level identifier, silently
-/// dispatching the wrong payload. Provably dead today (unique full paths give
-/// unique `generate` instantiations), kept to catch a future regression with a
-/// clear message instead of a wrong branch.
-fn checkCommandNodes(comptime nodes: []const type) void {
-    comptime {
-        for (nodes, 0..) |a, i| {
-            for (nodes[i + 1 ..]) |b| {
-                if (a.View == b.View) {
-                    @compileError("dap.command: levels '" ++ a.app_meta.name ++ "' and '" ++
-                        b.app_meta.name ++ "' share a View type; subcommand dispatch would be ambiguous");
-                }
-            }
-        }
     }
 }
 
@@ -2865,12 +2868,14 @@ const DefaultRepr = struct {
 /// A single command declaration found at a given level. `field` is the
 /// declaration field name (the `command` union tag); `view_field` is that
 /// name prefixed with `_`, the field the parent `View` stores the sub-view
-/// under; `name` is the wire name (`cmd_meta.name orelse field`); `Cmd` is
-/// the type returned by `Command(...)`.
+/// under; `name` is the wire name (`cmd_meta.name orelse field`); `rank` is
+/// the command node's pre-order position in the whole tree; `Cmd` is the
+/// type returned by `Command(...)`.
 const CommandEntry = struct {
     field: String,
     view_field: String,
     name: String,
+    rank: usize,
     Cmd: type,
 };
 
@@ -3632,11 +3637,38 @@ fn checkGlobalFlagNames(comptime origins: []const FlagOrigin) void {
 }
 
 fn normalize(comptime def: anytype) NormResult {
+    return normalizeRanked(def, 0);
+}
+
+/// Number of command nodes in a raw declaration subtree: one per
+/// `Command(...)` field, recursively. Mirrors what `commandNodes` would count
+/// for the generated namespaces, but without instantiating `generate`.
+fn commandSubtreeCount(comptime def: anytype) usize {
+    comptime {
+        var n: usize = 0;
+        for (fieldsOf(@TypeOf(def))) |f| {
+            if (f.type != type) continue;
+            const V = typeOfField(f);
+            if (@hasDecl(V, "dap_kind") and V.dap_kind == .command) {
+                n += 1 + commandSubtreeCount(V.cmd_def);
+            }
+        }
+        return n;
+    }
+}
+
+/// `normalize` with the level's own pre-order rank. Commands get consecutive
+/// ranks over the whole tree: the first child is `base_rank + 1`, each next
+/// sibling skips the command nodes in the preceding sibling's subtree.
+/// `generate` passes `app._command_rank`; the ranks end up in the generated
+/// `View` tag field and keep every level's `View` type distinct.
+fn normalizeRanked(comptime def: anytype, comptime base_rank: usize) NormResult {
     comptime checkNoUnderscoreFields(def);
     var specs: []const Spec = &.{};
     var commands: []const CommandEntry = &.{};
     var alts: []const AltLevel = &.{};
     var group_names: []const String = &.{};
+    var next_rank: usize = base_rank + 1;
 
     inline for (fieldsOf(@TypeOf(def))) |f| {
         if (f.type == type) {
@@ -3646,8 +3678,10 @@ fn normalize(comptime def: anytype) NormResult {
                     .field = f.name,
                     .view_field = viewCommandField(f.name),
                     .name = commandWireName(V.cmd_meta, f.name),
+                    .rank = next_rank,
                     .Cmd = V,
                 }};
+                next_rank += 1 + commandSubtreeCount(V.cmd_def);
             } else if (@hasDecl(V, "dap_kind") and V.dap_kind == .group) {
                 specs = specs ++ groupSpecs(V.group_def, V.group_name);
                 group_names = group_names ++ &[_]String{V.group_name};
@@ -4093,8 +4127,8 @@ test "M2: View field order and types" {
     const V = C.View;
     const fields = fieldsOf(V);
 
-    // 7 specs (builtin_help injected first) + 2 command fields.
-    try std.testing.expectEqual(@as(usize, 9), fields.len);
+    // 7 specs (builtin_help injected first) + the rank tag + 2 command fields.
+    try std.testing.expectEqual(@as(usize, 10), fields.len);
 
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqual(@as(type, bool), fields[0].type);
@@ -4113,14 +4147,18 @@ test "M2: View field order and types" {
     try std.testing.expectEqualStrings("host", fields[6].name);
     try std.testing.expectEqual(@as(type, []const u8), fields[6].type);
 
+    // the rank tag sits between the specs and the command fields.
+    try std.testing.expectEqualStrings("__command0", fields[7].name);
+    try std.testing.expectEqual(@as(type, u0), fields[7].type);
+
     // trailing command fields are optional sub-Views, hidden behind a `_`
     // prefix.
-    try std.testing.expectEqualStrings("_start", fields[7].name);
-    try std.testing.expect(@typeInfo(fields[7].type) == .optional);
-    try std.testing.expect(@typeInfo(@typeInfo(fields[7].type).optional.child) == .@"struct");
-    try std.testing.expectEqualStrings("_stop", fields[8].name);
+    try std.testing.expectEqualStrings("_start", fields[8].name);
     try std.testing.expect(@typeInfo(fields[8].type) == .optional);
     try std.testing.expect(@typeInfo(@typeInfo(fields[8].type).optional.child) == .@"struct");
+    try std.testing.expectEqualStrings("_stop", fields[9].name);
+    try std.testing.expect(@typeInfo(fields[9].type) == .optional);
+    try std.testing.expect(@typeInfo(@typeInfo(fields[9].type).optional.child) == .@"struct");
 }
 
 test "M2: @FieldType matches specs" {
@@ -4137,19 +4175,21 @@ test "M2: @FieldType matches specs" {
     }
 }
 
-test "M2: View without commands has only spec fields" {
+test "M2: View without commands carries spec fields and the tag" {
     const C = generate(App{ .name = "app", .help = "help" }, .{
         .a = Flag(u8){ .default = Default(u8){ .direct = 0 } },
         .b = Argument([]const u8){},
     });
     const fields = fieldsOf(C.View);
-    try std.testing.expectEqual(@as(usize, 3), fields.len);
+    try std.testing.expectEqual(@as(usize, 4), fields.len);
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqual(@as(type, bool), fields[0].type);
     try std.testing.expectEqualStrings("a", fields[1].name);
     try std.testing.expectEqual(@as(type, u8), fields[1].type);
     try std.testing.expectEqualStrings("b", fields[2].name);
     try std.testing.expectEqual(@as(type, []const u8), fields[2].type);
+    try std.testing.expectEqualStrings("__command0", fields[3].name);
+    try std.testing.expectEqual(@as(type, u0), fields[3].type);
 }
 
 test "M2: command View fields are optional sub-views" {
@@ -4158,16 +4198,18 @@ test "M2: command View fields are optional sub-views" {
     try std.testing.expectEqual(@as(usize, 2), C.commands.len);
 
     // each command field's View payload is the command's generated View; the
-    // injected builtin_help field occupies the first slot of every sub. Command
-    // fields carry a `_` prefix in the View.
+    // injected builtin_help field occupies the first slot of every sub, and
+    // the rank-named tag follows the specs. Command fields carry a `_` prefix
+    // in the View.
     const StartSub = @typeInfo(@FieldType(C.View, "_start")).optional.child;
     const start_fields = fieldsOf(StartSub);
-    try std.testing.expectEqual(@as(usize, 2), start_fields.len);
+    try std.testing.expectEqual(@as(usize, 3), start_fields.len);
     try std.testing.expectEqualStrings("builtin_help", start_fields[0].name);
     try std.testing.expectEqualStrings("name", start_fields[1].name);
+    try std.testing.expectEqualStrings("__command1", start_fields[2].name);
 
     const HaltSub = @typeInfo(@FieldType(C.View, "_stop")).optional.child;
-    try std.testing.expectEqual(@as(usize, 1), @typeInfo(HaltSub).@"struct".field_names.len);
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(HaltSub).@"struct".field_names.len);
 
     // the sub level has no commands of its own.
     const StartNs = Sub(C.commands[0].Cmd, subApp(C.app_meta, C.commands[0]));
@@ -7019,7 +7061,7 @@ test "M18: dispatch does not disturb deinit" {
     M18.deinit(&v, std.testing.allocator);
 }
 
-test "M18: registry covers the tree and View types are unique" {
+test "M18: registry covers the tree in declaration pre-order" {
     comptime {
         const nodes = commandNodes(M18);
         if (nodes.len != 4) @compileError("M18: unexpected node count");
@@ -7028,14 +7070,13 @@ test "M18: registry covers the tree and View types are unique" {
             if (!std.mem.eql(u8, n.app_meta.name, name))
                 @compileError("M18: unexpected node path '" ++ n.app_meta.name ++ "'");
         }
-        checkCommandNodes(nodes);
     }
 }
 
 test "M18: dispatch into a leaf is a compile error" {
     if (false) {
-        // enabling this must fail to compile: '"m18 body left" declares no
-        // subcommands'
+        // enabling this must fail to compile: 'a leaf View of 'm18 body left'
+        // declares no subcommands'
         // var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         // defer arena.deinit();
         // var diag: Diag = .{};
@@ -7049,5 +7090,123 @@ test "M18: dispatch on a non-view is a compile error" {
         // enabling this must fail to compile: 'argument is not a command View
         // of 'm18''
         // _ = M18.command(0);
+    }
+}
+
+// Flagless leaves and symmetrically shaped subtrees are the layouts that used
+// to intern to one `View` type: the rank-named tag field must keep every
+// level distinct while dispatch stays exact.
+
+const M18SharedDef = .{
+    .run = Command(.{ .help = "Run." }, .{}),
+    .config = Command(.{ .help = "Config." }, .{
+        .show_dev = Command(.{ .name = "show-dev", .help = "Show dev." }, .{}),
+        .validate = Command(.{ .help = "Validate." }, .{
+            .path = Argument([]const u8){},
+        }),
+    }),
+    .version = Command(.{ .help = "Version." }, .{}),
+};
+const M18Shared = generate(App{ .name = "m18-shared", .help = "m18 shared" }, M18SharedDef);
+
+test "M18: flagless leaf commands dispatch independently" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+
+    const c = try M18Shared.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "config", "show-dev" }, &diag);
+    const cfg = switch (M18Shared.command(c) orelse return error.TestUnexpectedResult) {
+        .config => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (M18Shared.command(cfg) orelse return error.TestUnexpectedResult) {
+        .show_dev => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const r = try M18Shared.parseInner(arena.allocator(), std.process.Environ.empty, &.{"run"}, &diag);
+    switch (M18Shared.command(r) orelse return error.TestUnexpectedResult) {
+        .run => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const vv = try M18Shared.parseInner(arena.allocator(), std.process.Environ.empty, &.{"version"}, &diag);
+    switch (M18Shared.command(vv) orelse return error.TestUnexpectedResult) {
+        .version => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "M18: every command level has a distinct View type" {
+    comptime {
+        const nodes = commandNodes(M18Shared);
+        if (nodes.len != 6) @compileError("M18: unexpected node count");
+        const want = [_]String{
+            "m18-shared",
+            "m18-shared run",
+            "m18-shared config",
+            "m18-shared config show-dev",
+            "m18-shared config validate",
+            "m18-shared version",
+        };
+        for (nodes, 0..) |n, i| {
+            if (!std.mem.eql(u8, n.app_meta.name, want[i]))
+                @compileError("M18: unexpected node path '" ++ n.app_meta.name ++ "'");
+            // The registry is pre-order, so a level's rank is its index.
+            const tag = std.fmt.comptimePrint("__command{}", .{i});
+            if (!@hasField(n.View, tag))
+                @compileError("M18: level '" ++ n.app_meta.name ++ "' lacks tag '" ++ tag ++ "'");
+            for (nodes[0..i]) |prev| {
+                if (prev.View == n.View)
+                    @compileError("M18: levels '" ++ prev.app_meta.name ++ "' and '" ++
+                        n.app_meta.name ++ "' share a View type");
+            }
+        }
+    }
+}
+
+const M18TwinDef = .{
+    .a = Command(.{ .help = "A." }, .{
+        .go = Command(.{ .name = "a-go", .help = "A go." }, .{ .n = Argument(u8){} }),
+    }),
+    .b = Command(.{ .help = "B." }, .{
+        .go = Command(.{ .name = "b-go", .help = "B go." }, .{ .n = Argument(u8){} }),
+    }),
+};
+const M18Twin = generate(App{ .name = "m18-twin", .help = "m18 twin" }, M18TwinDef);
+
+test "M18: twin subtrees keep distinct View types and dispatch independently" {
+    comptime {
+        const nodes = commandNodes(M18Twin);
+        if (nodes.len != 5) @compileError("M18: unexpected node count");
+        for (nodes, 0..) |n, i| {
+            for (nodes[0..i]) |prev| {
+                if (prev.View == n.View)
+                    @compileError("M18: levels '" ++ prev.app_meta.name ++ "' and '" ++
+                        n.app_meta.name ++ "' share a View type");
+            }
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+
+    const a = try M18Twin.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "a", "a-go", "3" }, &diag);
+    const av = switch (M18Twin.command(a) orelse return error.TestUnexpectedResult) {
+        .a => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (M18Twin.command(av) orelse return error.TestUnexpectedResult) {
+        .go => |g| try std.testing.expectEqual(@as(u8, 3), g.n),
+    }
+
+    const b = try M18Twin.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "b", "b-go", "9" }, &diag);
+    const bv = switch (M18Twin.command(b) orelse return error.TestUnexpectedResult) {
+        .b => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (M18Twin.command(bv) orelse return error.TestUnexpectedResult) {
+        .go => |g| try std.testing.expectEqual(@as(u8, 9), g.n),
     }
 }

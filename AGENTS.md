@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (204 tests, the milestone-tagged M1–M18
+`zig test src/dap.zig` both pass (207 tests, the milestone-tagged M1–M18
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
@@ -50,11 +50,12 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
 - Then the public `generate` entry point (its namespace body named `Base`, plus
   the conditional forwarding shell that adds `CommandPayload`/`command` when
   commands exist), then the private normalization/decode helpers (`Spec`,
-  `Defaults`/`DefaultRepr`, `normalize`, `specFromField`,
+  `Defaults`/`DefaultRepr`, `normalize`/`normalizeRanked`,
+  `commandSubtreeCount`, `specFromField`,
   `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `helpRequested`,
   `validateAlt`, `resolveAbsent`, the `check*` validators plus
   `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
-  `Sub`/`subApp`/`CommandPayloadOf`/`commandNodes`/`checkCommandNodes`), then
+  `Sub`/`subApp`/`CommandPayloadOf`/`commandNodes`), then
   the test blocks.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`.
 
@@ -174,10 +175,18 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build run -- --help`.
   the shell's `Nodes` decl is `commandNodes(@This())`, a pre-order registry of
   the level and every descendant namespace rebuilt with the same
   `Sub(c.Cmd, subApp(...))` expression (so `View` types identify levels), and
-  `NodeOf(V)` resolves a `View` type back to its node (`@compileError` for a
-  leaf level or a foreign type). `checkCommandNodes` guards the invariant
-  pairwise: two nodes must never share a `View` type. `command` is infallible
-  and allocation-free: it `inline for`s the resolved level's command fields
+  `NodeOf(V)` resolves a `View` type back to its node, naming the matched
+  level's own path when it is a leaf and reporting a foreign value otherwise.
+  Because `View` is an `@Struct` (Zig interns those structurally), every
+  generated `View` carries a zero-sized tag field named `__command<rank>` after
+  the spec fields and before the `Alt`/command fields. `rank` is the level's
+  pre-order position in the command tree: `App._command_rank`, assigned by
+  `subApp` from `CommandEntry.rank`, which `normalizeRanked` computes as
+  `base + 1 +` the command nodes in preceding sibling subtrees
+  (`commandSubtreeCount`). Every level therefore has a distinct `View` type and
+  `NodeOf` matches exactly. The double `_` cannot collide: declaration names,
+  and hence command `View` fields, must not start with `_`. `command`
+  is infallible and allocation-free: it `inline for`s the resolved level's command fields
   (reading `c.view_field`), and `@unionInit`s the first non-null one into that
   level's `CommandPayload` (the single handoff guarantees at most one is set),
   returning `null` when none was activated. Zero commands never synthesize the

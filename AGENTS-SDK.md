@@ -110,9 +110,10 @@ The declaration is an **anonymous struct literal**. Each field is one of:
 | `dap.Command(meta, def)` | command  | `?View` under a `_`-prefixed name (`_cmd`) |
 
 Order matters: `View` fields appear in declaration order, with the injected
-`builtin_help: bool` first (§6), then the `Alt` unions and the per-command
-sub-`View`s. Declaration field names must not start with `_`; that prefix is
-reserved for the command `View` fields.
+`builtin_help: bool` first (§6), then a zero-sized `__command<rank>` tag, then
+the `Alt` unions and the per-command sub-`View`s. Declaration field names must
+not start with `_`; that prefix is reserved for the command `View` fields, and
+the double-underscore tag name cannot collide with either.
 
 ### 3.1 Flag names
 
@@ -295,8 +296,12 @@ safe to call where a level declares subcommands and simply absent otherwise.
 
 The accessor is generic over the `View`: pass a sub-`View` from any level of
 the tree and it resolves that level's union, so dispatch nests as deep as the
-commands go. The registry of levels is comptime-only; a `View` type is the
-level's identity.
+commands go. The registry of levels is comptime-only, keyed by `View` type.
+`View` is an `@Struct` and Zig interns those structurally, but every generated
+`View` carries a zero-sized tag field named `__command<rank>` (its pre-order
+rank in the command tree) after the spec fields, so each level's type is
+nominally distinct and a `View` value identifies exactly one level. The tag
+never affects parsing, `deinit`, or help.
 
 ```zig
 if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -434,6 +439,9 @@ degenerate: it yields a type with `decode`/`encode`/`deinit` only (no `view`,
 
 - `builtin_help: bool` first (the injected `-h, --help`, §6);
 - one field per spec, in declaration order;
+- a zero-sized `__command<rank>` tag after the specs, where `rank` is the
+  level's pre-order position in the command tree. It only makes each level's
+  `View` nominally distinct; ignore it;
 - one `?Union` field per `Alt` and one `?View` field per command, after the
   specs. A command's `View` field carries a `_` prefix (`_stop`); the plain
   name is the tag of the `command` union (§3.7). Declaration field names must
