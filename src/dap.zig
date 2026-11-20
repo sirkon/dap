@@ -2316,15 +2316,16 @@ fn completionFamily(comptime spelling: String) CompletionEntryFamily {
     return .normal;
 }
 
-/// Sort key: entries with help first, then the family partition (normal,
-/// version, help), then byte-wise spelling order.
+/// Sort key: the family partition (normal, version, help) always wins, so
+/// `help` stays last; inside a family, entries with help come before entries
+/// with empty help; then byte-wise spelling order.
 fn completionEntryLess(comptime a: CompletionEntry, comptime b: CompletionEntry) bool {
-    const a_help = a.help.len != 0;
-    const b_help = b.help.len != 0;
-    if (a_help != b_help) return a_help;
     const a_family = @backingInt(a.family);
     const b_family = @backingInt(b.family);
     if (a_family != b_family) return a_family < b_family;
+    const a_help = a.help.len != 0;
+    const b_help = b.help.len != 0;
+    if (a_help != b_help) return a_help;
     return std.mem.lessThan(u8, a.spelling, b.spelling);
 }
 
@@ -2540,7 +2541,8 @@ fn completionSpellingRank(comptime universe: []const String, comptime spelling: 
 
 fn completionEntryBucket(comptime entry: CompletionEntry) usize {
     const no_help: usize = if (entry.help.len != 0) 0 else 1;
-    return no_help * 3 + @backingInt(entry.family);
+    const family: usize = @backingInt(entry.family);
+    return family * 2 + no_help;
 }
 
 fn completionEntryKey(
@@ -2744,11 +2746,12 @@ fn appendQuotedSanitized(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     s: String,
+    quote: CompletionQuote,
 ) std.mem.Allocator.Error!void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try appendSanitized(&buf, allocator, s);
-    try appendQuoted(out, allocator, buf.items, .posix);
+    try appendQuoted(out, allocator, buf.items, quote);
 }
 
 /// Append the shared zsh row helper. It holds one static row table per level
@@ -2792,7 +2795,7 @@ fn appendZshRowsHelper(
         try out.appendSlice(allocator, ")\n        help=(");
         for (rows, 0..) |row, i| {
             if (i != 0) try out.append(allocator, ' ');
-            try appendQuotedSanitized(out, allocator, row.entry.help);
+            try appendQuotedSanitized(out, allocator, row.entry.help, .posix);
         }
         try out.appendSlice(allocator, ")\n        kind=(");
         for (rows) |row| try out.print(allocator, " {}", .{@backingInt(row.entry.kind)});
@@ -3452,33 +3455,252 @@ fn appendFishWords(
     try out.append(allocator, '\n');
 }
 
-/// Append one fish candidate line: `candidate<TAB>description`, or the
-/// candidate alone when its sanitized description is empty. A spelling with a
-/// tab or newline is skipped, since fish reads one candidate per line and
-/// splits the description on the first tab.
-fn appendFishCandidate(
+/// Rows fish can carry: a pair survives only when both spellings are
+/// representable, otherwise the representable spelling becomes a one-name row,
+/// and an entry with neither is dropped.
+fn fishRows(comptime level: CompletionLevel) []const CompletionRow {
+    comptime {
+        var out: []const CompletionRow = &.{};
+        for (completionRows(level)) |row| {
+            const spelling_ok = fishWordIsRepresentable(row.entry.spelling);
+            if (row.entry.alias) |alias| {
+                const alias_ok = fishWordIsRepresentable(alias);
+                if (spelling_ok and alias_ok) {
+                    out = out ++ &[_]CompletionRow{row};
+                } else if (spelling_ok) {
+                    out = out ++ &[_]CompletionRow{.{
+                        .entry = .{
+                            .spelling = row.entry.spelling,
+                            .alias = null,
+                            .help = row.entry.help,
+                            .kind = row.entry.kind,
+                            .family = row.entry.family,
+                        },
+                        .slot = row.slot,
+                        .key_primary = row.key_primary,
+                        .key_alias = null,
+                    }};
+                } else if (alias_ok) {
+                    out = out ++ &[_]CompletionRow{.{
+                        .entry = .{
+                            .spelling = alias,
+                            .alias = null,
+                            .help = row.entry.help,
+                            .kind = row.entry.kind,
+                            .family = row.entry.family,
+                        },
+                        .slot = row.slot,
+                        .key_primary = row.key_alias.?,
+                        .key_alias = null,
+                    }};
+                }
+                continue;
+            }
+            if (spelling_ok) out = out ++ &[_]CompletionRow{row};
+        }
+        var sorted: []const CompletionRow = &.{};
+        for (out) |row| {
+            var pos = sorted.len;
+            for (sorted, 0..) |prev, i| {
+                if (row.key_primary < prev.key_primary) {
+                    pos = i;
+                    break;
+                }
+            }
+            sorted = sorted[0..pos] ++ &[_]CompletionRow{row} ++ sorted[pos..];
+        }
+        return sorted;
+    }
+}
+
+/// Append the shared fish row helper. It holds one static row table per level
+/// and prints `candidate<TAB>description` lines in phase and prefix order;
+/// fish decides the final column spacing.
+fn appendFishRowsHelper(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    indent: String,
-    candidate: CompletionCandidate,
+    ident: String,
+    comptime levels: []const CompletionLevel,
 ) std.mem.Allocator.Error!void {
-    if (!fishWordIsRepresentable(candidate.spelling)) return;
+    try out.appendSlice(allocator, "function ");
+    try appendFishFnName(out, allocator, ident, "_rows\n");
+    try out.appendSlice(allocator,
+        \\    set -l rank $argv[1]
+        \\    set -l pos $argv[2]
+        \\    set -l cur $argv[3]
+        \\    set -l spell
+        \\    set -l alias
+        \\    set -l help
+        \\    set -l kind
+        \\    set -l slot
+        \\    set -l kp
+        \\    set -l ka
+        \\    set -l phase 3
+        \\    switch $rank
+        \\
+    );
+    inline for (levels) |level| {
+        const rows = comptime fishRows(level);
+        const entries = comptime completionEntries(level);
+        const commands = comptime completionEntriesOfKind(entries, .command);
 
-    var display: std.ArrayList(u8) = .empty;
-    defer display.deinit(allocator);
-    try appendSanitized(&display, allocator, candidate.help);
+        try out.print(allocator, "    case {}\n", .{level.rank});
 
-    try out.appendSlice(allocator, indent);
-    if (display.items.len == 0) {
-        try out.appendSlice(allocator, "printf '%s\\n' ");
-        try appendQuoted(out, allocator, candidate.spelling, .fish);
-    } else {
-        try out.appendSlice(allocator, "printf '%s\\t%s\\n' ");
-        try appendQuoted(out, allocator, candidate.spelling, .fish);
-        try out.append(allocator, ' ');
-        try appendQuoted(out, allocator, display.items, .fish);
+        try out.appendSlice(allocator, "        set spell");
+        for (rows) |row| {
+            try out.append(allocator, ' ');
+            try appendQuoted(out, allocator, row.entry.spelling, .fish);
+        }
+        try out.appendSlice(allocator, "\n        set alias");
+        for (rows) |row| {
+            try out.append(allocator, ' ');
+            try appendQuoted(out, allocator, row.entry.alias orelse "", .fish);
+        }
+        try out.appendSlice(allocator, "\n        set help");
+        for (rows) |row| {
+            try out.append(allocator, ' ');
+            try appendQuotedSanitized(out, allocator, row.entry.help, .fish);
+        }
+        try out.appendSlice(allocator, "\n        set kind");
+        for (rows) |row| try out.print(allocator, " {}", .{@backingInt(row.entry.kind)});
+        try out.appendSlice(allocator, "\n        set slot");
+        for (rows) |row| try out.print(allocator, " {}", .{row.slot});
+        try out.appendSlice(allocator, "\n        set kp");
+        for (rows) |row| try out.print(allocator, " {}", .{row.key_primary});
+        try out.appendSlice(allocator, "\n        set ka");
+        for (rows) |row| try out.print(allocator, " {}", .{row.key_alias orelse 0});
+        try out.append(allocator, '\n');
+
+        if (commands.len != 0) {
+            try out.appendSlice(allocator,
+                \\        set phase 0
+                \\        if test -n "$cur"
+                \\            set phase 3
+                \\        else
+                \\            set phase 2
+                \\        end
+                \\
+            );
+        } else if (level.arguments.len != 0) {
+            try out.appendSlice(allocator,
+                \\        set phase 0
+                \\        if test -n "$cur"
+                \\            set phase 3
+                \\        else
+                \\            switch $pos
+                \\
+            );
+            inline for (0..level.arguments.len) |slot| {
+                const values = comptime completionArgumentEntries(level, slot);
+                if (values.len != 0) {
+                    try out.print(allocator, "            case {}\n                set phase 1\n", .{slot});
+                }
+            }
+            try out.appendSlice(allocator,
+                \\            end
+                \\        end
+                \\
+            );
+        } else {
+            try out.appendSlice(allocator,
+                \\        set phase 0
+                \\        if test -n "$cur"
+                \\            set phase 3
+                \\        end
+                \\
+            );
+        }
     }
-    try out.append(allocator, '\n');
+    try out.appendSlice(allocator, "    end\n");
+    try out.appendSlice(allocator,
+        \\    set -l sel_spell
+        \\    set -l sel_alias
+        \\    set -l sel_help
+        \\    set -l sel_key
+        \\    for i in (seq (count $spell))
+        \\        set -l k $kind[$i]
+        \\        set -l sl $slot[$i]
+        \\        if test $phase -eq 0
+        \\            test $k -eq 0; or continue
+        \\        else if test $phase -eq 2
+        \\            test $k -eq 2; or continue
+        \\        else if test $phase -eq 1
+        \\            test $sl -eq $pos; or continue
+        \\        else if test $k -eq 1
+        \\            test $sl -eq $pos; or continue
+        \\        end
+        \\        set -l s $spell[$i]
+        \\        set -l a $alias[$i]
+        \\        set -l hit 0
+        \\        if test (string sub -l (string length -- $cur) -- $s) = "$cur"
+        \\            set hit 1
+        \\        end
+        \\        set -l amatch 0
+        \\        if test -n "$a"; and test (string sub -l (string length -- $cur) -- $a) = "$cur"
+        \\            set amatch 1
+        \\        end
+        \\        if test $amatch -eq 1
+        \\            if test $hit -eq 1
+        \\                set sel_spell $sel_spell "$s"
+        \\                set sel_alias $sel_alias "$a"
+        \\                set sel_key $sel_key $kp[$i]
+        \\            else
+        \\                set sel_spell $sel_spell "$a"
+        \\                set sel_alias $sel_alias ''
+        \\                set sel_key $sel_key $ka[$i]
+        \\            end
+        \\        else if test $hit -eq 1
+        \\            set sel_spell $sel_spell "$s"
+        \\            set sel_alias $sel_alias ''
+        \\            set sel_key $sel_key $kp[$i]
+        \\        else
+        \\            continue
+        \\        end
+        \\        set sel_help $sel_help "$help[$i]"
+        \\    end
+        \\    set -l n (count $sel_spell)
+        \\    for i in (seq 2 $n)
+        \\        set -l ks $sel_spell[$i]
+        \\        set -l ka2 $sel_alias[$i]
+        \\        set -l kh $sel_help[$i]
+        \\        set -l kk $sel_key[$i]
+        \\        set -l j (math $i - 1)
+        \\        while test $j -ge 1
+        \\            if test $kk -lt $sel_key[$j]
+        \\                set sel_spell[(math $j + 1)] $sel_spell[$j]
+        \\                set sel_alias[(math $j + 1)] $sel_alias[$j]
+        \\                set sel_help[(math $j + 1)] $sel_help[$j]
+        \\                set sel_key[(math $j + 1)] $sel_key[$j]
+        \\                set j (math $j - 1)
+        \\            else
+        \\                break
+        \\            end
+        \\        end
+        \\        set sel_spell[(math $j + 1)] $ks
+        \\        set sel_alias[(math $j + 1)] $ka2
+        \\        set sel_help[(math $j + 1)] $kh
+        \\        set sel_key[(math $j + 1)] $kk
+        \\    end
+        \\    for i in (seq $n)
+        \\        set -l s $sel_spell[$i]
+        \\        set -l a $sel_alias[$i]
+        \\        set -l h $sel_help[$i]
+        \\        if test -n "$h"
+        \\            if test -n "$a"
+        \\                printf '%s\t%s\n' "$s" "$a  -- $h"
+        \\            else
+        \\                printf '%s\t%s\n' "$s" "-- $h"
+        \\            end
+        \\        else if test -n "$a"
+        \\            printf '%s\t%s\n' "$s" "$a"
+        \\        else
+        \\            printf '%s\n' "$s"
+        \\        end
+        \\    end
+        \\end
+        \\
+        \\
+    );
 }
 
 fn emitFish(
@@ -3515,6 +3737,8 @@ fn emitFish(
         \\
     );
 
+    try appendFishRowsHelper(&out, allocator, ident, levels);
+
     try out.appendSlice(allocator, "function ");
     try appendFishFnName(&out, allocator, ident, "_complete\n");
     try out.appendSlice(allocator,
@@ -3526,6 +3750,7 @@ fn emitFish(
         \\        set prev $toks[-1]
         \\    end
         \\    set -l level 0
+        \\    set -l pos 0
         \\    set -l literal 0
         \\    set -l i 1
         \\    set -l end (count $toks)
@@ -3555,6 +3780,7 @@ fn emitFish(
         \\            set i (math $i + 1)
         \\            continue
         \\        end
+        \\        set pos (math $pos + 1)
         \\
     );
 
@@ -3575,7 +3801,7 @@ fn emitFish(
                     inline for (comptime fishCommandSpellings(c)) |spelling| {
                         try out.appendSlice(allocator, "            case ");
                         try appendQuoted(&out, allocator, spelling, .fish);
-                        try out.print(allocator, "\n                set level {}\n", .{c.rank});
+                        try out.print(allocator, "\n                set level {}\n                set pos 0\n", .{c.rank});
                     }
                 }
                 try out.appendSlice(allocator, "            end\n");
@@ -3655,17 +3881,16 @@ fn emitFish(
             );
         }
 
-        const candidates = comptime completionCandidateHelp(level);
-        inline for (candidates) |candidate| {
-            try appendFishCandidate(&out, allocator, "        ", candidate);
-        }
+        try out.appendSlice(allocator, "        ");
+        try appendFishFnName(&out, allocator, ident, "_rows ");
+        try out.print(allocator, "{} $pos \"$cur\"\n", .{level.rank});
     }
 
     try out.appendSlice(allocator, "    end\nend\n\n");
     try out.appendSlice(allocator, "complete -c ");
     try appendQuoted(&out, allocator, app_name, .fish);
     try out.appendSlice(allocator, " -a '(");
-    try appendFishFnName(&out, allocator, ident, "_complete)'\n");
+    try appendFishFnName(&out, allocator, ident, "_complete)' -k\n");
     return try out.toOwnedSlice(allocator);
 }
 
@@ -9533,7 +9758,7 @@ test "M19: shell dispatch picks the matching registration" {
                 try std.testing.expect(std.mem.indexOf(u8, script, "compdef _tool 'tool'\n") != null);
             },
             .fish => {
-                try std.testing.expect(std.mem.endsWith(u8, script, "complete -c 'tool' -a '(__dap_tool_complete)'\n"));
+                try std.testing.expect(std.mem.endsWith(u8, script, "complete -c 'tool' -a '(__dap_tool_complete)' -k\n"));
                 try std.testing.expect(std.mem.indexOf(u8, script, "function __dap_tool_complete\n") != null);
             },
         }
@@ -9556,7 +9781,7 @@ test "M19: identifier and registration use app_name, not App.name" {
     const fish_script = try M19.completion(std.testing.allocator, "my-app", .fish);
     defer std.testing.allocator.free(fish_script);
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "function __dap_my_app_complete\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, fish_script, "complete -c 'my-app' -a '(__dap_my_app_complete)'\n"));
+    try std.testing.expect(std.mem.endsWith(u8, fish_script, "complete -c 'my-app' -a '(__dap_my_app_complete)' -k\n"));
 }
 
 test "M19: every generated namespace exposes completion" {
@@ -9867,8 +10092,8 @@ test "M19: zsh candidates by level" {
             "        help=('Mode.' 'Verbose.' 'Run.' 'Show context-sensitive help.')\n" ++
             "        kind=( 0 0 2 0 )\n" ++
             "        slot=( -1 -1 -1 -1 )\n" ++
-            "        kp=( 1 2 4 10 )\n" ++
-            "        ka=( 0 0 0 13 )\n",
+            "        kp=( 1 2 4 20 )\n" ++
+            "        ka=( 0 0 0 23 )\n",
     ) != null);
 
     // An empty prefix with commands selects the command phase.
@@ -10121,8 +10346,8 @@ test "M19: zsh and fish offer command synonyms" {
             "        help=('Build.' 'Run.' 'Show context-sensitive help.')\n" ++
             "        kind=( 2 2 0 )\n" ++
             "        slot=( -1 -1 -1 )\n" ++
-            "        kp=( 3 5 12 )\n" ++
-            "        ka=( 2 4 13 )\n",
+            "        kp=( 3 5 24 )\n" ++
+            "        ka=( 2 4 25 )\n",
     ) != null);
     for ([_]String{
         "            'run') level=1 pos=0 ;;",
@@ -10135,13 +10360,20 @@ test "M19: zsh and fish offer command synonyms" {
 
     const fish = try M19Synonym.completion(std.testing.allocator, "tool", .fish);
     defer std.testing.allocator.free(fish);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fish,
+        "        set spell 'build-target' 'run' '--help'\n" ++
+            "        set alias 'b' 'go' '-h'\n" ++
+            "        set help 'Build.' 'Run.' 'Show context-sensitive help.'\n" ++
+            "        set kind 2 2 0\n" ++
+            "        set slot -1 -1 -1\n" ++
+            "        set kp 3 5 24\n" ++
+            "        set ka 2 4 25\n",
+    ) != null);
     for ([_]String{
-        "printf '%s\\t%s\\n' 'run' 'Run.'",
-        "printf '%s\\t%s\\n' 'go' 'Run.'",
-        "printf '%s\\t%s\\n' 'build-target' 'Build.'",
-        "printf '%s\\t%s\\n' 'b' 'Build.'",
-        "            case 'go'\n                set level 1",
-        "            case 'b'\n                set level 2",
+        "            case 'go'\n                set level 1\n                set pos 0",
+        "            case 'b'\n                set level 2\n                set pos 0",
     }) |arm| {
         try std.testing.expect(std.mem.indexOf(u8, fish, arm) != null);
     }
@@ -10152,27 +10384,44 @@ test "M19: fish candidates by level" {
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
+    try std.testing.expect(std.mem.indexOf(u8, root, "        __dap_tool_rows 0 $pos \"$cur\"\n") != null);
+
+    const table = std.mem.indexOf(u8, script, "function __dap_tool_rows\n") orelse
+        return error.TestUnexpectedResult;
+    const rows = script[table..];
     const want_root =
-        "\n        printf '%s\\t%s\\n' '--help' 'Show context-sensitive help.'\n" ++
-        "        printf '%s\\t%s\\n' '-h' 'Show context-sensitive help.'\n" ++
-        "        printf '%s\\t%s\\n' '--verbose' 'Verbose.'\n" ++
-        "        printf '%s\\t%s\\n' '--mode' 'Mode.'\n" ++
-        "        printf '%s\\t%s\\n' 'run' 'Run.'\n";
-    try std.testing.expect(std.mem.indexOf(u8, root, want_root) != null);
+        "    case 0\n" ++
+        "        set spell '--mode' '--verbose' 'run' '--help'\n" ++
+        "        set alias '' '' '' '-h'\n" ++
+        "        set help 'Mode.' 'Verbose.' 'Run.' 'Show context-sensitive help.'\n" ++
+        "        set kind 0 0 2 0\n" ++
+        "        set slot -1 -1 -1 -1\n" ++
+        "        set kp 1 2 4 20\n" ++
+        "        set ka 0 0 0 23\n" ++
+        "        set phase 0\n" ++
+        "        if test -n \"$cur\"\n" ++
+        "            set phase 3\n" ++
+        "        else\n" ++
+        "            set phase 2\n" ++
+        "        end\n";
+    try std.testing.expect(std.mem.indexOf(u8, rows, want_root) != null);
 
     const run_level = m19LevelBlock(script, 1);
-    const want_run =
-        "\n        printf '%s\\t%s\\n' '--help' 'Show context-sensitive help.'\n" ++
-        "        printf '%s\\t%s\\n' '-h' 'Show context-sensitive help.'\n" ++
-        "        printf '%s\\t%s\\n' '--verbose' 'Verbose.'\n" ++
-        "        printf '%s\\t%s\\n' '--mode' 'Mode.'\n" ++
-        "        printf '%s\\t%s\\n' 'go' 'Go.'\n";
-    try std.testing.expect(std.mem.indexOf(u8, run_level, want_run) != null);
+    try std.testing.expect(std.mem.indexOf(u8, run_level, "        __dap_tool_rows 1 $pos \"$cur\"\n") != null);
     // A sibling's commands are not offered after a handoff.
     try std.testing.expect(std.mem.indexOf(u8, run_level, "'run'") == null);
 
     const go_level = m19LevelBlock(script, 2);
-    try std.testing.expect(std.mem.indexOf(u8, go_level, "\n        printf '%s\\t%s\\n' '--mode' 'Mode.'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "        __dap_tool_rows 2 $pos \"$cur\"\n") != null);
+    const go_phase =
+        "        set phase 0\n" ++
+        "        if test -n \"$cur\"\n" ++
+        "            set phase 3\n" ++
+        "        else\n" ++
+        "            switch $pos\n" ++
+        "            end\n" ++
+        "        end\n";
+    try std.testing.expect(std.mem.indexOf(u8, rows, go_phase) != null);
     try std.testing.expect(std.mem.indexOf(u8, go_level, "'go'") == null);
 
     // Command descent is a nested switch keyed by the level rank.
@@ -10182,11 +10431,13 @@ test "M19: fish candidates by level" {
         \\            switch $tok
         \\            case 'run'
         \\                set level 1
+        \\                set pos 0
         \\            end
         \\        case 1
         \\            switch $tok
         \\            case 'go'
         \\                set level 2
+        \\                set pos 0
         \\            end
         \\        end
         \\
@@ -10262,7 +10513,7 @@ test "M19: fish literal terminator and file fallback" {
     try std.testing.expect(std.mem.indexOf(u8, script, "        if test \"$tok\" = '--'\n            set literal 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "\n    if test $literal -eq 1\n        return\n    end\n") != null);
     // No `-f` on registration: file completion stays available.
-    try std.testing.expect(std.mem.endsWith(u8, script, "complete -c 'tool' -a '(__dap_tool_complete)'\n"));
+    try std.testing.expect(std.mem.endsWith(u8, script, "complete -c 'tool' -a '(__dap_tool_complete)' -k\n"));
     try std.testing.expect(std.mem.indexOf(u8, script, " -f ") == null);
 }
 
@@ -10324,9 +10575,13 @@ test "M19: fish quotes candidates and skips unrepresentable names" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         script,
-        "        printf '%s\\t%s\\n' '--a\\'b' 'Tab here next'\n" ++
-            "        printf '%s\\t%s\\n' '-x y' 'Tab here next'\n" ++
-            "        printf '%s\\t%s\\n' 'c d' 'Cmd \\'help\\'.'\n",
+        "        set spell '--a\\'b' 'c d'\n" ++
+            "        set alias '-x y' ''\n" ++
+            "        set help 'Tab here next' 'Cmd \\'help\\'.'\n" ++
+            "        set kind 0 2\n" ++
+            "        set slot -1 -1\n" ++
+            "        set kp 0 4\n" ++
+            "        set ka 1 0\n",
     ) != null);
     // A tab or newline cannot cross fish's line protocol: the candidate and
     // its descent case are both dropped.
@@ -10426,8 +10681,8 @@ test "M19: short enum spelling" {
             "        help=('Level.' 'Show context-sensitive help.')\n" ++
             "        kind=( 0 0 )\n" ++
             "        slot=( -1 -1 )\n" ++
-            "        kp=( 1 8 )\n" ++
-            "        ka=( 3 10 )\n",
+            "        kp=( 1 16 )\n" ++
+            "        ka=( 3 18 )\n",
     ) != null);
 
     const fish = try M19Short.completion(std.testing.allocator, "tool", .fish);
@@ -10519,7 +10774,7 @@ test "M19: identifier sanitization collisions" {
     const fish = try M19.completion(std.testing.allocator, "a+b", .fish);
     defer std.testing.allocator.free(fish);
     try std.testing.expect(std.mem.indexOf(u8, fish, "function __dap_a_b_complete\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, fish, "complete -c 'a+b' -a '(__dap_a_b_complete)'\n"));
+    try std.testing.expect(std.mem.endsWith(u8, fish, "complete -c 'a+b' -a '(__dap_a_b_complete)' -k\n"));
 }
 
 test "M19: out of memory sweep" {
@@ -10735,8 +10990,8 @@ test "M19: zsh golden" {
         \\        help=('Mode.' 'Verbose.' 'Run.' 'Show context-sensitive help.')
         \\        kind=( 0 0 2 0 )
         \\        slot=( -1 -1 -1 -1 )
-        \\        kp=( 1 2 4 10 )
-        \\        ka=( 0 0 0 13 )
+        \\        kp=( 1 2 4 20 )
+        \\        ka=( 0 0 0 23 )
         \\        phase=0
         \\        if [[ -n $cur ]]; then
         \\            phase=3
@@ -10750,8 +11005,8 @@ test "M19: zsh golden" {
         \\        help=('Mode.' 'Verbose.' 'Go.' 'Show context-sensitive help.')
         \\        kind=( 0 0 2 0 )
         \\        slot=( -1 -1 -1 -1 )
-        \\        kp=( 1 2 4 10 )
-        \\        ka=( 0 0 0 13 )
+        \\        kp=( 1 2 4 20 )
+        \\        ka=( 0 0 0 23 )
         \\        phase=0
         \\        if [[ -n $cur ]]; then
         \\            phase=3
@@ -10765,8 +11020,8 @@ test "M19: zsh golden" {
         \\        help=('Mode.' 'Verbose.' 'Show context-sensitive help.')
         \\        kind=( 0 0 0 )
         \\        slot=( -1 -1 -1 )
-        \\        kp=( 1 2 8 )
-        \\        ka=( 0 0 11 )
+        \\        kp=( 1 2 16 )
+        \\        ka=( 0 0 19 )
         \\        phase=0
         \\        if [[ -n $cur ]]; then
         \\            phase=3
@@ -11049,6 +11304,149 @@ test "M19: fish golden" {
         \\    return 1
         \\end
         \\
+        \\function __dap_m19_rows
+        \\    set -l rank $argv[1]
+        \\    set -l pos $argv[2]
+        \\    set -l cur $argv[3]
+        \\    set -l spell
+        \\    set -l alias
+        \\    set -l help
+        \\    set -l kind
+        \\    set -l slot
+        \\    set -l kp
+        \\    set -l ka
+        \\    set -l phase 3
+        \\    switch $rank
+        \\    case 0
+        \\        set spell '--mode' '--verbose' 'run' '--help'
+        \\        set alias '' '' '' '-h'
+        \\        set help 'Mode.' 'Verbose.' 'Run.' 'Show context-sensitive help.'
+        \\        set kind 0 0 2 0
+        \\        set slot -1 -1 -1 -1
+        \\        set kp 1 2 4 20
+        \\        set ka 0 0 0 23
+        \\        set phase 0
+        \\        if test -n "$cur"
+        \\            set phase 3
+        \\        else
+        \\            set phase 2
+        \\        end
+        \\    case 1
+        \\        set spell '--mode' '--verbose' 'go' '--help'
+        \\        set alias '' '' '' '-h'
+        \\        set help 'Mode.' 'Verbose.' 'Go.' 'Show context-sensitive help.'
+        \\        set kind 0 0 2 0
+        \\        set slot -1 -1 -1 -1
+        \\        set kp 1 2 4 20
+        \\        set ka 0 0 0 23
+        \\        set phase 0
+        \\        if test -n "$cur"
+        \\            set phase 3
+        \\        else
+        \\            set phase 2
+        \\        end
+        \\    case 2
+        \\        set spell '--mode' '--verbose' '--help'
+        \\        set alias '' '' '-h'
+        \\        set help 'Mode.' 'Verbose.' 'Show context-sensitive help.'
+        \\        set kind 0 0 0
+        \\        set slot -1 -1 -1
+        \\        set kp 1 2 16
+        \\        set ka 0 0 19
+        \\        set phase 0
+        \\        if test -n "$cur"
+        \\            set phase 3
+        \\        else
+        \\            switch $pos
+        \\            end
+        \\        end
+        \\    end
+        \\    set -l sel_spell
+        \\    set -l sel_alias
+        \\    set -l sel_help
+        \\    set -l sel_key
+        \\    for i in (seq (count $spell))
+        \\        set -l k $kind[$i]
+        \\        set -l sl $slot[$i]
+        \\        if test $phase -eq 0
+        \\            test $k -eq 0; or continue
+        \\        else if test $phase -eq 2
+        \\            test $k -eq 2; or continue
+        \\        else if test $phase -eq 1
+        \\            test $sl -eq $pos; or continue
+        \\        else if test $k -eq 1
+        \\            test $sl -eq $pos; or continue
+        \\        end
+        \\        set -l s $spell[$i]
+        \\        set -l a $alias[$i]
+        \\        set -l hit 0
+        \\        if test (string sub -l (string length -- $cur) -- $s) = "$cur"
+        \\            set hit 1
+        \\        end
+        \\        set -l amatch 0
+        \\        if test -n "$a"; and test (string sub -l (string length -- $cur) -- $a) = "$cur"
+        \\            set amatch 1
+        \\        end
+        \\        if test $amatch -eq 1
+        \\            if test $hit -eq 1
+        \\                set sel_spell $sel_spell "$s"
+        \\                set sel_alias $sel_alias "$a"
+        \\                set sel_key $sel_key $kp[$i]
+        \\            else
+        \\                set sel_spell $sel_spell "$a"
+        \\                set sel_alias $sel_alias ''
+        \\                set sel_key $sel_key $ka[$i]
+        \\            end
+        \\        else if test $hit -eq 1
+        \\            set sel_spell $sel_spell "$s"
+        \\            set sel_alias $sel_alias ''
+        \\            set sel_key $sel_key $kp[$i]
+        \\        else
+        \\            continue
+        \\        end
+        \\        set sel_help $sel_help "$help[$i]"
+        \\    end
+        \\    set -l n (count $sel_spell)
+        \\    for i in (seq 2 $n)
+        \\        set -l ks $sel_spell[$i]
+        \\        set -l ka2 $sel_alias[$i]
+        \\        set -l kh $sel_help[$i]
+        \\        set -l kk $sel_key[$i]
+        \\        set -l j (math $i - 1)
+        \\        while test $j -ge 1
+        \\            if test $kk -lt $sel_key[$j]
+        \\                set sel_spell[(math $j + 1)] $sel_spell[$j]
+        \\                set sel_alias[(math $j + 1)] $sel_alias[$j]
+        \\                set sel_help[(math $j + 1)] $sel_help[$j]
+        \\                set sel_key[(math $j + 1)] $sel_key[$j]
+        \\                set j (math $j - 1)
+        \\            else
+        \\                break
+        \\            end
+        \\        end
+        \\        set sel_spell[(math $j + 1)] $ks
+        \\        set sel_alias[(math $j + 1)] $ka2
+        \\        set sel_help[(math $j + 1)] $kh
+        \\        set sel_key[(math $j + 1)] $kk
+        \\    end
+        \\    for i in (seq $n)
+        \\        set -l s $sel_spell[$i]
+        \\        set -l a $sel_alias[$i]
+        \\        set -l h $sel_help[$i]
+        \\        if test -n "$h"
+        \\            if test -n "$a"
+        \\                printf '%s\t%s\n' "$s" "$a  -- $h"
+        \\            else
+        \\                printf '%s\t%s\n' "$s" "-- $h"
+        \\            end
+        \\        else if test -n "$a"
+        \\            printf '%s\t%s\n' "$s" "$a"
+        \\        else
+        \\            printf '%s\n' "$s"
+        \\        end
+        \\    end
+        \\end
+        \\
         \\function __dap_m19_complete
         \\    set -l toks (commandline -opc)
         \\    set -e toks[1]
@@ -11058,6 +11456,7 @@ test "M19: fish golden" {
         \\        set prev $toks[-1]
         \\    end
         \\    set -l level 0
+        \\    set -l pos 0
         \\    set -l literal 0
         \\    set -l i 1
         \\    set -l end (count $toks)
@@ -11084,16 +11483,19 @@ test "M19: fish golden" {
         \\            set i (math $i + 1)
         \\            continue
         \\        end
+        \\        set pos (math $pos + 1)
         \\        switch $level
         \\        case 0
         \\            switch $tok
         \\            case 'run'
         \\                set level 1
+        \\                set pos 0
         \\            end
         \\        case 1
         \\            switch $tok
         \\            case 'go'
         \\                set level 2
+        \\                set pos 0
         \\            end
         \\        end
         \\        set i (math $i + 1)
@@ -11127,11 +11529,7 @@ test "M19: fish golden" {
         \\            end
         \\            return
         \\        end
-        \\        printf '%s\t%s\n' '--help' 'Show context-sensitive help.'
-        \\        printf '%s\t%s\n' '-h' 'Show context-sensitive help.'
-        \\        printf '%s\t%s\n' '--verbose' 'Verbose.'
-        \\        printf '%s\t%s\n' '--mode' 'Mode.'
-        \\        printf '%s\t%s\n' 'run' 'Run.'
+        \\        __dap_m19_rows 0 $pos "$cur"
         \\    # dap: level 1 m19 run
         \\    case 1
         \\        if test -n "$vflag"
@@ -11147,11 +11545,7 @@ test "M19: fish golden" {
         \\            end
         \\            return
         \\        end
-        \\        printf '%s\t%s\n' '--help' 'Show context-sensitive help.'
-        \\        printf '%s\t%s\n' '-h' 'Show context-sensitive help.'
-        \\        printf '%s\t%s\n' '--verbose' 'Verbose.'
-        \\        printf '%s\t%s\n' '--mode' 'Mode.'
-        \\        printf '%s\t%s\n' 'go' 'Go.'
+        \\        __dap_m19_rows 1 $pos "$cur"
         \\    # dap: level 2 m19 run go
         \\    case 2
         \\        if test -n "$vflag"
@@ -11167,14 +11561,11 @@ test "M19: fish golden" {
         \\            end
         \\            return
         \\        end
-        \\        printf '%s\t%s\n' '--help' 'Show context-sensitive help.'
-        \\        printf '%s\t%s\n' '-h' 'Show context-sensitive help.'
-        \\        printf '%s\t%s\n' '--verbose' 'Verbose.'
-        \\        printf '%s\t%s\n' '--mode' 'Mode.'
+        \\        __dap_m19_rows 2 $pos "$cur"
         \\    end
         \\end
         \\
-        \\complete -c 'm19' -a '(__dap_m19_complete)'
+        \\complete -c 'm19' -a '(__dap_m19_complete)' -k
         \\
     ;
     try std.testing.expectEqualStrings(want, script);
@@ -11256,25 +11647,25 @@ test "M20: entry building pairs and families" {
         const root = completionEntries(levels[0]);
         m20Expect(root.len == 6, "root entry count");
 
-        const want = [_]String{ "--description", "--mode", "pick", "--help", "quiet", "--version" };
+        const want = [_]String{ "--description", "--mode", "pick", "quiet", "--version", "--help" };
         for (want, root) |w, e| m20Expect(std.mem.eql(u8, w, e.spelling), "root entry order");
 
         m20Expect(root[0].alias != null and std.mem.eql(u8, root[0].alias.?, "-d"), "flag alias");
         m20Expect(root[1].alias == null, "lone long flag");
         m20Expect(root[2].alias != null and std.mem.eql(u8, root[2].alias.?, "p"), "command synonym");
-        m20Expect(root[3].alias != null and std.mem.eql(u8, root[3].alias.?, "-h"), "builtin help alias");
-        m20Expect(root[5].alias == null, "lone version");
+        m20Expect(root[4].alias == null, "lone version");
+        m20Expect(root[5].alias != null and std.mem.eql(u8, root[5].alias.?, "-h"), "builtin help alias");
 
         m20Expect(root[0].kind == .flag, "flag kind");
         m20Expect(root[2].kind == .command, "command kind");
         m20Expect(root[0].family == .normal, "normal family");
-        m20Expect(root[3].family == .help, "help family");
-        m20Expect(root[5].family == .version, "version family");
+        m20Expect(root[4].family == .version, "version family");
+        m20Expect(root[5].family == .help, "help family");
 
         m20Expect(std.mem.eql(u8, root[0].help, "Description."), "flag help");
         m20Expect(std.mem.eql(u8, root[2].help, "Pick."), "command help");
-        m20Expect(root[4].help.len == 0, "empty command help");
-        m20Expect(root[5].help.len == 0, "empty version help");
+        m20Expect(root[3].help.len == 0, "empty command help");
+        m20Expect(root[4].help.len == 0, "empty version help");
     }
 }
 
@@ -11283,14 +11674,13 @@ test "M20: empty help sorts to the bottom" {
         const levels = completionLevels(M20, &.{});
         const rows = completionRows(levels[0]);
 
-        const want = [_]String{ "--description", "--mode", "pick", "--help", "quiet", "--version" };
+        const want = [_]String{ "--description", "--mode", "pick", "quiet", "--version", "--help" };
         for (want, rows) |w, r| m20Expect(std.mem.eql(u8, w, r.entry.spelling), "help-presence order");
 
-        // All help-carrying rows precede every empty-help row, and the empty
-        // help group keeps the normal < version < help tail.
-        m20Expect(rows[3].entry.family == .help, "help row first of its group");
-        m20Expect(rows[4].entry.help.len == 0 and rows[4].entry.family == .normal, "empty normal row");
-        m20Expect(rows[5].entry.help.len == 0 and rows[5].entry.family == .version, "empty version row last");
+        // The family tail always wins; inside a family, empty help sorts last.
+        m20Expect(rows[3].entry.help.len == 0 and rows[3].entry.family == .normal, "empty normal row last in family");
+        m20Expect(rows[4].entry.family == .version and rows[4].entry.help.len == 0, "version family");
+        m20Expect(rows[5].entry.family == .help, "help stays last");
     }
 }
 
@@ -11301,9 +11691,9 @@ test "M20: numeric keys follow help presence, family, spelling" {
         m20Expect(rows[0].key_primary == 0 and rows[0].key_alias.? == 4, "description keys");
         m20Expect(rows[1].key_primary == 2, "mode key");
         m20Expect(rows[2].key_primary == 7 and rows[2].key_alias.? == 6, "pick keys");
-        m20Expect(rows[3].key_primary == 19 and rows[3].key_alias.? == 23, "help keys");
-        m20Expect(rows[4].key_primary == 35, "quiet key");
-        m20Expect(rows[5].key_primary == 39, "version key");
+        m20Expect(rows[3].key_primary == 17, "quiet key");
+        m20Expect(rows[4].key_primary == 30, "version key");
+        m20Expect(rows[5].key_primary == 37 and rows[5].key_alias.? == 41, "help keys");
         for (rows) |row| m20Expect(row.slot == -1, "non-argument slot");
     }
 }
@@ -11356,7 +11746,7 @@ test "M20: entries with the current slot" {
         const pick = levels[1];
         const with_slot = completionEntriesWithSlot(pick, 0);
 
-        const want = [_]String{ "--description", "--mode", "--verbose", "alpha", "beta", "--help", "--version" };
+        const want = [_]String{ "--description", "--mode", "--verbose", "alpha", "beta", "--version", "--help" };
         m20Expect(with_slot.len == want.len, "union size");
         for (want, with_slot) |w, e| m20Expect(std.mem.eql(u8, w, e.spelling), "union order");
         m20Expect(completionEntriesOfKind(with_slot, .argument).len == 2, "argument kind filter");
@@ -11371,12 +11761,12 @@ test "M20: bash spelling expansion sorts each spelling" {
         const root = completionEntries(levels[0]);
 
         const flags = completionSpellings(completionEntriesOfKind(root, .flag));
-        const want_flags = [_]String{ "--description", "--mode", "-d", "--help", "-h", "--version" };
+        const want_flags = [_]String{ "--description", "--mode", "-d", "--version", "--help", "-h" };
         m20Expect(flags.len == want_flags.len, "flag spelling count");
         for (want_flags, flags) |w, s| m20Expect(std.mem.eql(u8, w, s), "flag spelling order");
 
         const all = completionSpellings(root);
-        const want_all = [_]String{ "--description", "--mode", "-d", "p", "pick", "--help", "-h", "quiet", "--version" };
+        const want_all = [_]String{ "--description", "--mode", "-d", "p", "pick", "quiet", "--version", "--help", "-h" };
         m20Expect(all.len == want_all.len, "all spelling count");
         for (want_all, all) |w, s| m20Expect(std.mem.eql(u8, w, s), "all spelling order");
     }
