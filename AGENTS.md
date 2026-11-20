@@ -161,9 +161,13 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   sub's own specs is retried against each ancestor's `assignLongFlag`/
   `assignShortFlag`, so `app sub --root-flag` assigns into the ancestor's
   `View`, consistent with the merged help and the global uniqueness rule.
-  Duplicate command wire names at a level and command-field names
-  colliding with a spec are compile errors (`checkCommandNames` /
-  `checkCommandFieldNames`); mixing commands with positional arguments in one
+  Duplicate command wire names or synonyms at a level and command-field
+  names colliding with a spec are compile errors (`checkCommandNames` /
+  `checkCommandFieldNames`); `CommandMeta.synonym` is an alternative wire
+  name for the same command, so it shares the level's name namespace (it may
+  neither shadow another command nor repeat its own primary name) and the
+  handoff matches either spelling. Mixing commands with positional arguments
+  in one
   declaration is also rejected (`checkCommandArgumentMix`), since a command
   token hands off the rest of the wire and a parent positional could never be
   filled; a level with no command fields simply has none. Flag long names and
@@ -293,7 +297,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   (ancestors first, own after, injected builtin once), own arguments, and own
   commands. All three emitters share the script contract: a level marker
   comment per level, ordinary candidates from flags (long then non-empty
-  short) then commands (skipping empty and `-`-leading names), enumeration
+  short) then commands (primary name then synonym, skipping empty and
+  `-`-leading spellings), enumeration
   values via `enumWireNames` only for enumerable `vtype`s, no `Alt` pruning,
   no argument completion, no library candidates after `--`, deterministic
   bytes and exactly one trailing `\n`. The caller owns the result. The example

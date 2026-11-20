@@ -390,9 +390,12 @@ pub const Enum = struct {
     i18n: ?String = null,
 };
 
-/// Command description.
+/// Command description. `synonym` is an alternative wire name accepted in
+/// place of the command's primary name (`name` orelse the declaration field
+/// name); it is an extra spelling of the same command, not a separate one.
 pub const CommandMeta = struct {
     name: ?String = null,
+    synonym: ?String = null,
     help: String = "",
     i18n: ?String = null,
 };
@@ -419,8 +422,9 @@ pub const CommandMeta = struct {
 ///
 /// Each command field contributes one `?View` field to the parent `View`,
 /// stored under the declaration field name prefixed with `_` (`_start`),
-/// `null` unless that command's wire name (`.name` orelse the field name)
-/// appears. This is how the parsed sub-view is carried, but it is an
+/// `null` unless that command's wire name (`.name` orelse the field name), or
+/// its optional `.synonym`, appears. This is how the parsed sub-view is
+/// carried, but it is an
 /// implementation detail: a declaration field name must not begin with `_`,
 /// and consumers reach commands through the namespace's `command` accessor
 /// (below). Nested commands nest:
@@ -1924,7 +1928,9 @@ fn suggestLoad(
             },
             .short_flag => {},
             .cmd => inline for (cmds) |c| {
-                if (suggestIsPrefix(body, c.name)) prefix_count += 1;
+                inline for (comptime commandSpellings(c)) |spelling| {
+                    if (suggestIsPrefix(body, spelling)) prefix_count += 1;
+                }
             },
         }
     }
@@ -1960,7 +1966,9 @@ fn suggestLoad(
         },
         .cmd => {
             inline for (cmds) |c| {
-                suggestConsider(&best, body, c.name, null, .cmd, true, prefix_ok);
+                inline for (comptime commandSpellings(c)) |spelling| {
+                    suggestConsider(&best, body, spelling, null, .cmd, true, prefix_ok);
+                }
             }
         },
     }
@@ -2254,13 +2262,27 @@ fn completionValueArms(comptime level: CompletionLevel) []const CompletionValueA
     }
 }
 
-/// Commands of `level` that the completion script can offer: empty names and
-/// dash-leading names are unreachable, because flag matching runs first.
+/// Wire spellings of `c` the completion script can offer: primary name then
+/// synonym, dropping empty and dash-leading spellings (unreachable, because
+/// flag matching runs first).
+fn completionCommandSpellings(comptime c: CommandEntry) []const String {
+    if (c.synonym) |s| {
+        if (s.len != 0 and s[0] != '-') {
+            if (c.name.len != 0 and c.name[0] != '-') return &[_]String{ c.name, s };
+            return &[_]String{s};
+        }
+    }
+    if (c.name.len != 0 and c.name[0] != '-') return &[_]String{c.name};
+    return &.{};
+}
+
+/// Commands of `level` that the completion script can offer, i.e. those with
+/// at least one reachable spelling.
 fn completionCommands(comptime level: CompletionLevel) []const CommandEntry {
     comptime {
         var cmds: []const CommandEntry = &.{};
         for (level.commands) |c| {
-            if (c.name.len == 0 or c.name[0] == '-') continue;
+            if (completionCommandSpellings(c).len == 0) continue;
             cmds = cmds ++ &[_]CommandEntry{c};
         }
         return cmds;
@@ -2290,7 +2312,9 @@ fn completionFlagCandidates(comptime level: CompletionLevel) []const String {
 fn completionCandidates(comptime level: CompletionLevel) []const String {
     comptime {
         var cands: []const String = completionFlagCandidates(level);
-        for (completionCommands(level)) |c| cands = cands ++ &[_]String{c.name};
+        for (completionCommands(level)) |c| {
+            for (completionCommandSpellings(c)) |spelling| cands = cands ++ &[_]String{spelling};
+        }
         return cands;
     }
 }
@@ -2333,10 +2357,12 @@ fn completionCandidateHelp(comptime level: CompletionLevel) []const CompletionCa
             }
         }
         for (completionCommands(level)) |c| {
-            cands = cands ++ &[_]CompletionCandidate{.{
-                .spelling = c.name,
-                .help = c.Cmd.cmd_meta.help,
-            }};
+            for (completionCommandSpellings(c)) |spelling| {
+                cands = cands ++ &[_]CompletionCandidate{.{
+                    .spelling = spelling,
+                    .help = c.Cmd.cmd_meta.help,
+                }};
+            }
         }
         return cands;
     }
@@ -2571,9 +2597,11 @@ fn emitBash(
         if (cmds.len != 0) {
             try out.appendSlice(allocator, "            case \"$tok\" in\n");
             inline for (cmds) |c| {
-                try out.appendSlice(allocator, "            ");
-                try appendQuoted(&out, allocator, c.name, .posix);
-                try out.print(allocator, ") level={} ;;\n", .{c.rank});
+                inline for (comptime completionCommandSpellings(c)) |spelling| {
+                    try out.appendSlice(allocator, "            ");
+                    try appendQuoted(&out, allocator, spelling, .posix);
+                    try out.print(allocator, ") level={} ;;\n", .{c.rank});
+                }
             }
             try out.appendSlice(allocator, "            esac\n");
         }
@@ -2723,9 +2751,11 @@ fn emitZsh(
         if (cmds.len != 0) {
             try out.appendSlice(allocator, "            case \"$tok\" in\n");
             inline for (cmds) |c| {
-                try out.appendSlice(allocator, "            ");
-                try appendQuoted(&out, allocator, c.name, .posix);
-                try out.print(allocator, ") level={} ;;\n", .{c.rank});
+                inline for (comptime completionCommandSpellings(c)) |spelling| {
+                    try out.appendSlice(allocator, "            ");
+                    try appendQuoted(&out, allocator, spelling, .posix);
+                    try out.print(allocator, ") level={} ;;\n", .{c.rank});
+                }
             }
             try out.appendSlice(allocator, "            esac\n");
         }
@@ -2834,13 +2864,28 @@ fn fishWordIsRepresentable(word: String) bool {
     return std.mem.indexOfAny(u8, word, "\t\n") == null;
 }
 
-/// Commands of `level` whose names fish can match: names with a tab or newline
-/// cannot appear in a `case` pattern or a printed candidate.
+/// Wire spellings of `c` fish can match: names and synonyms with a tab or
+/// newline cannot appear in a `case` pattern or a printed candidate.
+fn fishCommandSpellings(comptime c: CommandEntry) []const String {
+    const spellings = completionCommandSpellings(c);
+    const first_ok = spellings.len >= 1 and fishWordIsRepresentable(spellings[0]);
+    if (spellings.len == 2) {
+        const second_ok = fishWordIsRepresentable(spellings[1]);
+        if (first_ok and second_ok) return spellings;
+        if (first_ok) return spellings[0..1];
+        if (second_ok) return spellings[1..2];
+        return &.{};
+    }
+    if (first_ok) return spellings;
+    return &.{};
+}
+
+/// Commands of `level` whose names fish can match.
 fn fishCommands(comptime level: CompletionLevel) []const CommandEntry {
     comptime {
         var cmds: []const CommandEntry = &.{};
         for (completionCommands(level)) |c| {
-            if (!fishWordIsRepresentable(c.name)) continue;
+            if (fishCommandSpellings(c).len == 0) continue;
             cmds = cmds ++ &[_]CommandEntry{c};
         }
         return cmds;
@@ -2990,9 +3035,11 @@ fn emitFish(
                 try out.print(allocator, "        case {}\n", .{level.rank});
                 try out.appendSlice(allocator, "            switch $tok\n");
                 inline for (cmds) |c| {
-                    try out.appendSlice(allocator, "            case ");
-                    try appendQuoted(&out, allocator, c.name, .fish);
-                    try out.print(allocator, "\n                set level {}\n", .{c.rank});
+                    inline for (comptime fishCommandSpellings(c)) |spelling| {
+                        try out.appendSlice(allocator, "            case ");
+                        try appendQuoted(&out, allocator, spelling, .fish);
+                        try out.print(allocator, "\n                set level {}\n", .{c.rank});
+                    }
                 }
                 try out.appendSlice(allocator, "            end\n");
             }
@@ -3722,7 +3769,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                         // token and again starts at its own index 0.
                         var matched = false;
                         inline for (cmd_entries) |c| {
-                            if (std.mem.eql(u8, c.name, tok)) {
+                            if (commandMatches(c, tok)) {
                                 const S = Sub(c.Cmd, subApp(app, c));
                                 var frame: ParseFrame(@This()) = .{ .v = &v, .seen = &seen };
                                 const chain: Ancestor = .{
@@ -4066,13 +4113,15 @@ const DefaultRepr = struct {
 /// A single command declaration found at a given level. `field` is the
 /// declaration field name (the `command` union tag); `view_field` is that
 /// name prefixed with `_`, the field the parent `View` stores the sub-view
-/// under; `name` is the wire name (`cmd_meta.name orelse field`); `rank` is
-/// the command node's pre-order position in the whole tree; `Cmd` is the
-/// type returned by `Command(...)`.
+/// under; `name` is the wire name (`cmd_meta.name orelse field`); `synonym`
+/// is the optional alternative wire name; `rank` is the command node's
+/// pre-order position in the whole tree; `Cmd` is the type returned by
+/// `Command(...)`.
 const CommandEntry = struct {
     field: String,
     view_field: String,
     name: String,
+    synonym: ?String,
     rank: usize,
     Cmd: type,
 };
@@ -4632,12 +4681,44 @@ fn checkNoUnderscoreFields(comptime def: anytype) void {
     }
 }
 
+/// Every wire spelling of a command at its level: the primary name first,
+/// then the synonym when declared.
+fn commandSpellings(comptime c: CommandEntry) []const String {
+    if (c.synonym) |s| return &[_]String{ c.name, s };
+    return &[_]String{c.name};
+}
+
+/// Whether `tok` names `c`, matching its primary wire name or its synonym.
+fn commandMatches(comptime c: CommandEntry, tok: String) bool {
+    if (std.mem.eql(u8, c.name, tok)) return true;
+    if (c.synonym) |s| return std.mem.eql(u8, s, tok);
+    return false;
+}
+
 fn checkCommandNames(comptime commands: []const CommandEntry) void {
     comptime {
-        for (commands, 0..) |a, i| {
-            for (commands[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a.name, b.name)) {
-                    @compileError("duplicate command name '" ++ a.name ++ "' on fields '" ++ a.field ++ "' and '" ++ b.field ++ "'");
+        // Names and synonyms share one namespace at a level: a synonym is an
+        // alternative spelling of a command, so it may not shadow another
+        // command or repeat a name already taken.
+        const Named = struct {
+            spelling: String,
+            field: String,
+        };
+        var all: []const Named = &.{};
+        for (commands) |c| {
+            if (c.synonym) |s| {
+                if (std.mem.eql(u8, s, c.name)) {
+                    @compileError("command synonym '" ++ s ++ "' on field '" ++ c.field ++ "' duplicates its own name");
+                }
+            }
+            for (commandSpellings(c)) |spelling| {
+                all = all ++ &[_]Named{.{ .spelling = spelling, .field = c.field }};
+            }
+        }
+        for (all, 0..) |a, i| {
+            for (all[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a.spelling, b.spelling)) {
+                    @compileError("duplicate command name '" ++ a.spelling ++ "' on fields '" ++ a.field ++ "' and '" ++ b.field ++ "'");
                 }
             }
         }
@@ -4876,6 +4957,7 @@ fn normalizeRanked(comptime def: anytype, comptime base_rank: usize) NormResult 
                     .field = f.name,
                     .view_field = viewCommandField(f.name),
                     .name = commandWireName(V.cmd_meta, f.name),
+                    .synonym = V.cmd_meta.synonym,
                     .rank = next_rank,
                     .Cmd = V,
                 }};
@@ -5117,7 +5199,7 @@ const M1CmdDef = .{
     .start = Command(.{ .help = "Start." }, .{
         .name = Argument([]const u8){ .help = "Name." },
     }),
-    .stop = Command(.{ .name = "halt", .help = "Stop." }, .{}),
+    .stop = Command(.{ .name = "halt", .synonym = "quit", .help = "Stop." }, .{}),
 };
 
 test "M1: normalize spec contents" {
@@ -5190,6 +5272,8 @@ test "M1: commands level detected" {
     try std.testing.expectEqualStrings("stop", C.commands[1].field);
     try std.testing.expectEqualStrings("_stop", C.commands[1].view_field);
     try std.testing.expectEqualStrings("halt", C.commands[1].name);
+    try std.testing.expect(C.commands[0].synonym == null);
+    try std.testing.expectEqualStrings("quit", C.commands[1].synonym.?);
     try std.testing.expect(C.commands[0].Cmd.dap_kind == .command);
 }
 
@@ -5270,6 +5354,32 @@ test "M1: duplicate command names are a compile error" {
             .b = Command(.{ .name = "same" }, .{}),
         };
         comptime _ = normalize(Bad);
+    }
+}
+
+test "M1: command synonym clashes are a compile error" {
+    if (false) {
+        // Synonym shadowing another command's primary name.
+        const BadName = .{
+            .a = Command(.{ .name = "alpha", .synonym = "beta" }, .{}),
+            .b = Command(.{ .name = "beta" }, .{}),
+        };
+        comptime _ = normalize(BadName);
+    }
+    if (false) {
+        // Two commands claiming the same synonym.
+        const BadSynonym = .{
+            .a = Command(.{ .synonym = "shared" }, .{}),
+            .b = Command(.{ .name = "other", .synonym = "shared" }, .{}),
+        };
+        comptime _ = normalize(BadSynonym);
+    }
+    if (false) {
+        // A synonym repeating its own command's primary name.
+        const BadSelf = .{
+            .a = Command(.{ .name = "alpha", .synonym = "alpha" }, .{}),
+        };
+        comptime _ = normalize(BadSelf);
     }
 }
 
@@ -5998,7 +6108,7 @@ const M7Def = .{
             .default = Default(bool){ .direct = false },
         },
     }),
-    .stop = Command(.{ .name = "halt", .help = "Stop." }, .{}),
+    .stop = Command(.{ .name = "halt", .synonym = "quit", .help = "Stop." }, .{}),
     .nested = Command(.{ .help = "Nested." }, .{
         .deep = Command(.{ .help = "Deep." }, .{
             .n = Argument(u8){},
@@ -6045,6 +6155,17 @@ test "M7: named command via CommandMeta" {
     const a = try m7Parse(&arena, &.{ "--needed", "v", "halt" }, &diag);
     try std.testing.expect(a._stop != null);
     try std.testing.expect(a._start == null);
+}
+
+test "M7: command synonym is accepted as an alternative name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+
+    const a = try m7Parse(&arena, &.{ "--needed", "v", "quit" }, &diag);
+    try std.testing.expect(a._stop != null);
+    try std.testing.expect(a._start == null);
+    try std.testing.expect(diag.message == null);
 }
 
 test "M7: flags after the command are scoped to the sub" {
@@ -8609,6 +8730,15 @@ const M19ShortDef = .{
 
 const M19Short = generate(App{ .name = "m19-short", .help = "M19 short root." }, M19ShortDef);
 
+const M19SynonymDef = .{
+    .run = Command(.{ .synonym = "go", .help = "Run." }, .{
+        .flag = Flag(bool){ .default = Default(bool){ .direct = false } },
+    }),
+    .build = Command(.{ .name = "build-target", .synonym = "b", .help = "Build." }, .{}),
+};
+
+const M19Synonym = generate(App{ .name = "m19-synonym", .help = "M19 synonym root." }, M19SynonymDef);
+
 fn m19Expect(comptime ok: bool, comptime msg: []const u8) void {
     if (!ok) @compileError("M19: " ++ msg);
 }
@@ -9123,6 +9253,7 @@ test "M19: bash quotes candidates as shell literals" {
         .field = "c",
         .view_field = "_c",
         .name = "c d",
+        .synonym = null,
         .rank = 1,
         .Cmd = void,
     }};
@@ -9299,6 +9430,7 @@ test "M19: zsh quotes candidates and sanitizes descriptions" {
         .field = "c",
         .view_field = "_c",
         .name = "c d",
+        .synonym = null,
         .rank = 1,
         .Cmd = WeirdCmd,
     }};
@@ -9335,6 +9467,68 @@ test "M19: zsh candidate help pairs flags and commands" {
         m19Expect(run_level.len == 5, "run candidate count");
         m19Expect(std.mem.eql(u8, run_level[4].spelling, "go"), "command candidate");
         m19Expect(std.mem.eql(u8, run_level[4].help, "Go."), "command help text");
+    }
+}
+
+test "M19: command synonyms are completion candidates" {
+    comptime {
+        const levels = completionLevels(M19Synonym, &.{});
+        m19Expect(levels.len == 3, "synonym level count");
+
+        const cands = completionCandidates(levels[0]);
+        const want = [_]String{ "--help", "-h", "run", "go", "build-target", "b" };
+        m19Expect(cands.len == want.len, "candidate count");
+        for (want, cands) |w, c| m19Expect(std.mem.eql(u8, w, c), "candidate order");
+
+        const root = completionCandidateHelp(levels[0]);
+        m19Expect(root.len == want.len, "candidate help count");
+        m19Expect(std.mem.eql(u8, root[2].spelling, "run"), "primary name");
+        m19Expect(std.mem.eql(u8, root[3].spelling, "go"), "synonym");
+        m19Expect(std.mem.eql(u8, root[3].help, "Run."), "synonym help");
+        m19Expect(std.mem.eql(u8, root[5].spelling, "b"), "short synonym");
+        m19Expect(std.mem.eql(u8, root[5].help, "Build."), "short synonym help");
+    }
+}
+
+test "M19: bash descends through command synonyms" {
+    const script = try M19Synonym.completion(std.testing.allocator, "tool", .bash);
+    defer std.testing.allocator.free(script);
+
+    for ([_]String{
+        "            'run') level=1 ;;",
+        "            'go') level=1 ;;",
+        "            'build-target') level=2 ;;",
+        "            'b') level=2 ;;",
+    }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, script, arm) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, script, "'--help' '-h' 'run' 'go' 'build-target' 'b'") != null);
+}
+
+test "M19: zsh and fish offer command synonyms" {
+    const zsh = try M19Synonym.completion(std.testing.allocator, "tool", .zsh);
+    defer std.testing.allocator.free(zsh);
+    try std.testing.expect(std.mem.indexOf(u8, zsh, "\n        cands=('--help' '-h' 'run' 'go' 'build-target' 'b')\n") != null);
+    for ([_]String{
+        "            'run') level=1 ;;",
+        "            'go') level=1 ;;",
+        "            'build-target') level=2 ;;",
+        "            'b') level=2 ;;",
+    }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, zsh, arm) != null);
+    }
+
+    const fish = try M19Synonym.completion(std.testing.allocator, "tool", .fish);
+    defer std.testing.allocator.free(fish);
+    for ([_]String{
+        "printf '%s\\t%s\\n' 'run' 'Run.'",
+        "printf '%s\\t%s\\n' 'go' 'Run.'",
+        "printf '%s\\t%s\\n' 'build-target' 'Build.'",
+        "printf '%s\\t%s\\n' 'b' 'Build.'",
+        "            case 'go'\n                set level 1",
+        "            case 'b'\n                set level 2",
+    }) |arm| {
+        try std.testing.expect(std.mem.indexOf(u8, fish, arm) != null);
     }
 }
 
@@ -9480,6 +9674,7 @@ test "M19: fish quotes candidates and skips unrepresentable names" {
             .field = "c",
             .view_field = "_c",
             .name = "c d",
+            .synonym = null,
             .rank = 1,
             .Cmd = WeirdCmd,
         },
@@ -9487,6 +9682,7 @@ test "M19: fish quotes candidates and skips unrepresentable names" {
             .field = "bad",
             .view_field = "_bad",
             .name = "bad\ttab",
+            .synonym = null,
             .rank = 2,
             .Cmd = WeirdCmd,
         },
@@ -9494,6 +9690,7 @@ test "M19: fish quotes candidates and skips unrepresentable names" {
             .field = "bad2",
             .view_field = "_bad2",
             .name = "bad\nline",
+            .synonym = null,
             .rank = 3,
             .Cmd = WeirdCmd,
         },
