@@ -2289,6 +2289,316 @@ fn completionCommands(comptime level: CompletionLevel) []const CommandEntry {
     }
 }
 
+const CompletionEntryKind = enum { flag, argument, command };
+const CompletionEntryFamily = enum { normal, version, help };
+
+/// One row of the completion model: a flag, a command, or one argument value.
+/// `spelling` is the primary spelling (`--long`, command name, or value name);
+/// `alias` is the short flag or command synonym when the declaration has one.
+const CompletionEntry = struct {
+    spelling: String,
+    alias: ?String,
+    help: String,
+    kind: CompletionEntryKind,
+    family: CompletionEntryFamily,
+};
+
+/// Classify a primary spelling into the version/help tail. A lone `-h` or `-v`
+/// only reaches this with no long name, so `--verbose` with a `-v` alias stays
+/// normal.
+fn completionFamily(comptime spelling: String) CompletionEntryFamily {
+    if (std.mem.eql(u8, spelling, "--help") or
+        std.mem.eql(u8, spelling, "help") or
+        std.mem.eql(u8, spelling, "-h")) return .help;
+    if (std.mem.eql(u8, spelling, "--version") or
+        std.mem.eql(u8, spelling, "version") or
+        std.mem.eql(u8, spelling, "-v")) return .version;
+    return .normal;
+}
+
+/// Sort key: entries with help first, then the family partition (normal,
+/// version, help), then byte-wise spelling order.
+fn completionEntryLess(comptime a: CompletionEntry, comptime b: CompletionEntry) bool {
+    const a_help = a.help.len != 0;
+    const b_help = b.help.len != 0;
+    if (a_help != b_help) return a_help;
+    const a_family = @intFromEnum(a.family);
+    const b_family = @intFromEnum(b.family);
+    if (a_family != b_family) return a_family < b_family;
+    return std.mem.lessThan(u8, a.spelling, b.spelling);
+}
+
+/// Stable insertion sort, no `std.mem.sort` at comptime.
+fn completionSortedEntries(comptime raw: []const CompletionEntry) []const CompletionEntry {
+    comptime {
+        var out: []const CompletionEntry = &.{};
+        for (raw) |entry| {
+            var pos = out.len;
+            for (out, 0..) |prev, i| {
+                if (completionEntryLess(entry, prev)) {
+                    pos = i;
+                    break;
+                }
+            }
+            out = out[0..pos] ++ &[_]CompletionEntry{entry} ++ out[pos..];
+        }
+        return out;
+    }
+}
+
+/// ASCII-sorted, duplicate-free copy of `raw`.
+fn completionSortedStrings(comptime raw: []const String) []const String {
+    comptime {
+        var out: []const String = &.{};
+        for (raw) |s| {
+            var pos = out.len;
+            for (out, 0..) |prev, i| {
+                if (std.mem.lessThan(u8, s, prev)) {
+                    pos = i;
+                    break;
+                }
+            }
+            out = out[0..pos] ++ &[_]String{s} ++ out[pos..];
+        }
+        var deduped: []const String = &.{};
+        for (out) |s| {
+            if (deduped.len != 0 and std.mem.eql(u8, deduped[deduped.len - 1], s)) continue;
+            deduped = deduped ++ &[_]String{s};
+        }
+        return deduped;
+    }
+}
+
+/// Effective flag entries of `level`: one entry per flag, `--long` as primary
+/// and `-short` as alias when both exist.
+fn completionFlagEntries(comptime level: CompletionLevel) []const CompletionEntry {
+    comptime {
+        var entries: []const CompletionEntry = &.{};
+        for (level.flags) |s| {
+            const long: []const String = if (s.long.len == 0)
+                &.{}
+            else
+                &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
+            const short: []const String = if (s.short) |sh|
+                if (sh.len == 0) &.{} else &[_]String{std.fmt.comptimePrint("-{s}", .{sh})}
+            else
+                &.{};
+            const spelling = if (long.len != 0) long[0] else if (short.len != 0) short[0] else continue;
+            const alias: ?String = if (long.len != 0 and short.len != 0) short[0] else null;
+            entries = entries ++ &[_]CompletionEntry{.{
+                .spelling = spelling,
+                .alias = alias,
+                .help = s.help,
+                .kind = .flag,
+                .family = completionFamily(spelling),
+            }};
+        }
+        return completionSortedEntries(entries);
+    }
+}
+
+/// Command entries of `level`: reachable primary spelling, synonym as alias.
+fn completionCommandEntries(comptime level: CompletionLevel) []const CompletionEntry {
+    comptime {
+        var entries: []const CompletionEntry = &.{};
+        for (completionCommands(level)) |c| {
+            const spellings = completionCommandSpellings(c);
+            if (spellings.len == 0) continue;
+            entries = entries ++ &[_]CompletionEntry{.{
+                .spelling = spellings[0],
+                .alias = if (spellings.len == 2) spellings[1] else null,
+                .help = c.Cmd.cmd_meta.help,
+                .kind = .command,
+                .family = completionFamily(spellings[0]),
+            }};
+        }
+        return completionSortedEntries(entries);
+    }
+}
+
+/// Argument-value entries of positional slot `slot`: enumeration wire names,
+/// deduplicated, always in the normal family.
+fn completionArgumentEntries(comptime level: CompletionLevel, comptime slot: usize) []const CompletionEntry {
+    comptime {
+        if (slot >= level.arguments.len) return &.{};
+        const spec = level.arguments[slot];
+        var names: []const String = &.{};
+        for (enumWireNames(spec.vtype)) |name| {
+            var seen = false;
+            for (names) |prev| {
+                if (std.mem.eql(u8, prev, name)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) names = names ++ &[_]String{name};
+        }
+        var entries: []const CompletionEntry = &.{};
+        for (names) |name| {
+            entries = entries ++ &[_]CompletionEntry{.{
+                .spelling = name,
+                .alias = null,
+                .help = spec.help,
+                .kind = .argument,
+                .family = .normal,
+            }};
+        }
+        return completionSortedEntries(entries);
+    }
+}
+
+/// The level's flag and command entries, sorted and partitioned.
+fn completionEntries(comptime level: CompletionLevel) []const CompletionEntry {
+    comptime {
+        return completionSortedEntries(completionFlagEntries(level) ++ completionCommandEntries(level));
+    }
+}
+
+/// The level's flag and command entries plus slot `slot`'s argument values.
+fn completionEntriesWithSlot(comptime level: CompletionLevel, comptime slot: usize) []const CompletionEntry {
+    comptime {
+        return completionSortedEntries(completionEntries(level) ++ completionArgumentEntries(level, slot));
+    }
+}
+
+fn completionEntriesOfKind(
+    comptime entries: []const CompletionEntry,
+    comptime kind: CompletionEntryKind,
+) []const CompletionEntry {
+    comptime {
+        var out: []const CompletionEntry = &.{};
+        for (entries) |entry| {
+            if (entry.kind != kind) continue;
+            out = out ++ &[_]CompletionEntry{entry};
+        }
+        return out;
+    }
+}
+
+/// Expand entries into one description-free entry per spelling (bash does not
+/// merge pairs), sorted by the same key as rows.
+fn completionSpellingEntries(comptime entries: []const CompletionEntry) []const CompletionEntry {
+    comptime {
+        var expanded: []const CompletionEntry = &.{};
+        for (entries) |entry| {
+            const bare = CompletionEntry{
+                .spelling = entry.spelling,
+                .alias = null,
+                .help = entry.help,
+                .kind = entry.kind,
+                .family = entry.family,
+            };
+            expanded = expanded ++ &[_]CompletionEntry{bare};
+            if (entry.alias) |alias| {
+                expanded = expanded ++ &[_]CompletionEntry{.{
+                    .spelling = alias,
+                    .alias = null,
+                    .help = entry.help,
+                    .kind = entry.kind,
+                    .family = entry.family,
+                }};
+            }
+        }
+        return completionSortedEntries(expanded);
+    }
+}
+
+/// Every spelling a bash list contains, in final order.
+fn completionSpellings(comptime entries: []const CompletionEntry) []const String {
+    comptime {
+        var out: []const String = &.{};
+        for (completionSpellingEntries(entries)) |entry| out = out ++ &[_]String{entry.spelling};
+        return out;
+    }
+}
+
+/// All spellings of `level` (primary, alias, and every slot's values) in one
+/// ASCII order. Numeric row keys index into this table, so shell-side sorting
+/// never compares strings.
+fn completionSpellingUniverse(comptime level: CompletionLevel) []const String {
+    comptime {
+        var all: []const String = &.{};
+        for (completionEntries(level)) |entry| {
+            all = all ++ &[_]String{entry.spelling};
+            if (entry.alias) |alias| all = all ++ &[_]String{alias};
+        }
+        for (level.arguments, 0..) |_, slot| {
+            for (completionArgumentEntries(level, slot)) |entry| {
+                all = all ++ &[_]String{entry.spelling};
+            }
+        }
+        return completionSortedStrings(all);
+    }
+}
+
+fn completionSpellingRank(comptime universe: []const String, comptime spelling: String) usize {
+    for (universe, 0..) |s, i| {
+        if (std.mem.eql(u8, s, spelling)) return i;
+    }
+    unreachable;
+}
+
+fn completionEntryBucket(comptime entry: CompletionEntry) usize {
+    const no_help: usize = if (entry.help.len != 0) 0 else 1;
+    return no_help * 3 + @intFromEnum(entry.family);
+}
+
+fn completionEntryKey(
+    comptime entry: CompletionEntry,
+    comptime spelling: String,
+    comptime universe: []const String,
+) usize {
+    return completionEntryBucket(entry) * universe.len + completionSpellingRank(universe, spelling);
+}
+
+/// One row of a zsh/fish static table: the entry, the positional slot that
+/// owns it (`-1` for flags and commands), and the numeric keys for its primary
+/// and alias spellings.
+const CompletionRow = struct {
+    entry: CompletionEntry,
+    slot: isize,
+    key_primary: usize,
+    key_alias: ?usize,
+};
+
+/// Flag, command, and every slot's argument rows, ordered by primary key.
+fn completionRows(comptime level: CompletionLevel) []const CompletionRow {
+    comptime {
+        const universe = completionSpellingUniverse(level);
+        var rows: []const CompletionRow = &.{};
+        for (completionEntries(level)) |entry| {
+            rows = rows ++ &[_]CompletionRow{.{
+                .entry = entry,
+                .slot = -1,
+                .key_primary = completionEntryKey(entry, entry.spelling, universe),
+                .key_alias = if (entry.alias) |alias| completionEntryKey(entry, alias, universe) else null,
+            }};
+        }
+        for (level.arguments, 0..) |_, slot| {
+            for (completionArgumentEntries(level, slot)) |entry| {
+                rows = rows ++ &[_]CompletionRow{.{
+                    .entry = entry,
+                    .slot = @intCast(slot),
+                    .key_primary = completionEntryKey(entry, entry.spelling, universe),
+                    .key_alias = null,
+                }};
+            }
+        }
+        var sorted: []const CompletionRow = &.{};
+        for (rows) |row| {
+            var pos = sorted.len;
+            for (sorted, 0..) |prev, i| {
+                if (row.key_primary < prev.key_primary) {
+                    pos = i;
+                    break;
+                }
+            }
+            sorted = sorted[0..pos] ++ &[_]CompletionRow{row} ++ sorted[pos..];
+        }
+        return sorted;
+    }
+}
+
 /// Effective flag candidate spellings of `level`: `--long`, then `-short`
 /// immediately after it, in effective order.
 fn completionFlagCandidates(comptime level: CompletionLevel) []const String {
@@ -2320,10 +2630,13 @@ fn completionCandidates(comptime level: CompletionLevel) []const String {
 }
 
 /// Enumeration wire names of `T` prefixed by `prefix`, for inline value forms.
+/// Value positions are ASCII-sorted and never tail-partitioned.
 fn enumSpellings(comptime T: type, comptime prefix: String) []const String {
     comptime {
         var out: []const String = &.{};
-        for (enumWireNames(T)) |name| out = out ++ &[_]String{prefix ++ name};
+        for (completionSortedStrings(enumWireNames(T))) |name| {
+            out = out ++ &[_]String{prefix ++ name};
+        }
         return out;
     }
 }
@@ -2369,12 +2682,12 @@ fn completionCandidateHelp(comptime level: CompletionLevel) []const CompletionCa
 }
 
 /// Enumeration values of `T` prefixed by `prefix`, as description-free
-/// candidates. `prefix` is empty for bare values and carries the flag spelling
-/// plus `=` for inline forms.
+/// candidates in ASCII order. `prefix` is empty for bare values and carries the
+/// flag spelling plus `=` for inline forms.
 fn enumCandidates(comptime T: type, comptime prefix: String) []const CompletionCandidate {
     comptime {
         var cands: []const CompletionCandidate = &.{};
-        for (enumWireNames(T)) |name| {
+        for (completionSortedStrings(enumWireNames(T))) |name| {
             cands = cands ++ &[_]CompletionCandidate{.{
                 .spelling = prefix ++ name,
                 .help = "",
@@ -10387,4 +10700,255 @@ test "M19: fish golden" {
         \\
     ;
     try std.testing.expectEqualStrings(want, script);
+}
+
+// ---------------------------------------------------------------------------
+// M20: completion entry model, ordering, and phases.
+// ---------------------------------------------------------------------------
+
+const M20Kind = Enumeration(.{
+    .beta = Enum{},
+    .alpha = Enum{},
+});
+
+const M20Def = .{
+    .description = Flag([]const u8){ .short = "d", .help = "Description." },
+    .version = Flag(bool){ .default = Default(bool){ .direct = false } },
+    .mode = Flag(M20Kind){
+        .long = "mode",
+        .default = Default(M20Kind){ .direct = .{} },
+        .help = "Mode.",
+    },
+    .pick = Command(.{ .synonym = "p", .help = "Pick." }, .{
+        .kind = Argument(M20Kind){ .help = "Kind." },
+        .verbose = Flag(bool){
+            .short = "v",
+            .default = Default(bool){ .direct = false },
+            .help = "Verbose.",
+        },
+    }),
+    .quiet = Command(.{ .help = "" }, .{}),
+};
+
+const M20 = generate(App{ .name = "m20", .help = "M20 root." }, M20Def);
+
+fn m20Expect(comptime ok: bool, comptime msg: []const u8) void {
+    if (!ok) @compileError("M20: " ++ msg);
+}
+
+fn m20Spec(
+    comptime name: String,
+    comptime long: String,
+    comptime short: ?String,
+    comptime help: String,
+) Spec {
+    return .{
+        .name = name,
+        .kind = .flag,
+        .vtype = bool,
+        .long = long,
+        .short = short,
+        .required = false,
+        .default = null,
+        .default_env = null,
+        .validation = null,
+        .help = help,
+        .i18n = null,
+        .group = null,
+    };
+}
+
+fn m20Level(
+    comptime flags: []const Spec,
+    comptime arguments: []const Spec,
+    comptime commands: []const CommandEntry,
+) CompletionLevel {
+    return .{
+        .rank = 0,
+        .path = "manual",
+        .flags = flags,
+        .arguments = arguments,
+        .commands = commands,
+    };
+}
+
+test "M20: entry building pairs and families" {
+    comptime {
+        const levels = completionLevels(M20, &.{});
+        const root = completionEntries(levels[0]);
+        m20Expect(root.len == 6, "root entry count");
+
+        const want = [_]String{ "--description", "--mode", "pick", "--help", "quiet", "--version" };
+        for (want, root) |w, e| m20Expect(std.mem.eql(u8, w, e.spelling), "root entry order");
+
+        m20Expect(root[0].alias != null and std.mem.eql(u8, root[0].alias.?, "-d"), "flag alias");
+        m20Expect(root[1].alias == null, "lone long flag");
+        m20Expect(root[2].alias != null and std.mem.eql(u8, root[2].alias.?, "p"), "command synonym");
+        m20Expect(root[3].alias != null and std.mem.eql(u8, root[3].alias.?, "-h"), "builtin help alias");
+        m20Expect(root[5].alias == null, "lone version");
+
+        m20Expect(root[0].kind == .flag, "flag kind");
+        m20Expect(root[2].kind == .command, "command kind");
+        m20Expect(root[0].family == .normal, "normal family");
+        m20Expect(root[3].family == .help, "help family");
+        m20Expect(root[5].family == .version, "version family");
+
+        m20Expect(std.mem.eql(u8, root[0].help, "Description."), "flag help");
+        m20Expect(std.mem.eql(u8, root[2].help, "Pick."), "command help");
+        m20Expect(root[4].help.len == 0, "empty command help");
+        m20Expect(root[5].help.len == 0, "empty version help");
+    }
+}
+
+test "M20: empty help sorts to the bottom" {
+    comptime {
+        const levels = completionLevels(M20, &.{});
+        const rows = completionRows(levels[0]);
+
+        const want = [_]String{ "--description", "--mode", "pick", "--help", "quiet", "--version" };
+        for (want, rows) |w, r| m20Expect(std.mem.eql(u8, w, r.entry.spelling), "help-presence order");
+
+        // All help-carrying rows precede every empty-help row, and the empty
+        // help group keeps the normal < version < help tail.
+        m20Expect(rows[3].entry.family == .help, "help row first of its group");
+        m20Expect(rows[4].entry.help.len == 0 and rows[4].entry.family == .normal, "empty normal row");
+        m20Expect(rows[5].entry.help.len == 0 and rows[5].entry.family == .version, "empty version row last");
+    }
+}
+
+test "M20: numeric keys follow help presence, family, spelling" {
+    comptime {
+        const levels = completionLevels(M20, &.{});
+        const rows = completionRows(levels[0]);
+        m20Expect(rows[0].key_primary == 0 and rows[0].key_alias.? == 4, "description keys");
+        m20Expect(rows[1].key_primary == 2, "mode key");
+        m20Expect(rows[2].key_primary == 7 and rows[2].key_alias.? == 6, "pick keys");
+        m20Expect(rows[3].key_primary == 19 and rows[3].key_alias.? == 23, "help keys");
+        m20Expect(rows[4].key_primary == 35, "quiet key");
+        m20Expect(rows[5].key_primary == 39, "version key");
+        for (rows) |row| m20Expect(row.slot == -1, "non-argument slot");
+    }
+}
+
+test "M20: argument entries are sorted, deduplicated values" {
+    comptime {
+        const levels = completionLevels(M20, &.{});
+        const pick = levels[1];
+        m20Expect(pick.arguments.len == 1, "pick argument count");
+
+        const values = completionArgumentEntries(pick, 0);
+        m20Expect(values.len == 2, "value count");
+        m20Expect(std.mem.eql(u8, values[0].spelling, "alpha"), "values sorted");
+        m20Expect(std.mem.eql(u8, values[1].spelling, "beta"), "second value");
+        m20Expect(values[0].kind == .argument, "argument kind");
+        m20Expect(values[0].family == .normal, "argument family");
+        m20Expect(values[0].alias == null, "argument alias");
+        m20Expect(std.mem.eql(u8, values[0].help, "Kind."), "argument help");
+        m20Expect(completionArgumentEntries(pick, 1).len == 0, "out of range slot");
+
+        const Dup = struct {
+            pub const EnumView = enum { a, b };
+            pub const names = [_]String{ "b", "a", "b" };
+        };
+        const dup_args = [_]Spec{.{
+            .name = "x",
+            .kind = .argument,
+            .vtype = Dup,
+            .long = "",
+            .short = null,
+            .required = true,
+            .default = null,
+            .default_env = null,
+            .validation = null,
+            .help = "",
+            .i18n = null,
+            .group = null,
+        }};
+        const dup_level = m20Level(&.{}, &dup_args, &.{});
+        const dup_values = completionArgumentEntries(dup_level, 0);
+        m20Expect(dup_values.len == 2, "dedupe by spelling");
+        m20Expect(std.mem.eql(u8, dup_values[0].spelling, "a"), "dedupe order");
+        m20Expect(std.mem.eql(u8, dup_values[1].spelling, "b"), "dedupe second");
+    }
+}
+
+test "M20: entries with the current slot" {
+    comptime {
+        const levels = completionLevels(M20, &.{});
+        const pick = levels[1];
+        const with_slot = completionEntriesWithSlot(pick, 0);
+
+        const want = [_]String{ "--description", "--mode", "--verbose", "alpha", "beta", "--help", "--version" };
+        m20Expect(with_slot.len == want.len, "union size");
+        for (want, with_slot) |w, e| m20Expect(std.mem.eql(u8, w, e.spelling), "union order");
+        m20Expect(completionEntriesOfKind(with_slot, .argument).len == 2, "argument kind filter");
+        m20Expect(completionEntriesOfKind(completionEntries(pick), .command).len == 0, "no commands");
+        m20Expect(completionEntriesOfKind(completionEntries(levels[0]), .command).len == 2, "two commands");
+    }
+}
+
+test "M20: bash spelling expansion sorts each spelling" {
+    comptime {
+        const levels = completionLevels(M20, &.{});
+        const root = completionEntries(levels[0]);
+
+        const flags = completionSpellings(completionEntriesOfKind(root, .flag));
+        const want_flags = [_]String{ "--description", "--mode", "-d", "--help", "-h", "--version" };
+        m20Expect(flags.len == want_flags.len, "flag spelling count");
+        for (want_flags, flags) |w, s| m20Expect(std.mem.eql(u8, w, s), "flag spelling order");
+
+        const all = completionSpellings(root);
+        const want_all = [_]String{ "--description", "--mode", "-d", "p", "pick", "--help", "-h", "quiet", "--version" };
+        m20Expect(all.len == want_all.len, "all spelling count");
+        for (want_all, all) |w, s| m20Expect(std.mem.eql(u8, w, s), "all spelling order");
+    }
+}
+
+test "M20: value positions stay ASCII sorted and unpartitioned" {
+    comptime {
+        const values = enumCandidates(M20Kind, "");
+        m20Expect(values.len == 2, "value count");
+        m20Expect(std.mem.eql(u8, values[0].spelling, "alpha"), "value order");
+        m20Expect(std.mem.eql(u8, values[1].spelling, "beta"), "value second");
+        for (values) |v| m20Expect(v.help.len == 0, "value help empty");
+
+        const inline_values = enumSpellings(M20Kind, "--kind=");
+        m20Expect(std.mem.eql(u8, inline_values[0], "--kind=alpha"), "inline order");
+        m20Expect(std.mem.eql(u8, inline_values[1], "--kind=beta"), "inline second");
+    }
+}
+
+test "M20: family classification uses the primary spelling" {
+    comptime {
+        const lone_help = [_]Spec{m20Spec("h", "", "h", "")};
+        const lone_version = [_]Spec{m20Spec("v", "", "v", "")};
+        const verbose = [_]Spec{m20Spec("verbose", "verbose", "v", "Verbose.")};
+        const help_flag = [_]Spec{m20Spec("help", "help", null, "Help.")};
+        const version_flag = [_]Spec{m20Spec("ver", "version", null, "")};
+
+        const lone_help_entries = completionEntries(m20Level(&lone_help, &.{}, &.{}));
+        m20Expect(lone_help_entries[0].family == .help, "lone -h is help");
+        const lone_version_entries = completionEntries(m20Level(&lone_version, &.{}, &.{}));
+        m20Expect(lone_version_entries[0].family == .version, "lone -v is version");
+        const verbose_entries = completionEntries(m20Level(&verbose, &.{}, &.{}));
+        m20Expect(verbose_entries[0].family == .normal, "--verbose with -v is normal");
+        const help_entries = completionEntries(m20Level(&help_flag, &.{}, &.{}));
+        m20Expect(help_entries[0].family == .help, "--help is help");
+        const version_entries = completionEntries(m20Level(&version_flag, &.{}, &.{}));
+        m20Expect(version_entries[0].family == .version, "--version is version");
+
+        const HelpCmd = struct {
+            pub const cmd_meta = CommandMeta{ .help = "Help." };
+        };
+        const cmds = [_]CommandEntry{.{
+            .field = "help",
+            .view_field = "_help",
+            .name = "help",
+            .synonym = null,
+            .rank = 1,
+            .Cmd = HelpCmd,
+        }};
+        const command_entries = completionEntries(m20Level(&.{}, &.{}, &cmds));
+        m20Expect(command_entries[0].family == .help, "command named help");
+    }
 }
