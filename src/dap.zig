@@ -2322,8 +2322,8 @@ fn completionEntryLess(comptime a: CompletionEntry, comptime b: CompletionEntry)
     const a_help = a.help.len != 0;
     const b_help = b.help.len != 0;
     if (a_help != b_help) return a_help;
-    const a_family = @intFromEnum(a.family);
-    const b_family = @intFromEnum(b.family);
+    const a_family = @backingInt(a.family);
+    const b_family = @backingInt(b.family);
     if (a_family != b_family) return a_family < b_family;
     return std.mem.lessThan(u8, a.spelling, b.spelling);
 }
@@ -2540,7 +2540,7 @@ fn completionSpellingRank(comptime universe: []const String, comptime spelling: 
 
 fn completionEntryBucket(comptime entry: CompletionEntry) usize {
     const no_help: usize = if (entry.help.len != 0) 0 else 1;
-    return no_help * 3 + @intFromEnum(entry.family);
+    return no_help * 3 + @backingInt(entry.family);
 }
 
 fn completionEntryKey(
@@ -2596,36 +2596,6 @@ fn completionRows(comptime level: CompletionLevel) []const CompletionRow {
             sorted = sorted[0..pos] ++ &[_]CompletionRow{row} ++ sorted[pos..];
         }
         return sorted;
-    }
-}
-
-/// Effective flag candidate spellings of `level`: `--long`, then `-short`
-/// immediately after it, in effective order.
-fn completionFlagCandidates(comptime level: CompletionLevel) []const String {
-    comptime {
-        var cands: []const String = &.{};
-        for (level.flags) |s| {
-            if (s.long.len != 0) {
-                cands = cands ++ &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
-            }
-            if (s.short) |sh| {
-                if (sh.len != 0) {
-                    cands = cands ++ &[_]String{std.fmt.comptimePrint("-{s}", .{sh})};
-                }
-            }
-        }
-        return cands;
-    }
-}
-
-/// Ordinary candidates of `level`: effective flags, then its own commands.
-fn completionCandidates(comptime level: CompletionLevel) []const String {
-    comptime {
-        var cands: []const String = completionFlagCandidates(level);
-        for (completionCommands(level)) |c| {
-            for (completionCommandSpellings(c)) |spelling| cands = cands ++ &[_]String{spelling};
-        }
-        return cands;
     }
 }
 
@@ -2860,7 +2830,7 @@ fn emitBash(
 
     try appendBashFnName(&out, allocator, ident, "() {\n");
     try out.appendSlice(allocator,
-        \\    local cur prev level=0 literal=0
+        \\    local cur prev level=0 pos=0 literal=0
         \\    local vflag= vform=bare
         \\    local i tok end
         \\    COMPREPLY=()
@@ -2901,6 +2871,7 @@ fn emitBash(
         \\            i=$((i + 1))
         \\            continue
         \\        fi
+        \\        pos=$((pos + 1))
         \\        case "$level" in
         \\
     );
@@ -2913,7 +2884,7 @@ fn emitBash(
                 inline for (comptime completionCommandSpellings(c)) |spelling| {
                     try out.appendSlice(allocator, "            ");
                     try appendQuoted(&out, allocator, spelling, .posix);
-                    try out.print(allocator, ") level={} ;;\n", .{c.rank});
+                    try out.print(allocator, ") level={} pos=0 ;;\n", .{c.rank});
                 }
             }
             try out.appendSlice(allocator, "            esac\n");
@@ -2949,7 +2920,9 @@ fn emitBash(
     );
     inline for (levels) |level| {
         const arms = comptime completionValueArms(level);
-        const cands = comptime completionCandidates(level);
+        const entries = comptime completionEntries(level);
+        const flags = comptime completionEntriesOfKind(entries, .flag);
+        const commands = comptime completionEntriesOfKind(entries, .command);
         try out.print(allocator, "    {})\n", .{level.rank});
         try appendLevelMarker(&out, allocator, level);
         if (arms.len != 0) {
@@ -2980,9 +2953,47 @@ fn emitBash(
             }
             try out.appendSlice(allocator, "        esac\n");
         }
-        try out.appendSlice(allocator, "        ");
-        try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", cands);
-        try out.appendSlice(allocator, "\n        ;;\n");
+        if (commands.len != 0) {
+            try out.appendSlice(allocator, "        if [[ -z $cur ]]; then\n            ");
+            try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(commands));
+            try out.appendSlice(allocator, "\n        else\n            ");
+            try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(entries));
+            try out.appendSlice(allocator, "\n        fi\n");
+        } else if (level.arguments.len != 0) {
+            try out.appendSlice(allocator, "        if [[ -z $cur ]]; then\n            case \"$pos\" in\n");
+            inline for (0..level.arguments.len) |slot| {
+                const values = comptime completionArgumentEntries(level, slot);
+                try out.print(allocator, "            {}) ", .{slot});
+                if (values.len == 0) {
+                    try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(flags));
+                } else {
+                    try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(values));
+                }
+                try out.appendSlice(allocator, " ;;\n");
+            }
+            try out.appendSlice(allocator, "            *) ");
+            try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(flags));
+            try out.appendSlice(allocator, " ;;\n            esac\n        else\n            case \"$pos\" in\n");
+            inline for (0..level.arguments.len) |slot| {
+                try out.print(allocator, "            {}) ", .{slot});
+                try appendBashFilterCall(
+                    &out,
+                    allocator,
+                    ident,
+                    "\"$cur\"",
+                    comptime completionSpellings(completionEntriesWithSlot(level, slot)),
+                );
+                try out.appendSlice(allocator, " ;;\n");
+            }
+            try out.appendSlice(allocator, "            *) ");
+            try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(entries));
+            try out.appendSlice(allocator, " ;;\n            esac\n        fi\n");
+        } else {
+            try out.appendSlice(allocator, "        ");
+            try appendBashFilterCall(&out, allocator, ident, "\"$cur\"", comptime completionSpellings(entries));
+            try out.appendSlice(allocator, "\n");
+        }
+        try out.appendSlice(allocator, "        ;;\n");
     }
     try out.appendSlice(allocator,
         \\    esac
@@ -9434,15 +9445,43 @@ test "M19: bash candidates by level" {
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
-    try std.testing.expect(std.mem.indexOf(u8, root, "\n        _dap_tool_filter \"$cur\" '--help' '-h' '--verbose' '--mode' 'run'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root,
+        \\        if [[ -z $cur ]]; then
+        \\            _dap_tool_filter "$cur" 'run'
+        \\        else
+        \\            _dap_tool_filter "$cur" '--mode' '--verbose' 'run' '--help' '-h'
+        \\        fi
+        \\
+    ) != null);
 
     const run_level = m19LevelBlock(script, 1);
-    try std.testing.expect(std.mem.indexOf(u8, run_level, "\n        _dap_tool_filter \"$cur\" '--help' '-h' '--verbose' '--mode' 'go'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run_level,
+        \\        if [[ -z $cur ]]; then
+        \\            _dap_tool_filter "$cur" 'go'
+        \\        else
+        \\            _dap_tool_filter "$cur" '--mode' '--verbose' 'go' '--help' '-h'
+        \\        fi
+        \\
+    ) != null);
     // A sibling's commands are not offered after a handoff.
     try std.testing.expect(std.mem.indexOf(u8, run_level, "'run'") == null);
 
     const go_level = m19LevelBlock(script, 2);
-    try std.testing.expect(std.mem.indexOf(u8, go_level, "\n        _dap_tool_filter \"$cur\" '--help' '-h' '--verbose' '--mode'\n") != null);
+    const go_want =
+        \\        if [[ -z $cur ]]; then
+        \\            case "$pos" in
+        \\            0) _dap_tool_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            *) _dap_tool_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            esac
+        \\        else
+        \\            case "$pos" in
+        \\            0) _dap_tool_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            *) _dap_tool_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            esac
+        \\        fi
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, go_level, go_want) != null);
     try std.testing.expect(std.mem.indexOf(u8, go_level, "'go'") == null);
 }
 
@@ -9562,13 +9601,16 @@ test "M19: bash quotes candidates as shell literals" {
         .i18n = null,
         .group = null,
     }};
+    const WeirdCmd = struct {
+        pub const cmd_meta = CommandMeta{ .help = "Cmd 'help'." };
+    };
     const weird_commands = [_]CommandEntry{.{
         .field = "c",
         .view_field = "_c",
         .name = "c d",
         .synonym = null,
         .rank = 1,
-        .Cmd = void,
+        .Cmd = WeirdCmd,
     }};
     const weird_levels = [_]CompletionLevel{.{
         .rank = 0,
@@ -9581,7 +9623,15 @@ test "M19: bash quotes candidates as shell literals" {
     const script = try emitBash(std.testing.allocator, &weird_levels, "weird", "app");
     defer std.testing.allocator.free(script);
 
-    try std.testing.expect(std.mem.indexOf(u8, script, "_dap_weird_filter \"$cur\" '--a'\\''b' '-x y' 'c d'\n") != null);
+    const want =
+        \\        if [[ -z $cur ]]; then
+        \\            _dap_weird_filter "$cur" 'c d'
+        \\        else
+        \\            _dap_weird_filter "$cur" 'c d' '--a'\''b' '-x y'
+        \\        fi
+        \\
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, script, want) != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "# dap: level 0 weird root\n") != null);
 }
 
@@ -9788,18 +9838,20 @@ test "M19: command synonyms are completion candidates" {
         const levels = completionLevels(M19Synonym, &.{});
         m19Expect(levels.len == 3, "synonym level count");
 
-        const cands = completionCandidates(levels[0]);
-        const want = [_]String{ "--help", "-h", "run", "go", "build-target", "b" };
-        m19Expect(cands.len == want.len, "candidate count");
-        for (want, cands) |w, c| m19Expect(std.mem.eql(u8, w, c), "candidate order");
+        const entries = completionEntries(levels[0]);
+        m19Expect(entries.len == 3, "entry count");
+        m19Expect(std.mem.eql(u8, entries[0].spelling, "build-target"), "primary name order");
+        m19Expect(std.mem.eql(u8, entries[0].alias.?, "b"), "short synonym");
+        m19Expect(std.mem.eql(u8, entries[0].help, "Build."), "short synonym help");
+        m19Expect(std.mem.eql(u8, entries[1].spelling, "run"), "primary command");
+        m19Expect(std.mem.eql(u8, entries[1].alias.?, "go"), "synonym");
+        m19Expect(std.mem.eql(u8, entries[1].help, "Run."), "synonym help");
+        m19Expect(entries[2].family == .help, "builtin help family");
 
-        const root = completionCandidateHelp(levels[0]);
-        m19Expect(root.len == want.len, "candidate help count");
-        m19Expect(std.mem.eql(u8, root[2].spelling, "run"), "primary name");
-        m19Expect(std.mem.eql(u8, root[3].spelling, "go"), "synonym");
-        m19Expect(std.mem.eql(u8, root[3].help, "Run."), "synonym help");
-        m19Expect(std.mem.eql(u8, root[5].spelling, "b"), "short synonym");
-        m19Expect(std.mem.eql(u8, root[5].help, "Build."), "short synonym help");
+        const spellings = completionSpellings(entries);
+        const want = [_]String{ "b", "build-target", "go", "run", "--help", "-h" };
+        m19Expect(spellings.len == want.len, "spelling count");
+        for (want, spellings) |w, s| m19Expect(std.mem.eql(u8, w, s), "spelling order");
     }
 }
 
@@ -9808,14 +9860,14 @@ test "M19: bash descends through command synonyms" {
     defer std.testing.allocator.free(script);
 
     for ([_]String{
-        "            'run') level=1 ;;",
-        "            'go') level=1 ;;",
-        "            'build-target') level=2 ;;",
-        "            'b') level=2 ;;",
+        "            'run') level=1 pos=0 ;;",
+        "            'go') level=1 pos=0 ;;",
+        "            'build-target') level=2 pos=0 ;;",
+        "            'b') level=2 pos=0 ;;",
     }) |arm| {
         try std.testing.expect(std.mem.indexOf(u8, script, arm) != null);
     }
-    try std.testing.expect(std.mem.indexOf(u8, script, "'--help' '-h' 'run' 'go' 'build-target' 'b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "'b' 'build-target' 'go' 'run' '--help' '-h'") != null);
 }
 
 test "M19: zsh and fish offer command synonyms" {
@@ -10060,7 +10112,7 @@ test "M19: short enum spelling" {
         \\
     ;
     try std.testing.expect(std.mem.indexOf(u8, bash_root, bash_want) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bash_root, "_dap_tool_filter \"$cur\" '--help' '-h' '--level' '-l'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_root, "_dap_tool_filter \"$cur\" '--level' '-l' '--help' '-h'\n") != null);
     // Both spellings skip a following value word.
     const bash_helper_at = std.mem.indexOf(u8, bash, "_dap_tool_value_flag() {\n") orelse
         return error.TestUnexpectedResult;
@@ -10257,7 +10309,7 @@ test "M19: bash golden" {
         \\}
         \\
         \\_dap_m19() {
-        \\    local cur prev level=0 literal=0
+        \\    local cur prev level=0 pos=0 literal=0
         \\    local vflag= vform=bare
         \\    local i tok end
         \\    COMPREPLY=()
@@ -10295,15 +10347,16 @@ test "M19: bash golden" {
         \\            i=$((i + 1))
         \\            continue
         \\        fi
+        \\        pos=$((pos + 1))
         \\        case "$level" in
         \\        0)
         \\            case "$tok" in
-        \\            'run') level=1 ;;
+        \\            'run') level=1 pos=0 ;;
         \\            esac
         \\            ;;
         \\        1)
         \\            case "$tok" in
-        \\            'go') level=2 ;;
+        \\            'go') level=2 pos=0 ;;
         \\            esac
         \\            ;;
         \\        2)
@@ -10338,7 +10391,11 @@ test "M19: bash golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        _dap_m19_filter "$cur" '--help' '-h' '--verbose' '--mode' 'run'
+        \\        if [[ -z $cur ]]; then
+        \\            _dap_m19_filter "$cur" 'run'
+        \\        else
+        \\            _dap_m19_filter "$cur" '--mode' '--verbose' 'run' '--help' '-h'
+        \\        fi
         \\        ;;
         \\    1)
         \\# dap: level 1 m19 run
@@ -10352,7 +10409,11 @@ test "M19: bash golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        _dap_m19_filter "$cur" '--help' '-h' '--verbose' '--mode' 'go'
+        \\        if [[ -z $cur ]]; then
+        \\            _dap_m19_filter "$cur" 'go'
+        \\        else
+        \\            _dap_m19_filter "$cur" '--mode' '--verbose' 'go' '--help' '-h'
+        \\        fi
         \\        ;;
         \\    2)
         \\# dap: level 2 m19 run go
@@ -10366,7 +10427,17 @@ test "M19: bash golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        _dap_m19_filter "$cur" '--help' '-h' '--verbose' '--mode'
+        \\        if [[ -z $cur ]]; then
+        \\            case "$pos" in
+        \\            0) _dap_m19_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            *) _dap_m19_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            esac
+        \\        else
+        \\            case "$pos" in
+        \\            0) _dap_m19_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            *) _dap_m19_filter "$cur" '--mode' '--verbose' '--help' '-h' ;;
+        \\            esac
+        \\        fi
         \\        ;;
         \\    esac
         \\}
