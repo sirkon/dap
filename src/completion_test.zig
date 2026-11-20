@@ -22,10 +22,16 @@ const CLI = dap.generate(dap.App{
     .help = "Completion integration test.",
 }, .{
     .verbose = dap.Flag(bool){ .help = "Verbose." },
+    .description = dap.Flag(dap.String){ .short = "d", .help = "Description of context." },
+    .version = dap.Flag(bool){ .default = dap.Default(bool){ .direct = false } },
     .color = dap.Flag(Mode){ .long = "color", .help = "Color." },
     .config = dap.Flag(dap.String){ .long = "config", .help = "Config." },
     .run = dap.Command(.{ .help = "Run." }, .{
         .deep = dap.Command(.{ .help = "Deep." }, .{}),
+    }),
+    .pick = dap.Command(.{ .synonym = "p", .help = "Pick." }, .{
+        .kind = dap.Argument(Mode){ .help = "Kind." },
+        .note = dap.Flag(dap.String){ .long = "note", .help = "Note." },
     }),
 });
 
@@ -109,13 +115,71 @@ fn expectCandidateSet(
     }
 }
 
-fn bashExpect(
+/// Compares `got` (newline-separated) with `want` in order.
+fn expectLinesExact(
+    allocator: std.mem.Allocator,
+    comptime label: []const u8,
+    got: []const u8,
+    want: []const []const u8,
+) !void {
+    var got_list: std.ArrayList([]const u8) = .empty;
+    defer got_list.deinit(allocator);
+
+    const trimmed = std.mem.trimEnd(u8, got, "\r\n");
+    if (trimmed.len != 0) {
+        var lines = std.mem.splitScalar(u8, trimmed, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try got_list.append(allocator, line);
+        }
+    }
+
+    try std.testing.expectEqual(want.len, got_list.items.len);
+    for (want, got_list.items) |want_item, got_item| {
+        std.testing.expectEqualStrings(want_item, got_item) catch |err| {
+            std.debug.print("completion-test: case '{s}' mismatch\n", .{label});
+            return err;
+        };
+    }
+}
+
+fn zshExpectDisplays(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    words: []const u8,
+    want: []const []const u8,
+) !void {
+    const code = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\compdef() {{ :; }}
+        \\compadd() {{
+        \\    local d
+        \\    for d in "${{displays[@]}}"; do print -r -- "$d"; done
+        \\}}
+        \\source ../dap_completion_test.zsh
+        \\words=({s})
+        \\CURRENT=${{#words}}
+        \\PREFIX=${{words[CURRENT]}}
+        \\_dap_completion_test
+    ,
+        .{words},
+    );
+    defer std.testing.allocator.free(code);
+
+    const maybe = try runShell(cwd, &.{ "zsh", "-f", "-c", code });
+    const res = maybe orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess(label, res);
+    try expectLinesExact(std.testing.allocator, label, res.stdout, want);
+}
+
+fn bashComplete(
     cwd: std.Io.Dir,
     comptime label: []const u8,
     words: []const u8,
     cword: u8,
-    want: []const []const u8,
-) !void {
+) !?[]u8 {
     const code = try std.fmt.allocPrint(
         std.testing.allocator,
         \\. ../dap_completion_test.bash
@@ -131,19 +195,38 @@ fn bashExpect(
     defer std.testing.allocator.free(code);
 
     const maybe = try runShell(cwd, &.{ "bash", "-c", code });
-    const res = maybe orelse return error.SkipZigTest;
+    const res = maybe orelse return null;
     defer std.testing.allocator.free(res.stdout);
     defer std.testing.allocator.free(res.stderr);
     try expectSuccess(label, res);
-    try expectCandidateSet(std.testing.allocator, label, res.stdout, want);
+    return try std.testing.allocator.dupe(u8, res.stdout);
 }
 
-fn fishExpect(
+fn bashExpect(
     cwd: std.Io.Dir,
     comptime label: []const u8,
-    line: []const u8,
+    words: []const u8,
+    cword: u8,
     want: []const []const u8,
 ) !void {
+    const got = try bashComplete(cwd, label, words, cword) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(got);
+    try expectCandidateSet(std.testing.allocator, label, got, want);
+}
+
+fn bashExpectOrder(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    words: []const u8,
+    cword: u8,
+    want: []const []const u8,
+) !void {
+    const got = try bashComplete(cwd, label, words, cword) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(got);
+    try expectLinesExact(std.testing.allocator, label, got, want);
+}
+
+fn fishComplete(cwd: std.Io.Dir, comptime label: []const u8, line: []const u8) !?[]u8 {
     const code = try std.fmt.allocPrint(
         std.testing.allocator,
         "source ../dap_completion_test.fish; complete -C '{s}'",
@@ -152,14 +235,25 @@ fn fishExpect(
     defer std.testing.allocator.free(code);
 
     const maybe = try runShell(cwd, &.{ "fish", "--no-config", "-c", code });
-    const res = maybe orelse return error.SkipZigTest;
+    const res = maybe orelse return null;
     defer std.testing.allocator.free(res.stdout);
     defer std.testing.allocator.free(res.stderr);
     try expectSuccess(label, res);
+    return try std.testing.allocator.dupe(u8, res.stdout);
+}
+
+fn fishExpect(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    line: []const u8,
+    want: []const []const u8,
+) !void {
+    const got = try fishComplete(cwd, label, line) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(got);
 
     var candidates: std.ArrayList(u8) = .empty;
     defer candidates.deinit(std.testing.allocator);
-    const trimmed = std.mem.trimEnd(u8, res.stdout, "\r\n");
+    const trimmed = std.mem.trimEnd(u8, got, "\r\n");
     if (trimmed.len != 0) {
         var lines = std.mem.splitScalar(u8, trimmed, '\n');
         while (lines.next()) |line_text| {
@@ -174,6 +268,17 @@ fn fishExpect(
     }
 
     try expectCandidateSet(std.testing.allocator, label, candidates.items, want);
+}
+
+fn fishExpectLines(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    line: []const u8,
+    want: []const []const u8,
+) !void {
+    const got = try fishComplete(cwd, label, line) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(got);
+    try expectLinesExact(std.testing.allocator, label, got, want);
 }
 
 test "completion integration: registration uses app_name" {
@@ -205,7 +310,7 @@ test "completion integration: registration uses app_name" {
                 try std.testing.expect(std.mem.endsWith(
                     u8,
                     script,
-                    "complete -c 'dap-completion-test' -a '(__dap_dap_completion_test_complete)'\n",
+                    "complete -c 'dap-completion-test' -a '(__dap_dap_completion_test_complete)' -k\n",
                 ));
             },
         }
@@ -242,16 +347,27 @@ test "completion integration: bash" {
     defer std.testing.allocator.free(res.stderr);
     try expectSuccess("bash -n", res);
 
-    try bashExpect(work, "root flag prefix", "dap-completion-test --ver", 1, &.{"--verbose"});
+    try bashExpect(work, "root flag prefix", "dap-completion-test --ver", 1, &.{ "--verbose", "--version" });
     try bashExpect(work, "child command", "dap-completion-test ru", 1, &.{"run"});
     try bashExpect(work, "child level candidates", "dap-completion-test run de", 2, &.{"deep"});
-    try bashExpect(work, "ancestor flag on child", "dap-completion-test run --ver", 2, &.{"--verbose"});
+    try bashExpect(work, "ancestor flag on child", "dap-completion-test run --ver", 2, &.{ "--verbose", "--version" });
     try bashExpect(work, "enum separate value", "dap-completion-test --color ''", 2, &.{ "red", "green" });
     try bashExpect(work, "enum eq with text", "dap-completion-test --color = r", 3, &.{"red"});
     try bashExpect(work, "enum eq empty", "dap-completion-test --color =", 2, &.{ "=red", "=green" });
     try bashExpect(work, "enum full form", "dap-completion-test --color=r", 1, &.{ "--color=red", "--color=green" });
     try bashExpect(work, "non-enum value", "dap-completion-test --config ''", 2, &.{});
     try bashExpect(work, "literal after terminator", "dap-completion-test -- x", 2, &.{});
+
+    try bashExpectOrder(work, "phase: commands", "dap-completion-test ''", 1, &.{ "p", "pick", "run" });
+    try bashExpectOrder(work, "phase: arguments", "dap-completion-test pick ''", 2, &.{ "green", "red" });
+    try bashExpectOrder(work, "phase: flags after slot", "dap-completion-test pick red ''", 3, &.{
+        "--color", "--config", "--description", "--note", "--verbose", "-d", "--version", "--help", "-h",
+    });
+    try bashExpectOrder(work, "value token is not positional", "dap-completion-test pick --note x ''", 4, &.{ "green", "red" });
+    try bashExpectOrder(work, "alias-only insertion", "dap-completion-test pick -d", 2, &.{"-d"});
+    try bashExpectOrder(work, "version and help tail", "dap-completion-test -", 1, &.{
+        "--color", "--config", "--description", "--verbose", "-d", "--version", "--help", "-h",
+    });
 }
 
 test "completion integration: fish" {
@@ -275,11 +391,30 @@ test "completion integration: fish" {
 
     try fishExpect(work, "root flag prefix", "dap-completion-test --co", &.{ "--config", "--color" });
     try fishExpect(work, "child command", "dap-completion-test run de", &.{"deep"});
-    try fishExpect(work, "ancestor flag on child", "dap-completion-test run --ver", &.{"--verbose"});
+    try fishExpect(work, "ancestor flag on child", "dap-completion-test run --ver", &.{ "--verbose", "--version" });
     try fishExpect(work, "enum separate value", "dap-completion-test --color ", &.{ "red", "green" });
     try fishExpect(work, "enum full form", "dap-completion-test --color=r", &.{"--color=red"});
     try fishExpect(work, "non-enum value", "dap-completion-test --config ", &.{});
     try fishExpect(work, "literal after terminator", "dap-completion-test -- ", &.{});
+
+    try fishExpectLines(work, "merged prefix rows", "dap-completion-test -", &.{
+        "--color\t-- Color.",
+        "--config\t-- Config.",
+        "--description\t-d  -- Description of context.",
+        "--verbose\t-- Verbose.",
+        "--version",
+        "--help\t-h  -- Show context-sensitive help.",
+    });
+    try fishExpectLines(work, "phase: commands", "dap-completion-test ", &.{
+        "pick\tp  -- Pick.",
+        "run\t-- Run.",
+    });
+    try fishExpectLines(work, "phase: arguments", "dap-completion-test pick ", &.{
+        "green\t-- Kind.",
+        "red\t-- Kind.",
+    });
+    try fishExpectLines(work, "alias-only row", "dap-completion-test -d", &.{"-d\t-- Description of context."});
+    try fishExpectLines(work, "version tail", "dap-completion-test --v", &.{ "--verbose\t-- Verbose.", "--version" });
 }
 
 test "completion integration: zsh" {
@@ -315,4 +450,35 @@ test "completion integration: zsh" {
 
     const trimmed = std.mem.trim(u8, smoke.stdout, " \t\r\n");
     try std.testing.expectEqualStrings("_dap_completion_test: function", trimmed);
+
+    try zshExpectDisplays(work, "zsh three columns", "dap-completion-test -", &.{
+        "--color            -- Color.",
+        "--config           -- Config.",
+        "--description  -d  -- Description of context.",
+        "--verbose          -- Verbose.",
+        "--version",
+        "--help         -h  -- Show context-sensitive help.",
+    });
+    try zshExpectDisplays(work, "zsh two columns", "dap-completion-test --v", &.{
+        "--verbose  -- Verbose.",
+        "--version",
+    });
+    try zshExpectDisplays(work, "zsh empty prefix commands", "dap-completion-test ''", &.{
+        "pick  p  -- Pick.",
+        "run      -- Run.",
+    });
+    try zshExpectDisplays(work, "zsh empty prefix arguments", "dap-completion-test pick ''", &.{
+        "green  -- Kind.",
+        "red    -- Kind.",
+    });
+    try zshExpectDisplays(work, "zsh alias-only row", "dap-completion-test pick -d", &.{"-d  -- Description of context."});
+    try zshExpectDisplays(work, "zsh flags after slot", "dap-completion-test pick red ''", &.{
+        "--color            -- Color.",
+        "--config           -- Config.",
+        "--description  -d  -- Description of context.",
+        "--note             -- Note.",
+        "--verbose          -- Verbose.",
+        "--version",
+        "--help         -h  -- Show context-sensitive help.",
+    });
 }

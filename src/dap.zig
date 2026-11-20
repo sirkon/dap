@@ -2619,40 +2619,6 @@ const CompletionCandidate = struct {
     help: String,
 };
 
-/// Ordinary candidates of `level` paired with descriptions: effective flags
-/// (long then short, both carrying the flag's help), then the level's own
-/// commands with their `CommandMeta.help`.
-fn completionCandidateHelp(comptime level: CompletionLevel) []const CompletionCandidate {
-    comptime {
-        var cands: []const CompletionCandidate = &.{};
-        for (level.flags) |s| {
-            if (s.long.len != 0) {
-                cands = cands ++ &[_]CompletionCandidate{.{
-                    .spelling = std.fmt.comptimePrint("--{s}", .{s.long}),
-                    .help = s.help,
-                }};
-            }
-            if (s.short) |sh| {
-                if (sh.len != 0) {
-                    cands = cands ++ &[_]CompletionCandidate{.{
-                        .spelling = std.fmt.comptimePrint("-{s}", .{sh}),
-                        .help = s.help,
-                    }};
-                }
-            }
-        }
-        for (completionCommands(level)) |c| {
-            for (completionCommandSpellings(c)) |spelling| {
-                cands = cands ++ &[_]CompletionCandidate{.{
-                    .spelling = spelling,
-                    .help = c.Cmd.cmd_meta.help,
-                }};
-            }
-        }
-        return cands;
-    }
-}
-
 /// Enumeration values of `T` prefixed by `prefix`, as description-free
 /// candidates in ASCII order. `prefix` is empty for bare values and carries the
 /// flag spelling plus `=` for inline forms.
@@ -10279,25 +10245,6 @@ test "M19: zsh quotes candidates and sanitizes descriptions" {
     try std.testing.expect(std.mem.indexOf(u8, script, "# dap: level 0 weird root\n") != null);
 }
 
-test "M19: zsh candidate help pairs flags and commands" {
-    comptime {
-        const levels = completionLevels(M19, &.{});
-        const root = completionCandidateHelp(levels[0]);
-        m19Expect(root.len == 5, "root candidate count");
-        const want = [_]String{ "--help", "-h", "--verbose", "--mode", "run" };
-        for (want, root) |w, c| m19Expect(std.mem.eql(u8, w, c.spelling), "candidate order");
-        m19Expect(std.mem.eql(u8, root[0].help, "Show context-sensitive help."), "builtin help");
-        m19Expect(std.mem.eql(u8, root[1].help, "Show context-sensitive help."), "short builtin help");
-        m19Expect(std.mem.eql(u8, root[2].help, "Verbose."), "flag help");
-        m19Expect(std.mem.eql(u8, root[4].help, "Run."), "command help");
-
-        const run_level = completionCandidateHelp(levels[1]);
-        m19Expect(run_level.len == 5, "run candidate count");
-        m19Expect(std.mem.eql(u8, run_level[4].spelling, "go"), "command candidate");
-        m19Expect(std.mem.eql(u8, run_level[4].help, "Go."), "command help text");
-    }
-}
-
 test "M19: command synonyms are completion candidates" {
     comptime {
         const levels = completionLevels(M19Synonym, &.{});
@@ -11669,7 +11616,7 @@ test "M20: entry building pairs and families" {
     }
 }
 
-test "M20: empty help sorts to the bottom" {
+test "M20: empty help sorts to the bottom of its family" {
     comptime {
         const levels = completionLevels(M20, &.{});
         const rows = completionRows(levels[0]);
@@ -11684,7 +11631,7 @@ test "M20: empty help sorts to the bottom" {
     }
 }
 
-test "M20: numeric keys follow help presence, family, spelling" {
+test "M20: numeric keys follow family, help presence, spelling" {
     comptime {
         const levels = completionLevels(M20, &.{});
         const rows = completionRows(levels[0]);

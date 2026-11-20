@@ -295,13 +295,31 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `CompletionLevel` table by re-instantiating `Sub(c.Cmd, subApp(NS.app_meta,
   c))`: each level carries its rank, usage path, effective flags
   (ancestors first, own after, injected builtin once), own arguments, and own
-  commands. All three emitters share the script contract: a level marker
-  comment per level, ordinary candidates from flags (long then non-empty
-  short) then commands (primary name then synonym, skipping empty and
-  `-`-leading spellings), enumeration
-  values via `enumWireNames` only for enumerable `vtype`s, no `Alt` pruning,
-  no argument completion, no library candidates after `--`, deterministic
-  bytes and exactly one trailing `\n`. The caller owns the result. The example
+  commands. Candidates come from `CompletionEntry` rows: one row per flag
+  (`--long` primary, `-short` alias) and one per command (primary wire name,
+  synonym alias; empty and `-`-leading spellings are dropped), plus
+  `completionArgumentEntries` for a positional slot (enumeration wire names,
+  deduplicated, carrying the argument's help). Ordering is family first
+  (normal, version, help; family is classified from the primary spelling:
+  `help`/`--help`/lone `-h`, `version`/`--version`/lone `-v`), then help
+  presence (rows with help before rows with none), then ASCII spelling.
+  An empty current word shows one phase only: commands if the level has any,
+  else the next unfilled slot's values (`pos` counts surviving bare tokens,
+  resets on command descent, and every declared slot counts, defaulted
+  included; a non-enumerable slot falls through to flags), else flags. A
+  non-empty prefix shows every row whose primary or alias starts with it,
+  plus only slot `pos`'s argument values. zsh merges a row when both spellings
+  match, inserts the effective spelling (alias-only rows insert the alias),
+  and renders a left-aligned 2- or 3-column table via `compadd -o nosort
+  -V '' -l -d` (3 columns when any filtered row merged, two spaces between
+  columns, empty help without separator or trailing padding). fish prints
+  `candidate<TAB>description` in the same order from a static per-level table
+  and registers with `-k`; merged rows carry the alias in the description,
+  unrepresentable spellings degrade as before, and `-f` stays omitted. bash
+  keeps plain per-spelling names in `COMPREPLY` and `-o default`. Enumeration
+  value positions stay ASCII-sorted and unpartitioned. No `Alt` pruning, no
+  library candidates after `--`, deterministic bytes and exactly one trailing
+  `\n`. The caller owns the result. The example
   tree declares a `completion` command whose `main` prints the script and
   returns before any other output, so
   `zig build run -- --required 0 completion <shell>` pipes cleanly. Two test

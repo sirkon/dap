@@ -241,6 +241,46 @@ an alias.
 root one: a call from a subcommand level is a compile error, because a subtree
 cannot reconstruct its ancestors' flags.
 
+### Candidate selection and ordering
+
+The script tracks the command level and counts completed positional words as
+it scans (`pos`). Flags that consume a value, `--flag=value` tokens and
+everything after `--` are skipped, so they never count as positionals.
+
+With an empty current word the script shows one phase only:
+
+1. subcommands, when the level has any;
+2. otherwise the next unfilled positional slot's values, when that slot is an
+   enumeration (every declared slot counts, including one with a default);
+3. otherwise flags.
+
+A non-empty prefix shows every matching candidate across the three categories,
+but only the current positional slot's values. Enumeration values are offered
+as-is; other argument types contribute nothing, so the flag phase opens
+instead. Typing `-` or `--v` reaches the flags even while a positional is
+still pending.
+
+A long flag pairs with its short alias, and a command with its synonym. zsh
+and fish merge a pair into one row when both spellings match the prefix; the
+row inserts the spelling that matched, so typing `-d` completes `-d`, not
+`--description`. When only the long spelling matches, the long is inserted.
+
+Ordering is:
+
+1. `normal` entries first, then `version` (`-v`/`--version`/`version`), then
+   `help` (`-h`/`--help`/`help`) strictly last;
+2. inside a family, entries with help before entries with empty help;
+3. ASCII order by the inserted spelling.
+
+zsh renders a left-aligned table with exactly two spaces between columns:
+`--description  -d  -- Description of context.`. It uses three columns when at
+least one displayed row merged and two otherwise; a row with empty help has no
+`-- ` separator and no trailing padding. fish prints one
+`candidate<TAB>description` line per row (the alias rides in the description
+for a merged row) and registers with `-k` so that order survives fish's own
+sorting; fish lays out the description itself. bash keeps plain names in
+`COMPREPLY`, one per spelling, and keeps `-o default` as the file fallback.
+
 A typical `completion` subcommand in `main` prints the script and returns
 before doing anything else:
 
@@ -278,8 +318,9 @@ Regenerate the script whenever flags or commands change; it is a snapshot, not
 a runtime query. Limitations: identifier sanitization is not injective
 (`my-app` and `my_app` both map to `_my_app`), so two `dap` CLIs sourced into
 one bash or fish session can collide; zsh is namespaced by the function name.
-zsh completion is covered by a syntax and autoload smoke test only, not by a
-semantic autotest (bash and fish have running semantic tests).
+All three shells have semantic integration tests: bash and fish run real
+completion cases, and zsh runs the generated function against a `compadd`
+stub that captures the displayed rows, plus syntax and autoload smoke tests.
 
 ## Building and testing
 
