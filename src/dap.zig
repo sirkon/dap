@@ -2739,6 +2739,214 @@ fn appendZshCandidates(
     }
 }
 
+/// Append `s` with control whitespace flattened, as one quoted POSIX literal.
+fn appendQuotedSanitized(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    s: String,
+) std.mem.Allocator.Error!void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendSanitized(&buf, allocator, s);
+    try appendQuoted(out, allocator, buf.items, .posix);
+}
+
+/// Append the shared zsh row helper. It holds one static row table per level
+/// (rank, spellings, aliases, help, kind, owning slot, and the numeric sort
+/// keys), then selects the phase, filters by `PREFIX`, sorts numerically, and
+/// renders 2- or 3-column displays.
+fn appendZshRowsHelper(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    ident: String,
+    comptime levels: []const CompletionLevel,
+) std.mem.Allocator.Error!void {
+    try appendZshFnName(out, allocator, ident, "_rows() {\n");
+    try out.appendSlice(allocator,
+        \\    emulate -L zsh
+        \\    local rank=$1 pos=$2 cur=$PREFIX
+        \\    local -a spell alias help kind slot kp ka
+        \\    local -a sel_spell sel_alias sel_help sel_key
+        \\    local phase=3 i n s a eff kk kind_i slot_i j pkey
+        \\    local ws=0 wa=0 k3=0 row any=0 blank=''
+        \\    case $rank in
+        \\
+    );
+    inline for (levels) |level| {
+        const rows = comptime completionRows(level);
+        const entries = comptime completionEntries(level);
+        const commands = comptime completionEntriesOfKind(entries, .command);
+
+        try out.print(allocator, "    {})\n", .{level.rank});
+
+        try out.appendSlice(allocator, "        spell=(");
+        for (rows, 0..) |row, i| {
+            if (i != 0) try out.append(allocator, ' ');
+            try appendQuoted(out, allocator, row.entry.spelling, .posix);
+        }
+        try out.appendSlice(allocator, ")\n        alias=(");
+        for (rows, 0..) |row, i| {
+            if (i != 0) try out.append(allocator, ' ');
+            try appendQuoted(out, allocator, row.entry.alias orelse "", .posix);
+        }
+        try out.appendSlice(allocator, ")\n        help=(");
+        for (rows, 0..) |row, i| {
+            if (i != 0) try out.append(allocator, ' ');
+            try appendQuotedSanitized(out, allocator, row.entry.help);
+        }
+        try out.appendSlice(allocator, ")\n        kind=(");
+        for (rows) |row| try out.print(allocator, " {}", .{@backingInt(row.entry.kind)});
+        try out.appendSlice(allocator, " )\n        slot=(");
+        for (rows) |row| try out.print(allocator, " {}", .{row.slot});
+        try out.appendSlice(allocator, " )\n        kp=(");
+        for (rows) |row| try out.print(allocator, " {}", .{row.key_primary});
+        try out.appendSlice(allocator, " )\n        ka=(");
+        for (rows) |row| try out.print(allocator, " {}", .{row.key_alias orelse 0});
+        try out.appendSlice(allocator, " )\n");
+
+        if (commands.len != 0) {
+            try out.appendSlice(allocator,
+                \\        phase=0
+                \\        if [[ -n $cur ]]; then
+                \\            phase=3
+                \\        else
+                \\            phase=2
+                \\        fi
+                \\
+            );
+        } else if (level.arguments.len != 0) {
+            try out.appendSlice(allocator,
+                \\        phase=0
+                \\        if [[ -n $cur ]]; then
+                \\            phase=3
+                \\        else
+                \\            case $pos in
+                \\
+            );
+            inline for (0..level.arguments.len) |slot| {
+                const values = comptime completionArgumentEntries(level, slot);
+                if (values.len != 0) {
+                    try out.print(allocator, "            {}) phase=1 ;;\n", .{slot});
+                }
+            }
+            try out.appendSlice(allocator,
+                \\            esac
+                \\        fi
+                \\
+            );
+        } else {
+            try out.appendSlice(allocator,
+                \\        phase=0
+                \\        if [[ -n $cur ]]; then
+                \\            phase=3
+                \\        fi
+                \\
+            );
+        }
+        try out.appendSlice(allocator, "        ;;\n");
+    }
+    try out.appendSlice(allocator, "    esac\n");
+    try out.appendSlice(allocator,
+        \\    local -a cands displays
+        \\    n=${#spell}
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        kind_i=${kind[i]}
+        \\        slot_i=${slot[i]}
+        \\        if (( phase == 0 )); then
+        \\            (( kind_i == 0 )) || continue
+        \\        elif (( phase == 2 )); then
+        \\            (( kind_i == 2 )) || continue
+        \\        elif (( phase == 1 )); then
+        \\            (( slot_i == pos )) || continue
+        \\        elif (( kind_i == 1 )); then
+        \\            (( slot_i == pos )) || continue
+        \\        fi
+        \\        s=${spell[i]}
+        \\        a=${alias[i]}
+        \\        if [[ -n $a && $a == "$cur"* && $s == "$cur"* ]]; then
+        \\            eff=$s
+        \\            kk=${kp[i]}
+        \\        elif [[ -n $a && $a == "$cur"* ]]; then
+        \\            eff=$a
+        \\            a=
+        \\            kk=${ka[i]}
+        \\        elif [[ $s == "$cur"* ]]; then
+        \\            eff=$s
+        \\            kk=${kp[i]}
+        \\        else
+        \\            continue
+        \\        fi
+        \\        sel_spell+=("$eff")
+        \\        sel_alias+=("$a")
+        \\        sel_help+=("${help[i]}")
+        \\        sel_key+=("$kk")
+        \\    done
+        \\    n=${#sel_spell}
+        \\    for (( i = 2; i <= n; i++ )); do
+        \\        s=${sel_spell[i]}
+        \\        a=${sel_alias[i]}
+        \\        kk=${sel_key[i]}
+        \\        h=${sel_help[i]}
+        \\        j=$(( i - 1 ))
+        \\        while (( j >= 1 )); do
+        \\            pkey=${sel_key[j]}
+        \\            if (( kk < pkey )); then
+        \\                sel_spell[$(( j + 1 ))]=$s
+        \\                sel_alias[$(( j + 1 ))]=$a
+        \\                sel_help[$(( j + 1 ))]=$h
+        \\                sel_key[$(( j + 1 ))]=$kk
+        \\                j=$(( j - 1 ))
+        \\            else
+        \\                break
+        \\            fi
+        \\        done
+        \\        sel_spell[$(( j + 1 ))]=$s
+        \\        sel_alias[$(( j + 1 ))]=$a
+        \\        sel_help[$(( j + 1 ))]=$h
+        \\        sel_key[$(( j + 1 ))]=$kk
+        \\    done
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        (( ${#sel_spell[i]} > ws )) && ws=${#sel_spell[i]}
+        \\        (( ${#sel_alias[i]} > wa )) && wa=${#sel_alias[i]}
+        \\        [[ -n ${sel_alias[i]} ]] && k3=1
+        \\    done
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        cands+=("${sel_spell[i]}")
+        \\        row=${(r:$ws:)sel_spell[i]}
+        \\        if (( k3 )); then
+        \\            if [[ -n ${sel_alias[i]} ]]; then
+        \\                row="$row  ${(r:$wa:)sel_alias[i]}"
+        \\            else
+        \\                row="$row  ${(r:$wa:)blank}"
+        \\            fi
+        \\        fi
+        \\        if [[ -n ${sel_help[i]} ]]; then
+        \\            row="$row  -- ${sel_help[i]}"
+        \\        fi
+        \\        while [[ $row == *' ' ]]; do
+        \\            row=${row% }
+        \\        done
+        \\        displays+=("$row")
+        \\    done
+        \\    if (( n == 0 )); then
+        \\        return 1
+        \\    fi
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        if [[ ${displays[i]} != ${cands[i]} ]]; then
+        \\            any=1
+        \\            break
+        \\        fi
+        \\    done
+        \\    if (( any )); then
+        \\        compadd -o nosort -V '' -l -d displays -- "${cands[@]}"
+        \\    else
+        \\        compadd -o nosort -d displays -- "${cands[@]}"
+        \\    fi
+        \\}
+        \\
+        \\
+    );
+}
 /// Append `_dap_<ident><suffix>` to `out`.
 fn appendBashFnName(
     out: *std.ArrayList(u8),
@@ -3029,10 +3237,12 @@ fn emitZsh(
     }
     try out.appendSlice(allocator, "    esac\n    return 1\n}\n\n");
 
+    try appendZshRowsHelper(&out, allocator, ident, levels);
+
     try appendZshFnName(&out, allocator, ident, "() {\n");
     try out.appendSlice(allocator,
         \\    emulate -L zsh
-        \\    local level=0 literal=0 vflag= vform=bare i tok end
+        \\    local level=0 pos=0 literal=0 vflag= vform=bare i tok end
         \\    local -a cands displays
         \\    end=$(( CURRENT - 1 ))
         \\    i=2
@@ -3066,6 +3276,7 @@ fn emitZsh(
         \\            i=$(( i + 1 ))
         \\            continue
         \\        fi
+        \\        pos=$(( pos + 1 ))
         \\        case "$level" in
         \\
     );
@@ -3078,7 +3289,7 @@ fn emitZsh(
                 inline for (comptime completionCommandSpellings(c)) |spelling| {
                     try out.appendSlice(allocator, "            ");
                     try appendQuoted(&out, allocator, spelling, .posix);
-                    try out.print(allocator, ") level={} ;;\n", .{c.rank});
+                    try out.print(allocator, ") level={} pos=0 ;;\n", .{c.rank});
                 }
             }
             try out.appendSlice(allocator, "            esac\n");
@@ -3150,7 +3361,9 @@ fn emitZsh(
             }
             try out.appendSlice(allocator, "        esac\n");
         }
-        try appendZshCandidates(&out, allocator, "        ", comptime completionCandidateHelp(level));
+        try out.appendSlice(allocator, "        ");
+        try appendZshFnName(&out, allocator, ident, "_rows ");
+        try out.print(allocator, "{} $pos\n", .{level.rank});
         try out.appendSlice(allocator, "        return\n        ;;\n");
     }
     try out.appendSlice(allocator,
@@ -9640,21 +9853,41 @@ test "M19: zsh candidates by level" {
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
-    try std.testing.expect(std.mem.indexOf(u8, root, "\n        cands=('--help' '-h' '--verbose' '--mode' 'run')\n") != null);
-    const want_displays =
-        "\n        displays=('--help     -- Show context-sensitive help.'" ++
-        " '-h         -- Show context-sensitive help.'" ++
-        " '--verbose  -- Verbose.' '--mode     -- Mode.' 'run        -- Run.')\n";
-    try std.testing.expect(std.mem.indexOf(u8, root, want_displays) != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "compadd -V '' -l -d displays -- \"${cands[@]}\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "\n        _tool_rows 0 $pos\n        return\n") != null);
 
-    const run_level = m19LevelBlock(script, 1);
-    try std.testing.expect(std.mem.indexOf(u8, run_level, "\n        cands=('--help' '-h' '--verbose' '--mode' 'go')\n") != null);
-    // A sibling's commands are not offered after a handoff.
-    try std.testing.expect(std.mem.indexOf(u8, run_level, "'run'") == null);
+    const table = std.mem.indexOf(u8, script, "_tool_rows() {\n") orelse return error.TestUnexpectedResult;
+    const rows = script[table..];
 
+    // Root rows: normal flags then commands, help family last.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rows,
+        "        spell=('--mode' '--verbose' 'run' '--help')\n" ++
+            "        alias=('' '' '' '-h')\n" ++
+            "        help=('Mode.' 'Verbose.' 'Run.' 'Show context-sensitive help.')\n" ++
+            "        kind=( 0 0 2 0 )\n" ++
+            "        slot=( -1 -1 -1 -1 )\n" ++
+            "        kp=( 1 2 4 10 )\n" ++
+            "        ka=( 0 0 0 13 )\n",
+    ) != null);
+
+    // An empty prefix with commands selects the command phase.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rows,
+        "        phase=0\n        if [[ -n $cur ]]; then\n            phase=3\n        else\n            phase=2\n        fi\n",
+    ) != null);
+
+    // The nested command level has an argument with no values, so the slot
+    // case falls through to the flag phase.
     const go_level = m19LevelBlock(script, 2);
-    try std.testing.expect(std.mem.indexOf(u8, go_level, "\n        cands=('--help' '-h' '--verbose' '--mode')\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "        _tool_rows 2 $pos\n        return\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rows,
+        "        phase=0\n        if [[ -n $cur ]]; then\n            phase=3\n        else\n            case $pos in\n            esac\n        fi\n",
+    ) != null);
+    // A sibling's commands are not offered after a handoff.
     try std.testing.expect(std.mem.indexOf(u8, go_level, "'go'") == null);
 }
 
@@ -9752,7 +9985,8 @@ test "M19: zsh header, locals, and guard" {
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.startsWith(u8, script, "#compdef my-app\n"));
-    try std.testing.expect(std.mem.indexOf(u8, script, "_my_app() {\n    emulate -L zsh\n    local level=0 literal=0 vflag= vform=bare i tok end\n    local -a cands displays\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "_my_app() {\n    emulate -L zsh\n    local level=0 pos=0 literal=0 vflag= vform=bare i tok end\n    local -a cands displays\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "_my_app_rows() {\n    emulate -L zsh\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, script, "if [[ $funcstack[1] == '_my_app' ]]; then\n    _my_app \"$@\"\nelse\n    compdef _my_app 'my-app'\nfi\n"));
 }
 
@@ -9808,9 +10042,15 @@ test "M19: zsh quotes candidates and sanitizes descriptions" {
     const script = try emitZsh(std.testing.allocator, &weird_levels, "weird", "app");
     defer std.testing.allocator.free(script);
 
-    try std.testing.expect(std.mem.indexOf(u8, script, "\n        cands=('--a'\\''b' '-x y' 'c d')\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "\n        displays=('--a'\\''b  -- Tab here next' '-x y   -- Tab here next' 'c d    -- Cmd '\\''help'\\''.')\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "compadd -V '' -l -d displays -- \"${cands[@]}\"\n") != null);
+    const want =
+        "        spell=('--a'\\''b' 'c d')\n" ++
+        "        alias=('-x y' '')\n" ++
+        "        help=('Tab here next' 'Cmd '\\''help'\\''.')\n" ++
+        "        kind=( 0 2 )\n" ++
+        "        slot=( -1 -1 )\n" ++
+        "        kp=( 0 2 )\n" ++
+        "        ka=( 1 0 )\n";
+    try std.testing.expect(std.mem.indexOf(u8, script, want) != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "# dap: level 0 weird root\n") != null);
 }
 
@@ -9873,12 +10113,22 @@ test "M19: bash descends through command synonyms" {
 test "M19: zsh and fish offer command synonyms" {
     const zsh = try M19Synonym.completion(std.testing.allocator, "tool", .zsh);
     defer std.testing.allocator.free(zsh);
-    try std.testing.expect(std.mem.indexOf(u8, zsh, "\n        cands=('--help' '-h' 'run' 'go' 'build-target' 'b')\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        zsh,
+        "        spell=('build-target' 'run' '--help')\n" ++
+            "        alias=('b' 'go' '-h')\n" ++
+            "        help=('Build.' 'Run.' 'Show context-sensitive help.')\n" ++
+            "        kind=( 2 2 0 )\n" ++
+            "        slot=( -1 -1 -1 )\n" ++
+            "        kp=( 3 5 12 )\n" ++
+            "        ka=( 2 4 13 )\n",
+    ) != null);
     for ([_]String{
-        "            'run') level=1 ;;",
-        "            'go') level=1 ;;",
-        "            'build-target') level=2 ;;",
-        "            'b') level=2 ;;",
+        "            'run') level=1 pos=0 ;;",
+        "            'go') level=1 pos=0 ;;",
+        "            'build-target') level=2 pos=0 ;;",
+        "            'b') level=2 pos=0 ;;",
     }) |arm| {
         try std.testing.expect(std.mem.indexOf(u8, zsh, arm) != null);
     }
@@ -10168,7 +10418,17 @@ test "M19: short enum spelling" {
         \\
     ;
     try std.testing.expect(std.mem.indexOf(u8, zsh_root, zsh_want) != null);
-    try std.testing.expect(std.mem.indexOf(u8, zsh_root, "\n        cands=('--help' '-h' '--level' '-l')\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        zsh,
+        "        spell=('--level' '--help')\n" ++
+            "        alias=('-l' '-h')\n" ++
+            "        help=('Level.' 'Show context-sensitive help.')\n" ++
+            "        kind=( 0 0 )\n" ++
+            "        slot=( -1 -1 )\n" ++
+            "        kp=( 1 8 )\n" ++
+            "        ka=( 3 10 )\n",
+    ) != null);
 
     const fish = try M19Short.completion(std.testing.allocator, "tool", .fish);
     defer std.testing.allocator.free(fish);
@@ -10461,9 +10721,161 @@ test "M19: zsh golden" {
         \\    return 1
         \\}
         \\
+        \\_m19_rows() {
+        \\    emulate -L zsh
+        \\    local rank=$1 pos=$2 cur=$PREFIX
+        \\    local -a spell alias help kind slot kp ka
+        \\    local -a sel_spell sel_alias sel_help sel_key
+        \\    local phase=3 i n s a eff kk kind_i slot_i j pkey
+        \\    local ws=0 wa=0 k3=0 row any=0 blank=''
+        \\    case $rank in
+        \\    0)
+        \\        spell=('--mode' '--verbose' 'run' '--help')
+        \\        alias=('' '' '' '-h')
+        \\        help=('Mode.' 'Verbose.' 'Run.' 'Show context-sensitive help.')
+        \\        kind=( 0 0 2 0 )
+        \\        slot=( -1 -1 -1 -1 )
+        \\        kp=( 1 2 4 10 )
+        \\        ka=( 0 0 0 13 )
+        \\        phase=0
+        \\        if [[ -n $cur ]]; then
+        \\            phase=3
+        \\        else
+        \\            phase=2
+        \\        fi
+        \\        ;;
+        \\    1)
+        \\        spell=('--mode' '--verbose' 'go' '--help')
+        \\        alias=('' '' '' '-h')
+        \\        help=('Mode.' 'Verbose.' 'Go.' 'Show context-sensitive help.')
+        \\        kind=( 0 0 2 0 )
+        \\        slot=( -1 -1 -1 -1 )
+        \\        kp=( 1 2 4 10 )
+        \\        ka=( 0 0 0 13 )
+        \\        phase=0
+        \\        if [[ -n $cur ]]; then
+        \\            phase=3
+        \\        else
+        \\            phase=2
+        \\        fi
+        \\        ;;
+        \\    2)
+        \\        spell=('--mode' '--verbose' '--help')
+        \\        alias=('' '' '-h')
+        \\        help=('Mode.' 'Verbose.' 'Show context-sensitive help.')
+        \\        kind=( 0 0 0 )
+        \\        slot=( -1 -1 -1 )
+        \\        kp=( 1 2 8 )
+        \\        ka=( 0 0 11 )
+        \\        phase=0
+        \\        if [[ -n $cur ]]; then
+        \\            phase=3
+        \\        else
+        \\            case $pos in
+        \\            esac
+        \\        fi
+        \\        ;;
+        \\    esac
+        \\    local -a cands displays
+        \\    n=${#spell}
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        kind_i=${kind[i]}
+        \\        slot_i=${slot[i]}
+        \\        if (( phase == 0 )); then
+        \\            (( kind_i == 0 )) || continue
+        \\        elif (( phase == 2 )); then
+        \\            (( kind_i == 2 )) || continue
+        \\        elif (( phase == 1 )); then
+        \\            (( slot_i == pos )) || continue
+        \\        elif (( kind_i == 1 )); then
+        \\            (( slot_i == pos )) || continue
+        \\        fi
+        \\        s=${spell[i]}
+        \\        a=${alias[i]}
+        \\        if [[ -n $a && $a == "$cur"* && $s == "$cur"* ]]; then
+        \\            eff=$s
+        \\            kk=${kp[i]}
+        \\        elif [[ -n $a && $a == "$cur"* ]]; then
+        \\            eff=$a
+        \\            a=
+        \\            kk=${ka[i]}
+        \\        elif [[ $s == "$cur"* ]]; then
+        \\            eff=$s
+        \\            kk=${kp[i]}
+        \\        else
+        \\            continue
+        \\        fi
+        \\        sel_spell+=("$eff")
+        \\        sel_alias+=("$a")
+        \\        sel_help+=("${help[i]}")
+        \\        sel_key+=("$kk")
+        \\    done
+        \\    n=${#sel_spell}
+        \\    for (( i = 2; i <= n; i++ )); do
+        \\        s=${sel_spell[i]}
+        \\        a=${sel_alias[i]}
+        \\        kk=${sel_key[i]}
+        \\        h=${sel_help[i]}
+        \\        j=$(( i - 1 ))
+        \\        while (( j >= 1 )); do
+        \\            pkey=${sel_key[j]}
+        \\            if (( kk < pkey )); then
+        \\                sel_spell[$(( j + 1 ))]=$s
+        \\                sel_alias[$(( j + 1 ))]=$a
+        \\                sel_help[$(( j + 1 ))]=$h
+        \\                sel_key[$(( j + 1 ))]=$kk
+        \\                j=$(( j - 1 ))
+        \\            else
+        \\                break
+        \\            fi
+        \\        done
+        \\        sel_spell[$(( j + 1 ))]=$s
+        \\        sel_alias[$(( j + 1 ))]=$a
+        \\        sel_help[$(( j + 1 ))]=$h
+        \\        sel_key[$(( j + 1 ))]=$kk
+        \\    done
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        (( ${#sel_spell[i]} > ws )) && ws=${#sel_spell[i]}
+        \\        (( ${#sel_alias[i]} > wa )) && wa=${#sel_alias[i]}
+        \\        [[ -n ${sel_alias[i]} ]] && k3=1
+        \\    done
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        cands+=("${sel_spell[i]}")
+        \\        row=${(r:$ws:)sel_spell[i]}
+        \\        if (( k3 )); then
+        \\            if [[ -n ${sel_alias[i]} ]]; then
+        \\                row="$row  ${(r:$wa:)sel_alias[i]}"
+        \\            else
+        \\                row="$row  ${(r:$wa:)blank}"
+        \\            fi
+        \\        fi
+        \\        if [[ -n ${sel_help[i]} ]]; then
+        \\            row="$row  -- ${sel_help[i]}"
+        \\        fi
+        \\        while [[ $row == *' ' ]]; do
+        \\            row=${row% }
+        \\        done
+        \\        displays+=("$row")
+        \\    done
+        \\    if (( n == 0 )); then
+        \\        return 1
+        \\    fi
+        \\    for (( i = 1; i <= n; i++ )); do
+        \\        if [[ ${displays[i]} != ${cands[i]} ]]; then
+        \\            any=1
+        \\            break
+        \\        fi
+        \\    done
+        \\    if (( any )); then
+        \\        compadd -o nosort -V '' -l -d displays -- "${cands[@]}"
+        \\    else
+        \\        compadd -o nosort -d displays -- "${cands[@]}"
+        \\    fi
+        \\}
+        \\
         \\_m19() {
         \\    emulate -L zsh
-        \\    local level=0 literal=0 vflag= vform=bare i tok end
+        \\    local level=0 pos=0 literal=0 vflag= vform=bare i tok end
         \\    local -a cands displays
         \\    end=$(( CURRENT - 1 ))
         \\    i=2
@@ -10494,15 +10906,16 @@ test "M19: zsh golden" {
         \\            i=$(( i + 1 ))
         \\            continue
         \\        fi
+        \\        pos=$(( pos + 1 ))
         \\        case "$level" in
         \\        0)
         \\            case "$tok" in
-        \\            'run') level=1 ;;
+        \\            'run') level=1 pos=0 ;;
         \\            esac
         \\            ;;
         \\        1)
         \\            case "$tok" in
-        \\            'go') level=2 ;;
+        \\            'go') level=2 pos=0 ;;
         \\            esac
         \\            ;;
         \\        2)
@@ -10552,9 +10965,7 @@ test "M19: zsh golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        cands=('--help' '-h' '--verbose' '--mode' 'run')
-        \\        displays=('--help     -- Show context-sensitive help.' '-h         -- Show context-sensitive help.' '--verbose  -- Verbose.' '--mode     -- Mode.' 'run        -- Run.')
-        \\        compadd -V '' -l -d displays -- "${cands[@]}"
+        \\        _m19_rows 0 $pos
         \\        return
         \\        ;;
         \\    1)
@@ -10581,9 +10992,7 @@ test "M19: zsh golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        cands=('--help' '-h' '--verbose' '--mode' 'go')
-        \\        displays=('--help     -- Show context-sensitive help.' '-h         -- Show context-sensitive help.' '--verbose  -- Verbose.' '--mode     -- Mode.' 'go         -- Go.')
-        \\        compadd -V '' -l -d displays -- "${cands[@]}"
+        \\        _m19_rows 1 $pos
         \\        return
         \\        ;;
         \\    2)
@@ -10610,9 +11019,7 @@ test "M19: zsh golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        cands=('--help' '-h' '--verbose' '--mode')
-        \\        displays=('--help     -- Show context-sensitive help.' '-h         -- Show context-sensitive help.' '--verbose  -- Verbose.' '--mode     -- Mode.')
-        \\        compadd -V '' -l -d displays -- "${cands[@]}"
+        \\        _m19_rows 2 $pos
         \\        return
         \\        ;;
         \\    esac
