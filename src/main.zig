@@ -148,13 +148,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (CLI.command(cli)) |cmd| switch (cmd) {
         .completion => |c| {
-            const script = try CLI.completion(arena, "dap-example", switch (c.shell.view) {
+            const completion = CLI.completion(arena, "dap-example", switch (c.shell.view) {
                 .bash => .bash,
                 .zsh => .zsh,
                 .fish => .fish,
             });
-            try stdout.writeAll(script);
-            try stdout.flush();
+            try completion.show(init.io);
             return;
         },
         .command1 => try stdout.print("command = command-1\n", .{}),

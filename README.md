@@ -215,23 +215,33 @@ text, so the codes never disturb alignment.
 
 ## Completion
 
-`CLI.completion(allocator, app_name, shell)` renders a complete completion
-script for the whole command tree. It is a pure function of the declaration:
-it takes no `View`, never parses, reads no environment and does no file I/O.
+`CLI.completion(allocator, app_name, shell)` returns a `CLI.Completion`
+handle for the whole command tree. Construction is infallible and does no
+work: it takes no `View`, never parses, reads no environment, does no file
+I/O, and validates nothing. The handle renders on demand:
 
 ```zig
 const dap = @import("dap");
 
-const script = try CLI.completion(arena.allocator(), "app", .zsh);
+var completion = CLI.completion(arena.allocator(), "app", .zsh);
+const script = try completion.text();
+defer arena.allocator().free(script);
 ```
 
-`CompletionShell` is `.bash`, `.zsh` or `.fish`; the result is a caller-owned
-`[]const u8` (a `dap.String`) with exactly one trailing newline, and failures
-are `OutOfMemory` or `dap.CompletionError.InvalidAppName`. The output is
-deterministic, so it can be regenerated and diffed.
+`CompletionShell` is `.bash`, `.zsh` or `.fish`. `text()` returns a caller-owned
+`[]const u8` (a `dap.String`) with exactly one trailing newline; failures are
+`OutOfMemory` or `dap.CompletionError.InvalidAppName`. The output is
+deterministic, so it can be regenerated and diffed. `show(io)` renders and
+writes the script to stdout. `install(io, environ)` renders and writes it to
+the shell's discovery directory (bash under
+`$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh under
+`$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under
+`$XDG_CONFIG_HOME/fish/completions/<app>.fish`), falling back to
+`$HOME/.local/share` and `$HOME/.config` and creating parent directories.
 
 `app_name` is the name the script **registers**, not `App.name` (which is the
-possibly multi-word usage path). It is validated before any allocation: it
+possibly multi-word usage path). It is validated by `text`/`show`/`install`
+before any allocation: it
 must be non-empty ASCII, must not start with `-`, must not contain `/`,
 whitespace or control bytes, and may only use `A-Za-z0-9._+-`. Passing a
 different name than the installed binary is the intended way to install under
@@ -287,20 +297,20 @@ before doing anything else:
 ```zig
 if (CLI.command(cli)) |cmd| switch (cmd) {
     .completion => |c| {
-        const script = try CLI.completion(arena, "app", switch (c.shell.view) {
+        const completion = CLI.completion(arena, "app", switch (c.shell.view) {
             .bash => .bash,
             .zsh => .zsh,
             .fish => .fish,
         });
-        try stdout.writeAll(script);
+        try completion.show(init.io);
         return;
     },
     else => {},
 };
 ```
 
-The library only returns the script; saving it is up to the program. With the
-script written to a file:
+`install` writes the script to the shell's standard directory instead; the
+manual alternative is to redirect `show` output or write `text()` yourself:
 
 ```sh
 app completion bash > /etc/bash_completion.d/app

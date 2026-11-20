@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (257 tests, the milestone-tagged M1–M19
+`zig test src/dap.zig` both pass (273 tests, the milestone-tagged M1–M19
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
 - `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
@@ -40,7 +40,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
 
 - `src/dap.zig` — core implementation. Public data types (`Kind`,
   `HelpRendererStyle`, `HelpRendererHighlight`, `CompletionShell`,
-  `CompletionError`, `App`, `HelpHighlight`,
+  `CompletionError`, `CompletionOf`, `App`, `HelpHighlight`,
   `String`, `Default(T)`, `defaultValue`, `Flag(T)`, `Optional`, `Group`,
   `Argument(T)`, `Enumeration`, `Enum`, `CommandMeta`, `Command`,
   `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`,
@@ -279,12 +279,24 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   otherwise prints the block standalone (`printDiagnosticsStandalone`); a
   failed render or diagnostic build falls back to the standalone lines so
   diagnostics are never lost.
-- Completion is static. `CLI.completion(allocator, app_name, shell)` (beside
-  `helpData`/`helpText`/`usage`) takes no `View`, never parses, reads no
-  environment and does no file I/O; `app_name` is the only runtime input
-  besides the allocator and shell. It exists on every generated namespace but
-  a non-root call is a compile error (`app._command_rank != 0` in a comptime
-  block); the command shell aliases it without analyzing the body.
+- Completion is static and lazy. `CLI.completion(allocator, app_name,
+  shell)` (beside `helpData`/`helpText`/`usage`) builds a `CLI.Completion`
+  handle without rendering, validating, or allocating; `app_name` is the only
+  runtime input besides the allocator and shell. The `Completion` type is
+  `CompletionOf(NS)`, specialized per generated namespace and re-aliasable
+  through the command shell. Its `text()` validates `app_name` and renders
+  the script (the caller owns and frees the string); `show(io)` renders and
+  writes it to stdout; `install(io, environ)` renders and drops it into the
+  shell's discovery directory (bash under
+  `$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh under
+  `$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under
+  `$XDG_CONFIG_HOME/fish/completions/<app>.fish`, falling back to
+  `$HOME/.local/share` and `$HOME/.config`, creating parent dirs), returning
+  `error.InstallUnsupported` without a home directory. Construction alone
+  never parses, reads the environment, or touches the filesystem. It exists on
+  every generated namespace but a non-root call is a compile error
+  (`app._command_rank != 0` in a comptime block); the command shell aliases it
+  without analyzing the body.
   `app_name` is the registered name, never `App.name`; it is validated before
   any allocation by `isValidCompletionAppName` (non-empty ASCII, no whitespace
   or control bytes, no `/`, not starting `-`, only `A-Za-z0-9._+-`), otherwise
@@ -310,18 +322,22 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   non-empty prefix shows every row whose primary or alias starts with it,
   plus only slot `pos`'s argument values. zsh merges a row when both spellings
   match, inserts the effective spelling (alias-only rows insert the alias),
-  and renders a left-aligned 2- or 3-column table via `compadd -o nosort
+  and renders a left-aligned 2- or 3-column table via `compadd -U -o nosort
   -V '' -l -d` (3 columns when any filtered row merged, two spaces between
-  columns, empty help without separator or trailing padding). fish prints
-  `candidate<TAB>description` in the same order from a static per-level table
-  and registers with `-k`; merged rows carry the alias in the description,
+  columns, empty help without separator or trailing padding). The aliases
+  folded into merged rows are added afterwards as hidden matches (`compadd -U
+  -n`), so zsh's common prefix spans both spellings: TAB on an empty word
+  inserts `-` rather than `--`, and menu selection can reach the alias.
+  fish prints `candidate<TAB>description` in the same order from a static
+  per-level table and registers with `-k`; merged rows carry the alias in the
+  description,
   unrepresentable spellings degrade as before, and `-f` stays omitted. bash
   keeps plain per-spelling names in `COMPREPLY` and `-o default`. Enumeration
   value positions stay ASCII-sorted and unpartitioned. No `Alt` pruning, no
   library candidates after `--`, deterministic bytes and exactly one trailing
-  `\n`. The caller owns the result. The example
-  tree declares a `completion` command whose `main` prints the script and
-  returns before any other output, so
+  `\n`. The example
+  tree declares a `completion` command whose `main` calls `Completion.show`
+  and returns before any other output, so
   `zig build run -- --required 0 completion <shell>` pipes cleanly. Two test
   surfaces with a hard split: the M19 block in `src/dap.zig` is pure Zig under
   `zig build test`; real shells are exercised only by

@@ -1,6 +1,6 @@
 .{
     .name = .dap,
-    .version = "0.0.15",
+    .version = "0.0.16",
     .minimum_zig_version = "0.17.0",
     .paths = .{""},
     .fingerprint = 0x9c7c91342200995d,

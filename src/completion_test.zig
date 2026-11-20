@@ -43,7 +43,7 @@ fn writeScripts(tmp: *std.testing.TmpDir) !void {
     };
 
     for (scripts) |entry| {
-        const script = try CLI.completion(std.testing.allocator, APP_NAME, entry.shell);
+        const script = try CLI.completion(std.testing.allocator, APP_NAME, entry.shell).text();
         defer std.testing.allocator.free(script);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
     }
@@ -153,6 +153,11 @@ fn zshExpectDisplays(
         std.testing.allocator,
         \\compdef() {{ :; }}
         \\compadd() {{
+        \\    local opt
+        \\    for opt in "$@"; do
+        \\        [[ $opt == -n ]] && return 0
+        \\        [[ $opt == -- ]] && break
+        \\    done
         \\    local d
         \\    for d in "${{displays[@]}}"; do print -r -- "$d"; done
         \\}}
@@ -172,6 +177,75 @@ fn zshExpectDisplays(
     defer std.testing.allocator.free(res.stderr);
     try expectSuccess(label, res);
     try expectLinesExact(std.testing.allocator, label, res.stdout, want);
+}
+
+/// Drive an interactive zsh under `zpty`, press TAB once at `words`, and
+/// return the resulting command line. This observes zsh's own common-prefix
+/// insertion, which the `compadd` display shim above cannot.
+fn zshTabCompletes(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    words: []const u8,
+) ![]u8 {
+    const driver =
+        \\zmodload zsh/zpty || exit 77
+        \\zmodload zsh/zselect || exit 77
+        \\trap 'zpty -d z 2>/dev/null' EXIT
+        \\
+        \\wait_match() {
+        \\    local name=$1 pat=$2 i=0 chunk acc=''
+        \\    while (( i < 500 )); do
+        \\        if zpty -r -mt $name chunk "$pat"; then
+        \\            acc+=$chunk
+        \\            REPLY=$acc
+        \\            return 0
+        \\        fi
+        \\        acc+=$chunk
+        \\        chunk=
+        \\        zselect -t 2
+        \\        (( i++ ))
+        \\    done
+        \\    return 1
+        \\}
+        \\
+        \\zpty z 'zsh -f -i' || exit 1
+        \\zpty -w z 'PROMPT="READY> "'
+        \\wait_match z '*READY> *' || exit 1
+        \\zpty -w z 'autoload -Uz compinit; compinit -u -D; source ../dap_completion_test.zsh'
+        \\zpty -w z 'inspect() { print -r -- "BUF:[$BUFFER]" }'
+        \\zpty -w z 'zle -N inspect; bindkey "^T" inspect'
+        \\zpty -w z 'PROMPT="READY2> "'
+        \\wait_match z '*READY2> *' || exit 1
+        \\zpty -w -n z "$1"
+        \\zpty -w -n z $'\t'
+        \\zpty -w -n z $'\x14'
+        \\wait_match z '*BUF:\[*\]*' || exit 1
+        \\local out=${REPLY##*BUF:\[}
+        \\print -r -- "${out%%]*}"
+        \\zpty -d z
+        \\
+    ;
+    try cwd.writeFile(std.testing.io, .{ .sub_path = "zpty.zsh", .data = driver });
+
+    const maybe = try runShell(cwd, &.{ "zsh", "-f", "zpty.zsh", words });
+    const res = maybe orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| {
+            if (code == 77) return error.SkipZigTest;
+            if (code != 0) {
+                std.debug.print("completion-test: {s} failed ({d})\n", .{ label, code });
+                std.debug.print("{s}", .{res.stderr});
+                return error.ShellFailed;
+            }
+        },
+        else => {
+            std.debug.print("completion-test: {s} did not exit normally\n", .{label});
+            return error.ShellFailed;
+        },
+    }
+    return try std.testing.allocator.dupe(u8, std.mem.trim(u8, res.stdout, " \t\r\n"));
 }
 
 fn bashComplete(
@@ -284,7 +358,7 @@ fn fishExpectLines(
 test "completion integration: registration uses app_name" {
     const shells = [_]dap.CompletionShell{ .bash, .zsh, .fish };
     inline for (shells) |shell| {
-        const script = try CLI.completion(std.testing.allocator, APP_NAME, shell);
+        const script = try CLI.completion(std.testing.allocator, APP_NAME, shell).text();
         defer std.testing.allocator.free(script);
 
         switch (shell) {
@@ -316,9 +390,9 @@ test "completion integration: registration uses app_name" {
         }
     }
 
-    const mine = try CLI.completion(std.testing.allocator, APP_NAME, .bash);
+    const mine = try CLI.completion(std.testing.allocator, APP_NAME, .bash).text();
     defer std.testing.allocator.free(mine);
-    const other = try CLI.completion(std.testing.allocator, "other-app", .bash);
+    const other = try CLI.completion(std.testing.allocator, "other-app", .bash).text();
     defer std.testing.allocator.free(other);
 
     try std.testing.expect(std.mem.indexOf(u8, other, "_dap_other_app") != null);
@@ -481,4 +555,20 @@ test "completion integration: zsh" {
         "--version",
         "--help         -h  -- Show context-sensitive help.",
     });
+
+    const dash = try zshTabCompletes(work, "zsh empty prefix inserts dash", "dap-completion-test pick red ");
+    defer std.testing.allocator.free(dash);
+    try std.testing.expectEqualStrings("dap-completion-test pick red -", dash);
+
+    const stays = try zshTabCompletes(work, "zsh dash prefix stays dash", "dap-completion-test pick red -");
+    defer std.testing.allocator.free(stays);
+    try std.testing.expectEqualStrings("dap-completion-test pick red -", stays);
+
+    const alias = try zshTabCompletes(work, "zsh alias completes", "dap-completion-test pick -d");
+    defer std.testing.allocator.free(alias);
+    try std.testing.expectEqualStrings("dap-completion-test pick -d", alias);
+
+    const long = try zshTabCompletes(work, "zsh long spelling completes", "dap-completion-test --col");
+    defer std.testing.allocator.free(long);
+    try std.testing.expectEqualStrings("dap-completion-test --color", long);
 }

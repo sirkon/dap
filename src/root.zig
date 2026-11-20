@@ -28,4 +28,7 @@ pub const HelpRendererHighlight = @import("dap.zig").HelpRendererHighlight;
 pub const HelpHighlight = @import("dap.zig").HelpHighlight;
 pub const CompletionShell = @import("dap.zig").CompletionShell;
 pub const CompletionError = @import("dap.zig").CompletionError;
+pub const CompletionOf = @import("dap.zig").CompletionOf;
+/// Generic completion handle: `dap.Completion(CLI)` equals `CLI.Completion`.
+pub const Completion = @import("dap.zig").CompletionOf;
 pub const generate = @import("dap.zig").generate;

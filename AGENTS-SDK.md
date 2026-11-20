@@ -492,17 +492,27 @@ the view, the local must be `var`.
 
 ### 5.1 Completion scripts
 
-`CLI.completion` renders a complete, installable completion script for the
-whole command tree, statically from the declaration (no `View`, no parse, no
-environment, no file I/O):
+`CLI.completion` builds a lazy `CLI.Completion` handle for the whole command
+tree, statically from the declaration. Construction is infallible and does no
+work (no `View`, no parse, no validation, no allocation, no environment, no
+file I/O):
 
 ```zig
-const script = try CLI.completion(allocator, "my-app", .zsh);
+var completion = CLI.completion(allocator, "my-app", .zsh);
+const script = try completion.text();
+defer allocator.free(script);
 ```
 
-`dap.CompletionShell` is `.bash`, `.zsh` or `.fish`; the result is caller-owned,
-deterministic, and ends with exactly one `\n`. Errors are `OutOfMemory` and
-`error.InvalidAppName` (validation runs before any allocation).
+`dap.CompletionShell` is `.bash`, `.zsh` or `.fish`. `text()` renders a
+caller-owned, deterministic script ending with exactly one `\n`; errors are
+`OutOfMemory` and `error.InvalidAppName` (validation runs before any
+allocation). `show(io)` renders and writes the script to stdout.
+`install(io, environ)` renders and writes it to the shell's discovery
+directory (bash under `$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh
+under `$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under
+`$XDG_CONFIG_HOME/fish/completions/<app>.fish`), falling back to
+`$HOME/.local/share` and `$HOME/.config` and creating parent directories.
+`environ` is the process environment, typically `init.minimal.environ`.
 
 `app_name` is the name the script **registers**, not `App.name` (which is a
 possibly multi-word usage path). It must be non-empty ASCII, must not start
@@ -512,6 +522,8 @@ the same program under another name.
 
 Only the **root** namespace may call it: a subcommand level cannot reconstruct
 its ancestors' flags, so `Sub.completion(...)` is a compile error.
+
+Writing the script manually remains possible:
 
 ```sh
 app completion bash > /etc/bash_completion.d/app
