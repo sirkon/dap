@@ -311,7 +311,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   (`--long` primary, `-short` alias) and one per command (primary wire name,
   synonym alias; empty and `-`-leading spellings are dropped), plus
   `completionArgumentEntries` for a positional slot (enumeration wire names,
-  deduplicated, carrying the argument's help). Ordering is family first
+  deduplicated, carrying the help declared on each value's own `dap.Enum`
+  branch, not the argument's help). Ordering is family first
   (normal, version, help; family is classified from the primary spelling:
   `help`/`--help`/lone `-h`, `version`/`--version`/lone `-v`), then help
   presence (rows with help before rows with none), then ASCII spelling.

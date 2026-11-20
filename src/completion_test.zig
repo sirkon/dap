@@ -13,8 +13,8 @@ const APP_NAME = "dap-completion-test";
 const IDENT = "dap_completion_test";
 
 const Mode = dap.Enumeration(.{
-    .red = dap.Enum{},
-    .green = dap.Enum{},
+    .red = dap.Enum{ .help = "Red." },
+    .green = dap.Enum{ .help = "Green." },
 });
 
 const CLI = dap.generate(dap.App{
@@ -484,8 +484,8 @@ test "completion integration: fish" {
         "run\t-- Run.",
     });
     try fishExpectLines(work, "phase: arguments", "dap-completion-test pick ", &.{
-        "green\t-- Kind.",
-        "red\t-- Kind.",
+        "green\t-- Green.",
+        "red\t-- Red.",
     });
     try fishExpectLines(work, "alias-only row", "dap-completion-test -d", &.{"-d\t-- Description of context."});
     try fishExpectLines(work, "version tail", "dap-completion-test --v", &.{ "--verbose\t-- Verbose.", "--version" });
@@ -542,8 +542,8 @@ test "completion integration: zsh" {
         "run      -- Run.",
     });
     try zshExpectDisplays(work, "zsh empty prefix arguments", "dap-completion-test pick ''", &.{
-        "green  -- Kind.",
-        "red    -- Kind.",
+        "green  -- Green.",
+        "red    -- Red.",
     });
     try zshExpectDisplays(work, "zsh alias-only row", "dap-completion-test pick -d", &.{"-d  -- Description of context."});
     try zshExpectDisplays(work, "zsh flags after slot", "dap-completion-test pick red ''", &.{
