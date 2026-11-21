@@ -8,9 +8,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dap = @import("dap");
+const fixture = @import("completion-fixture");
+const build_options = @import("build_options");
 
 const APP_NAME = "dap-completion-test";
 const IDENT = "dap_completion_test";
+const SCRIPT_BASH = "../dap_completion_test.bash";
+const SCRIPT_ZSH = "../dap_completion_test.zsh";
+const SCRIPT_FISH = "../dap_completion_test.fish";
+
+const PREDICTOR_APP_NAME = "dap-predictor-test";
+const PREDICTOR_IDENT = "dap_predictor_test";
+const PREDICTOR_SCRIPT_BASH = "../predictor.bash";
+const PREDICTOR_SCRIPT_ZSH = "../predictor.zsh";
+const PREDICTOR_SCRIPT_FISH = "../predictor.fish";
 
 const Mode = dap.Enumeration(.{
     .red = dap.Enum{ .help = "Red." },
@@ -36,7 +47,7 @@ const CLI = dap.generate(dap.App{
 });
 
 fn writeScripts(tmp: *std.testing.TmpDir) !void {
-    const scripts = [_]struct { shell: dap.CompletionShell, path: []const u8 }{
+    const scripts = [_]struct { shell: dap.Completion.Shell, path: []const u8 }{
         .{ .shell = .bash, .path = "dap_completion_test.bash" },
         .{ .shell = .zsh, .path = "dap_completion_test.zsh" },
         .{ .shell = .fish, .path = "dap_completion_test.fish" },
@@ -46,6 +57,48 @@ fn writeScripts(tmp: *std.testing.TmpDir) !void {
         const script = try CLI.completion(std.testing.allocator, APP_NAME, entry.shell).text();
         defer std.testing.allocator.free(script);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
+    }
+}
+
+/// Render the predictor fixture's scripts, symlink the fixture executable as
+/// `bin/dap-predictor-test` (the registered name), and populate `work/` with
+/// the files the predictors should list.
+fn writePredictorFixture(tmp: *std.testing.TmpDir, work: std.Io.Dir) !void {
+    const scripts = [_]struct { shell: dap.Completion.Shell, path: []const u8 }{
+        .{ .shell = .bash, .path = "predictor.bash" },
+        .{ .shell = .zsh, .path = "predictor.zsh" },
+        .{ .shell = .fish, .path = "predictor.fish" },
+    };
+
+    for (scripts) |entry| {
+        const script = try fixture.CLI.completion(std.testing.allocator, PREDICTOR_APP_NAME, entry.shell).text();
+        defer std.testing.allocator.free(script);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
+    }
+
+    const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        build_options.exe,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(fixture_path);
+
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    try tmp.dir.symLink(std.testing.io, fixture_path, "bin/" ++ PREDICTOR_APP_NAME, .{});
+
+    try work.createDirPath(std.testing.io, "assets/sub");
+    try work.createDirPath(std.testing.io, "native-dir");
+
+    const files = [_][]const u8{
+        "assets/alpha.txt",
+        "assets/beta.txt",
+        "assets/gamma.md",
+        "assets/sub/deep.txt",
+        "native-file.txt",
+        "plain.txt",
+    };
+    for (files) |path| {
+        try work.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
     }
 }
 
@@ -146,6 +199,8 @@ fn expectLinesExact(
 fn zshExpectDisplays(
     cwd: std.Io.Dir,
     comptime label: []const u8,
+    script: []const u8,
+    fn_name: []const u8,
     words: []const u8,
     want: []const []const u8,
 ) !void {
@@ -161,13 +216,15 @@ fn zshExpectDisplays(
         \\    local d
         \\    for d in "${{displays[@]}}"; do print -r -- "$d"; done
         \\}}
-        \\source ../dap_completion_test.zsh
+        \\_files() {{ print -r -- "FILES $*"; }}
+        \\export PATH="$PWD/../bin:$PATH"
+        \\source {s}
         \\words=({s})
         \\CURRENT=${{#words}}
         \\PREFIX=${{words[CURRENT]}}
-        \\_dap_completion_test
+        \\{s} || true
     ,
-        .{words},
+        .{ script, words, fn_name },
     );
     defer std.testing.allocator.free(code);
 
@@ -251,12 +308,15 @@ fn zshTabCompletes(
 fn bashComplete(
     cwd: std.Io.Dir,
     comptime label: []const u8,
+    script: []const u8,
+    ident: []const u8,
     words: []const u8,
     cword: u8,
 ) !?[]u8 {
     const code = try std.fmt.allocPrint(
         std.testing.allocator,
-        \\. ../dap_completion_test.bash
+        \\. {s}
+        \\export PATH="$PWD/../bin:$PATH"
         \\COMP_WORDS=({s})
         \\COMP_CWORD={d}
         \\_dap_{s}
@@ -264,7 +324,39 @@ fn bashComplete(
         \\    printf '%s\n' "${{COMPREPLY[@]}}"
         \\fi
     ,
-        .{ words, cword, IDENT },
+        .{ script, words, cword, ident },
+    );
+    defer std.testing.allocator.free(code);
+
+    const maybe = try runShell(cwd, &.{ "bash", "-c", code });
+    const res = maybe orelse return null;
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess(label, res);
+    return try std.testing.allocator.dupe(u8, res.stdout);
+}
+
+/// Run one bash case with a `compopt` stub and return the calls the generated
+/// function made. This observes fallback suppression without an interactive
+/// completion context.
+fn bashCompopt(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    script: []const u8,
+    ident: []const u8,
+    words: []const u8,
+    cword: u8,
+) !?[]u8 {
+    const code = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\compopt() {{ printf 'COMPOPT %s\n' "$*"; }}
+        \\. {s}
+        \\export PATH="$PWD/../bin:$PATH"
+        \\COMP_WORDS=({s})
+        \\COMP_CWORD={d}
+        \\_dap_{s}
+    ,
+        .{ script, words, cword, ident },
     );
     defer std.testing.allocator.free(code);
 
@@ -279,11 +371,13 @@ fn bashComplete(
 fn bashExpect(
     cwd: std.Io.Dir,
     comptime label: []const u8,
+    script: []const u8,
+    ident: []const u8,
     words: []const u8,
     cword: u8,
     want: []const []const u8,
 ) !void {
-    const got = try bashComplete(cwd, label, words, cword) orelse return error.SkipZigTest;
+    const got = try bashComplete(cwd, label, script, ident, words, cword) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(got);
     try expectCandidateSet(std.testing.allocator, label, got, want);
 }
@@ -291,20 +385,27 @@ fn bashExpect(
 fn bashExpectOrder(
     cwd: std.Io.Dir,
     comptime label: []const u8,
+    script: []const u8,
+    ident: []const u8,
     words: []const u8,
     cword: u8,
     want: []const []const u8,
 ) !void {
-    const got = try bashComplete(cwd, label, words, cword) orelse return error.SkipZigTest;
+    const got = try bashComplete(cwd, label, script, ident, words, cword) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(got);
     try expectLinesExact(std.testing.allocator, label, got, want);
 }
 
-fn fishComplete(cwd: std.Io.Dir, comptime label: []const u8, line: []const u8) !?[]u8 {
+fn fishComplete(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    script: []const u8,
+    line: []const u8,
+) !?[]u8 {
     const code = try std.fmt.allocPrint(
         std.testing.allocator,
-        "source ../dap_completion_test.fish; complete -C '{s}'",
-        .{line},
+        "set -gx PATH (pwd)/../bin $PATH; source {s}; complete -C '{s}'",
+        .{ script, line },
     );
     defer std.testing.allocator.free(code);
 
@@ -319,10 +420,11 @@ fn fishComplete(cwd: std.Io.Dir, comptime label: []const u8, line: []const u8) !
 fn fishExpect(
     cwd: std.Io.Dir,
     comptime label: []const u8,
+    script: []const u8,
     line: []const u8,
     want: []const []const u8,
 ) !void {
-    const got = try fishComplete(cwd, label, line) orelse return error.SkipZigTest;
+    const got = try fishComplete(cwd, label, script, line) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(got);
 
     var candidates: std.ArrayList(u8) = .empty;
@@ -347,16 +449,17 @@ fn fishExpect(
 fn fishExpectLines(
     cwd: std.Io.Dir,
     comptime label: []const u8,
+    script: []const u8,
     line: []const u8,
     want: []const []const u8,
 ) !void {
-    const got = try fishComplete(cwd, label, line) orelse return error.SkipZigTest;
+    const got = try fishComplete(cwd, label, script, line) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(got);
     try expectLinesExact(std.testing.allocator, label, got, want);
 }
 
 test "completion integration: registration uses app_name" {
-    const shells = [_]dap.CompletionShell{ .bash, .zsh, .fish };
+    const shells = [_]dap.Completion.Shell{ .bash, .zsh, .fish };
     inline for (shells) |shell| {
         const script = try CLI.completion(std.testing.allocator, APP_NAME, shell).text();
         defer std.testing.allocator.free(script);
@@ -384,7 +487,7 @@ test "completion integration: registration uses app_name" {
                 try std.testing.expect(std.mem.endsWith(
                     u8,
                     script,
-                    "complete -c 'dap-completion-test' -a '(__dap_dap_completion_test_complete)' -k\n",
+                    "complete -c 'dap-completion-test' -f -a '(__dap_dap_completion_test_complete)' -k\n",
                 ));
             },
         }
@@ -421,25 +524,25 @@ test "completion integration: bash" {
     defer std.testing.allocator.free(res.stderr);
     try expectSuccess("bash -n", res);
 
-    try bashExpect(work, "root flag prefix", "dap-completion-test --ver", 1, &.{ "--verbose", "--version" });
-    try bashExpect(work, "child command", "dap-completion-test ru", 1, &.{"run"});
-    try bashExpect(work, "child level candidates", "dap-completion-test run de", 2, &.{"deep"});
-    try bashExpect(work, "ancestor flag on child", "dap-completion-test run --ver", 2, &.{ "--verbose", "--version" });
-    try bashExpect(work, "enum separate value", "dap-completion-test --color ''", 2, &.{ "red", "green" });
-    try bashExpect(work, "enum eq with text", "dap-completion-test --color = r", 3, &.{"red"});
-    try bashExpect(work, "enum eq empty", "dap-completion-test --color =", 2, &.{ "=red", "=green" });
-    try bashExpect(work, "enum full form", "dap-completion-test --color=r", 1, &.{ "--color=red", "--color=green" });
-    try bashExpect(work, "non-enum value", "dap-completion-test --config ''", 2, &.{});
-    try bashExpect(work, "literal after terminator", "dap-completion-test -- x", 2, &.{});
+    try bashExpect(work, "root flag prefix", SCRIPT_BASH, IDENT, "dap-completion-test --ver", 1, &.{ "--verbose", "--version" });
+    try bashExpect(work, "child command", SCRIPT_BASH, IDENT, "dap-completion-test ru", 1, &.{"run"});
+    try bashExpect(work, "child level candidates", SCRIPT_BASH, IDENT, "dap-completion-test run de", 2, &.{"deep"});
+    try bashExpect(work, "ancestor flag on child", SCRIPT_BASH, IDENT, "dap-completion-test run --ver", 2, &.{ "--verbose", "--version" });
+    try bashExpect(work, "enum separate value", SCRIPT_BASH, IDENT, "dap-completion-test --color ''", 2, &.{ "red", "green" });
+    try bashExpect(work, "enum eq with text", SCRIPT_BASH, IDENT, "dap-completion-test --color = r", 3, &.{"red"});
+    try bashExpect(work, "enum eq empty", SCRIPT_BASH, IDENT, "dap-completion-test --color =", 2, &.{ "=red", "=green" });
+    try bashExpect(work, "enum full form", SCRIPT_BASH, IDENT, "dap-completion-test --color=r", 1, &.{ "--color=red", "--color=green" });
+    try bashExpect(work, "non-enum value", SCRIPT_BASH, IDENT, "dap-completion-test --config ''", 2, &.{});
+    try bashExpect(work, "literal after terminator", SCRIPT_BASH, IDENT, "dap-completion-test -- x", 2, &.{});
 
-    try bashExpectOrder(work, "phase: commands", "dap-completion-test ''", 1, &.{ "p", "pick", "run" });
-    try bashExpectOrder(work, "phase: arguments", "dap-completion-test pick ''", 2, &.{ "green", "red" });
-    try bashExpectOrder(work, "phase: flags after slot", "dap-completion-test pick red ''", 3, &.{
+    try bashExpectOrder(work, "phase: commands", SCRIPT_BASH, IDENT, "dap-completion-test ''", 1, &.{ "p", "pick", "run" });
+    try bashExpectOrder(work, "phase: arguments", SCRIPT_BASH, IDENT, "dap-completion-test pick ''", 2, &.{ "green", "red" });
+    try bashExpectOrder(work, "phase: flags after slot", SCRIPT_BASH, IDENT, "dap-completion-test pick red ''", 3, &.{
         "--color", "--config", "--description", "--note", "--verbose", "-d", "--version", "--help", "-h",
     });
-    try bashExpectOrder(work, "value token is not positional", "dap-completion-test pick --note x ''", 4, &.{ "green", "red" });
-    try bashExpectOrder(work, "alias-only insertion", "dap-completion-test pick -d", 2, &.{"-d"});
-    try bashExpectOrder(work, "version and help tail", "dap-completion-test -", 1, &.{
+    try bashExpectOrder(work, "value token is not positional", SCRIPT_BASH, IDENT, "dap-completion-test pick --note x ''", 4, &.{ "green", "red" });
+    try bashExpectOrder(work, "alias-only insertion", SCRIPT_BASH, IDENT, "dap-completion-test pick -d", 2, &.{"-d"});
+    try bashExpectOrder(work, "version and help tail", SCRIPT_BASH, IDENT, "dap-completion-test -", 1, &.{
         "--color", "--config", "--description", "--verbose", "-d", "--version", "--help", "-h",
     });
 }
@@ -463,15 +566,15 @@ test "completion integration: fish" {
     defer std.testing.allocator.free(res.stderr);
     try expectSuccess("fish -n", res);
 
-    try fishExpect(work, "root flag prefix", "dap-completion-test --co", &.{ "--config", "--color" });
-    try fishExpect(work, "child command", "dap-completion-test run de", &.{"deep"});
-    try fishExpect(work, "ancestor flag on child", "dap-completion-test run --ver", &.{ "--verbose", "--version" });
-    try fishExpect(work, "enum separate value", "dap-completion-test --color ", &.{ "red", "green" });
-    try fishExpect(work, "enum full form", "dap-completion-test --color=r", &.{"--color=red"});
-    try fishExpect(work, "non-enum value", "dap-completion-test --config ", &.{});
-    try fishExpect(work, "literal after terminator", "dap-completion-test -- ", &.{});
+    try fishExpect(work, "root flag prefix", SCRIPT_FISH, "dap-completion-test --co", &.{ "--config", "--color" });
+    try fishExpect(work, "child command", SCRIPT_FISH, "dap-completion-test run de", &.{"deep"});
+    try fishExpect(work, "ancestor flag on child", SCRIPT_FISH, "dap-completion-test run --ver", &.{ "--verbose", "--version" });
+    try fishExpect(work, "enum separate value", SCRIPT_FISH, "dap-completion-test --color ", &.{ "red", "green" });
+    try fishExpect(work, "enum full form", SCRIPT_FISH, "dap-completion-test --color=r", &.{"--color=red"});
+    try fishExpect(work, "non-enum value", SCRIPT_FISH, "dap-completion-test --config ", &.{});
+    try fishExpect(work, "literal after terminator", SCRIPT_FISH, "dap-completion-test -- ", &.{});
 
-    try fishExpectLines(work, "merged prefix rows", "dap-completion-test -", &.{
+    try fishExpectLines(work, "merged prefix rows", SCRIPT_FISH, "dap-completion-test -", &.{
         "--color\t-- Color.",
         "--config\t-- Config.",
         "--description\t-d  -- Description of context.",
@@ -479,16 +582,16 @@ test "completion integration: fish" {
         "--version",
         "--help\t-h  -- Show context-sensitive help.",
     });
-    try fishExpectLines(work, "phase: commands", "dap-completion-test ", &.{
+    try fishExpectLines(work, "phase: commands", SCRIPT_FISH, "dap-completion-test ", &.{
         "pick\tp  -- Pick.",
         "run\t-- Run.",
     });
-    try fishExpectLines(work, "phase: arguments", "dap-completion-test pick ", &.{
+    try fishExpectLines(work, "phase: arguments", SCRIPT_FISH, "dap-completion-test pick ", &.{
         "green\t-- Green.",
         "red\t-- Red.",
     });
-    try fishExpectLines(work, "alias-only row", "dap-completion-test -d", &.{"-d\t-- Description of context."});
-    try fishExpectLines(work, "version tail", "dap-completion-test --v", &.{ "--verbose\t-- Verbose.", "--version" });
+    try fishExpectLines(work, "alias-only row", SCRIPT_FISH, "dap-completion-test -d", &.{"-d\t-- Description of context."});
+    try fishExpectLines(work, "version tail", SCRIPT_FISH, "dap-completion-test --v", &.{ "--verbose\t-- Verbose.", "--version" });
 }
 
 test "completion integration: zsh" {
@@ -525,7 +628,7 @@ test "completion integration: zsh" {
     const trimmed = std.mem.trim(u8, smoke.stdout, " \t\r\n");
     try std.testing.expectEqualStrings("_dap_completion_test: function", trimmed);
 
-    try zshExpectDisplays(work, "zsh three columns", "dap-completion-test -", &.{
+    try zshExpectDisplays(work, "zsh three columns", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test -", &.{
         "--color            -- Color.",
         "--config           -- Config.",
         "--description  -d  -- Description of context.",
@@ -533,20 +636,20 @@ test "completion integration: zsh" {
         "--version",
         "--help         -h  -- Show context-sensitive help.",
     });
-    try zshExpectDisplays(work, "zsh two columns", "dap-completion-test --v", &.{
+    try zshExpectDisplays(work, "zsh two columns", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test --v", &.{
         "--verbose  -- Verbose.",
         "--version",
     });
-    try zshExpectDisplays(work, "zsh empty prefix commands", "dap-completion-test ''", &.{
+    try zshExpectDisplays(work, "zsh empty prefix commands", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test ''", &.{
         "pick  p  -- Pick.",
         "run      -- Run.",
     });
-    try zshExpectDisplays(work, "zsh empty prefix arguments", "dap-completion-test pick ''", &.{
+    try zshExpectDisplays(work, "zsh empty prefix arguments", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test pick ''", &.{
         "green  -- Green.",
         "red    -- Red.",
     });
-    try zshExpectDisplays(work, "zsh alias-only row", "dap-completion-test pick -d", &.{"-d  -- Description of context."});
-    try zshExpectDisplays(work, "zsh flags after slot", "dap-completion-test pick red ''", &.{
+    try zshExpectDisplays(work, "zsh alias-only row", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test pick -d", &.{"-d  -- Description of context."});
+    try zshExpectDisplays(work, "zsh flags after slot", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test pick red ''", &.{
         "--color            -- Color.",
         "--config           -- Config.",
         "--description  -d  -- Description of context.",
@@ -571,4 +674,170 @@ test "completion integration: zsh" {
     const long = try zshTabCompletes(work, "zsh long spelling completes", "dap-completion-test --col");
     defer std.testing.allocator.free(long);
     try std.testing.expectEqualStrings("dap-completion-test --color", long);
+}
+
+test "completion integration: bash predictors" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const work = try tmp.dir.createDirPathOpen(std.testing.io, "work", .{});
+    defer work.close(std.testing.io);
+    try writePredictorFixture(&tmp, work);
+
+    const syntax = try runShell(work, &.{ "bash", "-n", PREDICTOR_SCRIPT_BASH });
+    const res = syntax orelse {
+        std.debug.print("completion-test: bash not found; skipping predictor checks\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess("bash -n predictors", res);
+
+    try bashExpect(work, "callback values", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --cb ''", 2, &.{ "alpha", "beta" });
+    try bashExpect(work, "callback prefix", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --cb al", 2, &.{"alpha"});
+    try bashExpect(work, "callback eq re-attach", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --cb=al", 1, &.{"--cb=alpha"});
+    try bashExpect(work, "disabled stays empty", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --off ''", 2, &.{});
+    try bashExpect(work, "explicit empty does not fall back", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --cb zzz", 2, &.{});
+    try bashExpect(work, "null keeps the default fallback", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --plain ''", 2, &.{});
+    try bashExpect(work, "terminator runs no predictor", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test -- --cb ''", 3, &.{});
+    try bashExpect(work, "inline launch", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --launch ''", 2, &.{"launched"});
+    try bashExpect(work, "inline call", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --call c", 2, &.{ "cone", "ctwo" });
+    try bashExpect(work, "native files", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --native ''", 2, &.{
+        "assets", "native-dir", "native-file.txt", "plain.txt",
+    });
+    try bashExpect(work, "native directories", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --dirs ''", 2, &.{ "assets", "native-dir" });
+    try bashExpect(work, "rooted wildcard", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --assets ''", 2, &.{ "alpha.txt", "beta.txt", "sub/" });
+    try bashExpect(work, "rooted descent", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --assets sub/", 2, &.{"sub/deep.txt"});
+    try bashExpect(work, "rooted eq re-attach", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --assets=al", 1, &.{"--assets=alpha.txt"});
+    try bashExpect(work, "callback positional", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test pick ''", 2, &.{ "alpha", "beta" });
+    try bashExpect(work, "filesystem positional", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test pick alpha ''", 3, &.{
+        "assets/", "native-dir/", "native-file.txt", "plain.txt",
+    });
+
+    const off = try bashCompopt(work, "disabled compopt", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --off ''", 2) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(off);
+    try expectLinesExact(std.testing.allocator, "disabled compopt", off, &.{"COMPOPT +o default"});
+
+    const empty = try bashCompopt(work, "explicit empty compopt", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --cb zzz", 2) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(empty);
+    try expectLinesExact(std.testing.allocator, "explicit empty compopt", empty, &.{"COMPOPT +o default"});
+
+    const plain = try bashCompopt(work, "null compopt", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --plain ''", 2) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(plain);
+    try expectLinesExact(std.testing.allocator, "null compopt", plain, &.{});
+
+    const native = try bashCompopt(work, "native compopt", PREDICTOR_SCRIPT_BASH, PREDICTOR_IDENT, "dap-predictor-test --native ''", 2) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(native);
+    try expectLinesExact(std.testing.allocator, "native compopt", native, &.{"COMPOPT -o filenames"});
+
+    // `-o default` stays on the registration, so a null target keeps bash's
+    // file fallback even though the generated function leaves COMPREPLY empty.
+    const registration = try runShell(work, &.{ "bash", "-c", "source ../predictor.bash; complete -p dap-predictor-test" }) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(registration.stdout);
+    defer std.testing.allocator.free(registration.stderr);
+    try expectSuccess("bash registration", registration);
+    try std.testing.expect(std.mem.indexOf(u8, registration.stdout, "-o default") != null);
+    try std.testing.expect(std.mem.indexOf(u8, registration.stdout, "_dap_dap_predictor_test") != null);
+}
+
+test "completion integration: zsh predictors" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const work = try tmp.dir.createDirPathOpen(std.testing.io, "work", .{});
+    defer work.close(std.testing.io);
+    try writePredictorFixture(&tmp, work);
+
+    const syntax = try runShell(work, &.{ "zsh", "-n", PREDICTOR_SCRIPT_ZSH });
+    const res = syntax orelse {
+        std.debug.print("completion-test: zsh not found; skipping predictor checks\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess("zsh -n predictors", res);
+
+    try zshExpectDisplays(work, "zsh callback descriptions", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --cb ''", &.{
+        "alpha  -- Alpha value.",
+        "beta",
+    });
+    try zshExpectDisplays(work, "zsh callback prefix", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --cb al", &.{"alpha  -- Alpha value."});
+    try zshExpectDisplays(work, "zsh callback eq re-attach", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --cb=al", &.{"--cb=alpha  -- Alpha value."});
+    try zshExpectDisplays(work, "zsh disabled stays empty", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --off ''", &.{});
+    try zshExpectDisplays(work, "zsh explicit empty no fallback", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --cb zzz", &.{});
+    try zshExpectDisplays(work, "zsh null does not call _files", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --plain ''", &.{});
+    try zshExpectDisplays(work, "zsh terminator runs no predictor", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test -- --cb ''", &.{});
+    try zshExpectDisplays(work, "zsh inline launch", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --launch ''", &.{"launched"});
+    try zshExpectDisplays(work, "zsh inline call", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --call c", &.{ "cone", "ctwo" });
+    try zshExpectDisplays(work, "zsh native files", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --native ''", &.{"FILES "});
+    try zshExpectDisplays(work, "zsh native directories", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --dirs ''", &.{"FILES -/"});
+    try zshExpectDisplays(work, "zsh rooted wildcard", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --assets ''", &.{ "alpha.txt", "beta.txt", "sub/" });
+    try zshExpectDisplays(work, "zsh rooted descent", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --assets sub/", &.{"sub/deep.txt"});
+    try zshExpectDisplays(work, "zsh rooted eq re-attach", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --assets=al", &.{"--assets=alpha.txt"});
+    try zshExpectDisplays(work, "zsh callback positional", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test pick ''", &.{
+        "alpha  -- Alpha value.",
+        "beta",
+    });
+    try zshExpectDisplays(work, "zsh filesystem positional", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test pick alpha ''", &.{
+        "assets/",
+        "native-dir/",
+        "native-file.txt",
+        "plain.txt",
+    });
+}
+
+test "completion integration: fish predictors" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const work = try tmp.dir.createDirPathOpen(std.testing.io, "work", .{});
+    defer work.close(std.testing.io);
+    try writePredictorFixture(&tmp, work);
+
+    const syntax = try runShell(work, &.{ "fish", "--no-config", "-n", PREDICTOR_SCRIPT_FISH });
+    const res = syntax orelse {
+        std.debug.print("completion-test: fish not found; skipping predictor checks\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess("fish -n predictors", res);
+
+    try fishExpectLines(work, "fish callback descriptions", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --cb ", &.{
+        "alpha\tAlpha value.",
+        "beta",
+    });
+    try fishExpectLines(work, "fish callback prefix", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --cb al", &.{"alpha\tAlpha value."});
+    try fishExpectLines(work, "fish callback eq re-attach", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --cb=al", &.{"--cb=alpha\tAlpha value."});
+    try fishExpectLines(work, "fish disabled stays empty", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --off ", &.{});
+    try fishExpectLines(work, "fish explicit empty no fallback", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --cb zzz", &.{});
+    try fishExpectLines(work, "fish terminator runs no predictor", PREDICTOR_SCRIPT_FISH, "dap-predictor-test -- --cb ", &.{});
+    try fishExpectLines(work, "fish inline launch", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --launch ", &.{"launched"});
+    try fishExpectLines(work, "fish inline call", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --call c", &.{ "cone", "ctwo" });
+    try fishExpect(work, "fish null path fallback", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --plain ", &.{
+        "assets/", "native-dir/", "native-file.txt", "plain.txt",
+    });
+    try fishExpect(work, "fish native files", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --native ", &.{
+        "assets/", "native-dir/", "native-file.txt", "plain.txt",
+    });
+    try fishExpectLines(work, "fish native directories", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --dirs ", &.{
+        "assets/\tDirectory",
+        "native-dir/\tDirectory",
+    });
+    try fishExpect(work, "fish rooted wildcard", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --assets ", &.{ "alpha.txt", "beta.txt", "sub/" });
+    try fishExpect(work, "fish rooted descent", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --assets sub/", &.{"sub/deep.txt"});
+    try fishExpectLines(work, "fish rooted eq re-attach", PREDICTOR_SCRIPT_FISH, "dap-predictor-test --assets=al", &.{"--assets=alpha.txt"});
+    try fishExpectLines(work, "fish callback positional", PREDICTOR_SCRIPT_FISH, "dap-predictor-test pick ", &.{
+        "alpha\tAlpha value.",
+        "beta",
+    });
+    try fishExpect(work, "fish filesystem positional", PREDICTOR_SCRIPT_FISH, "dap-predictor-test pick alpha ", &.{
+        "assets/", "native-dir/", "native-file.txt", "plain.txt",
+    });
 }

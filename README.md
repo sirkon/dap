@@ -228,9 +228,9 @@ const script = try completion.text();
 defer arena.allocator().free(script);
 ```
 
-`CompletionShell` is `.bash`, `.zsh` or `.fish`. `text()` returns a caller-owned
+`dap.Completion.Shell` is `.bash`, `.zsh` or `.fish`. `text()` returns a caller-owned
 `[]const u8` (a `dap.String`) with exactly one trailing newline; failures are
-`OutOfMemory` or `dap.CompletionError.InvalidAppName`. The output is
+`OutOfMemory` or `dap.Completion.Error.InvalidAppName`. The output is
 deterministic, so it can be regenerated and diffed. `show(io)` renders and
 writes the script to stdout. `install(io, environ)` renders and writes it to
 the shell's discovery directory (bash under
@@ -250,6 +250,82 @@ an alias.
 `completion` exists on every generated namespace but may only be called on the
 root one: a call from a subcommand level is a compile error, because a subtree
 cannot reconstruct its ancestors' flags.
+
+### Value prediction
+
+By default a value position keeps the shell's file fallback (fish gets it from
+the generated `__fish_complete_path` helper because the script registers with
+`-f`). `Flag(T)` and `Argument(T)` accept a `completion` field to override
+that:
+
+```zig
+const dap = @import("dap");
+
+const def = .{
+    .config = dap.Flag(dap.String){
+        .completion = dap.Completion.fs(.{ .wildcard = "*.toml", .root = "config" }),
+    },
+    .mode = dap.Flag(dap.String){
+        .completion = dap.Completion.disabled(),
+    },
+    .item = dap.Argument(dap.String){
+        .completion = dap.Completion.custom(suggestItems),
+    },
+};
+```
+
+| declaration | values |
+| --- | --- |
+| `null` (the default) | the shell's fallback, unchanged |
+| `dap.Completion.fs(.{})` | identical to `null`; `wildcard = "*"` with no `root` is the native mapping |
+| `dap.Completion.fs(.{ ... })` | a custom wildcard, type or root, evaluated by the binary |
+| `dap.Completion.disabled()` | nothing, and suppresses the shell fallback |
+| `dap.Completion.launch(.{ "cmd", "$cur" })` | a literal command line in the script |
+| `dap.Completion.call("printf ...")` | shell source inserted verbatim |
+| `dap.Completion.custom(cb)` | a callback in the binary, invoked through the hidden route |
+
+`fs` takes `.wildcard` (basename-only `*` and `?`, default `"*"`), `.type`
+(`.all` or `.dir`) and `.root` (a process-cwd relative path whose prefix is
+never emitted). Only the native combination maps to the shell directly; every
+other `fs` spawns the binary. Directories end in `/`, dot entries are listed
+only when the typed name starts with `.`, and values are relative to `root`.
+`launch` materializes a tuple, array or slice at comptime; an element exactly
+equal to `$cur` expands the current word, and the current word is not appended
+otherwise. `call` is a single string inserted into every generated dialect, so
+it must be valid in each shell you generate for; it sees `cur` and the array or
+list `line` (the words before `cur`, program included).
+
+Predictors are a compile error on `bool` and `Enumeration` targets, including
+`.disabled`; those keep their names and static values. A predictor replaces the
+static values of its target. On a positional slot it runs immediately on an
+empty word, after `--` it never runs, and `--flag=value` strips `--flag=`
+before the value is matched and re-attaches it to every result. Native and
+`null` targets keep the shell fallback; an explicit predictor that returns
+nothing does not fall back to files.
+
+The runtime completion route is a hidden call into the application itself.
+The shell invokes `app ---608b59fe-b7a9-407a-b0f5-77640a2c1957 <index> <cur>
+<line...>`. The first argument is the exact marker; the application checks it
+before parsing anything. `index` addresses a compile-time binding and is used
+only by callback predictors and non-native filesystem predictors. The
+application writes one candidate per line to stdout, either `value` or
+`value<TAB>help`, and exits `0` on success (including zero candidates), `1` on
+predictor failure, and `2` on misuse. Stdout is empty on any non-zero exit.
+Diagnostics go to stderr only when `_DAP_DIAGNOSTICS=1`. Because the route runs
+at the very start of `parse`, an application must do no file, socket, or
+network work before `parse` is called.
+
+A callback has the type `*const fn (std.mem.Allocator, []const u8,
+[]const []const u8) anyerror![]const dap.Completion.Suggestion`. It owns its
+result: allocate the slice, every `value` and every non-null `help` with the
+allocator it was given, and never return string literals. The route frees a
+successful result after rendering it; on an error the callback must release
+whatever partial result it built. `cur` is already stripped of an inline
+`--flag=` prefix.
+
+The catalog of flag names, commands and enumeration values is still a snapshot
+of the declaration; only predictor-backed values are queried at completion
+time.
 
 ### Candidate selection and ordering
 
@@ -324,13 +400,18 @@ is `app_name` with every byte outside `[A-Za-z0-9_]` replaced by `_`
 verbatim: bash's trailing `complete` line and fish's `complete -c` need no
 external file naming, and a single script registers exactly one name.
 
-Regenerate the script whenever flags or commands change; it is a snapshot, not
-a runtime query. Limitations: identifier sanitization is not injective
+Regenerate the script whenever flags or commands change; the name catalog is a
+snapshot, not a runtime query. Predictor-backed values are the exception: they
+are resolved on every Tab, either by the shell's own filesystem completion or
+by the binary's hidden route. Limitations: identifier sanitization is not
+injective
 (`my-app` and `my_app` both map to `_my_app`), so two `dap` CLIs sourced into
 one bash or fish session can collide; zsh is namespaced by the function name.
 All three shells have semantic integration tests: bash and fish run real
 completion cases, and zsh runs the generated function against a `compadd`
 stub that captures the displayed rows, plus syntax and autoload smoke tests.
+A second fixture application exercises callbacks, both filesystem forms,
+`disabled`, `launch`, `call` and `--flag=value` through the real route.
 
 ## Building and testing
 
@@ -342,5 +423,7 @@ zig build completion-test  # run generated scripts through real shells
 
 `completion-test` is opt-in: `zig build test` never compiles the shell
 integration file or spawns a shell. The completion test runs `bash -n`,
-`zsh -n` and `fish -n`, semantic bash and fish cases, and a zsh sourcing smoke
-test; a missing shell prints a notice and skips that shell.
+`zsh -n` and `fish -n`, semantic bash and fish cases, a zsh sourcing smoke
+test, and the predictor matrix against a fixture executable built from
+`src/completion_fixture.zig`; a missing shell prints a notice and skips that
+shell.

@@ -39,14 +39,40 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_dap_tests.step);
 
-    const completion_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/completion_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const fixture_module = b.createModule(.{
+        .root_source_file = b.path("src/completion_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    completion_tests.root_module.addImport("dap", dap_module);
+    fixture_module.addImport("dap", dap_module);
+
+    const fixture_exe = b.addExecutable(.{
+        .name = "dap-completion-fixture",
+        .root_module = fixture_module,
+    });
+
+    const fixture_options = b.addOptions();
+    fixture_options.addOptionPath("exe", fixture_exe.getEmittedBin());
+
+    const completion_test_module = b.createModule(.{
+        .root_source_file = b.path("src/completion_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    completion_test_module.addImport("dap", dap_module);
+
+    const fixture_import = b.createModule(.{
+        .root_source_file = b.path("src/completion_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fixture_import.addImport("dap", dap_module);
+    completion_test_module.addImport("completion-fixture", fixture_import);
+    completion_test_module.addOptions("build_options", fixture_options);
+
+    const completion_tests = b.addTest(.{
+        .root_module = completion_test_module,
+    });
 
     const run_completion_tests = b.addRunArtifact(completion_tests);
 

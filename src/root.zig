@@ -26,9 +26,5 @@ pub const HelpData = @import("dap.zig").HelpData;
 pub const HelpRendererStyle = @import("dap.zig").HelpRendererStyle;
 pub const HelpRendererHighlight = @import("dap.zig").HelpRendererHighlight;
 pub const HelpHighlight = @import("dap.zig").HelpHighlight;
-pub const CompletionShell = @import("dap.zig").CompletionShell;
-pub const CompletionError = @import("dap.zig").CompletionError;
-pub const CompletionOf = @import("dap.zig").CompletionOf;
-/// Generic completion handle: `dap.Completion(CLI)` equals `CLI.Completion`.
-pub const Completion = @import("dap.zig").CompletionOf;
+pub const Completion = @import("dap.zig").Completion;
 pub const generate = @import("dap.zig").generate;

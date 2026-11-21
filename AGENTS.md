@@ -10,26 +10,36 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (273 tests, the milestone-tagged M1–M19
+`zig test src/dap.zig` both pass (314 tests, the milestone-tagged M1–M26
 blocks). There is no `PLAN.md`; the test names are the plan of record.
 
-- `src/dap.zig` holds everything: DSL types, spec normalization, `generate`,
+- `src/dap.zig` holds the DSL, spec normalization, `generate`,
   `Enumeration`, `Command`, `Alt`, runtime help (`HelpData` +
-  `renderHelpWithStyle`/`renderCompact`), completion scripts
-  (`CompletionShell`/`CompletionError` + the emitters), typo suggestions
-  (`SuggestValid`/`Suggest` + the `suggest*` family), `DecodeError`/
-  `ParseError`, `Diag`, and the test suite.
+  `renderHelpWithStyle`/`renderCompact`), typo suggestions (`SuggestValid`/
+  `Suggest` + the `suggest*` family), `DecodeError`/`ParseError`, `Diag`, the
+  `_completion_internal` bridge, the generated wiring, and the test suite.
+- `src/completion.zig` owns the whole completion feature: the public
+  `Completion` namespace, the `Level`/`Binding`/`Model` tables, script
+  emitters, the hidden route, and the M19–M26 tests. It imports `dap.zig`
+  directly; the cycle resolves lazily.
 - `src/stdcompare.zig` holds the private `levenshtein` helper the suggester
   ranks with; it is imported directly by `dap.zig` (not re-exported).
+- `src/completion_fixture.zig` is the predictor fixture application: it
+  declares a callback, native and binary filesystem targets, `disabled`,
+  `launch`, `call`, and positional predictors, and its `main` calls `parse` so
+  the shell route works. `completion-test` builds it as
+  `dap-completion-fixture`.
 - `src/completion_test.zig` is the opt-in shell integration suite; it imports
-  the public module and is compiled only by the `completion-test` step.
+  the public module and the fixture, and is compiled only by the
+  `completion-test` step.
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
   `usingnamespace`; exports are explicit).
 - `build.zig` exposes a public `dap` module rooted at `src/root.zig`, builds a
   `dap-example` executable from `src/main.zig` with a `run` step, a `test` step
   compiling/running tests from `src/dap.zig`, and a separate `completion-test`
-  step for `src/completion_test.zig`. `test` never depends on
-  `completion-test`, so it never spawns a shell.
+  step for `src/completion_test.zig`. The completion step also builds the
+  fixture executable and passes its path through a `build_options` module.
+  `test` never depends on `completion-test`, so it never spawns a shell.
 - `build.zig.zon` sets `.name = .dap` and `.minimum_zig_version = "0.17.0"`.
   Match that version.
 
@@ -39,8 +49,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
 ## Layout
 
 - `src/dap.zig` — core implementation. Public data types (`Kind`,
-  `HelpRendererStyle`, `HelpRendererHighlight`, `CompletionShell`,
-  `CompletionError`, `CompletionOf`, `App`, `HelpHighlight`,
+  `HelpRendererStyle`, `HelpRendererHighlight`, `App`, `HelpHighlight`,
   `String`, `Default(T)`, `defaultValue`, `Flag(T)`, `Optional`, `Group`,
   `Argument(T)`, `Enumeration`, `Enum`, `CommandMeta`, `Command`,
   `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`,
@@ -54,28 +63,41 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `dedupeBuiltinHelp`, `appendActiveScopes`, `contextHelpText`) and the
   builtin-help injection helpers (`builtin_help_field`, `BuiltinHelp`,
   `MergedDecl`, `withBuiltinHelp`, `renderHelpWithStyle`) follow.
-- The private `suggest*` family follows, then the private completion
-  scaffolding (`CompletionLevel`, `completionLevels`, `enumWireNames`,
-  `isValidCompletionAppName`, `completionIdent`, `CompletionQuote`,
-  `appendQuoted`, `appendSanitized`, `appendLevelMarker`,
-  `valueFlagSpellings`, `completionCommands`/`completionFlagCandidates`/
-  `completionCandidates`, `completionCandidateHelp`, `enumCandidates`,
-  `completionScript`, `emitBash`/`emitZsh`/`emitFish`). `Base.completion` sits
+- The private `suggest*` family follows. Then the completion bridge and alias:
+  `const completion_mod = @import("completion.zig");`,
+  `pub const _completion_internal = struct { pub const Spec = Spec; pub const
+  CommandEntry = CommandEntry; pub const Sub = Sub; pub const subApp = subApp;
+  };`, and `pub const Completion = completion_mod.Completion;`. The bridge is
+  exactly these four names and is not public API. `Base.completion` sits
   beside `helpData`/`helpText`/`usage`, and the command shell aliases it.
 - Then the public `generate` entry point (its namespace body named `Base`, plus
   the conditional forwarding shell that adds `CommandPayload`/`command` when
   commands exist), then the private normalization/decode helpers (`Spec`,
   `Defaults`/`DefaultRepr`, `normalize`/`normalizeRanked`,
-  `commandSubtreeCount`, `specFromField`,
+  `commandSubtreeCount`, `specFromField`, `declCompletion`,
   `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `helpRequested`,
   `validateAlt`, `resolveAbsent`, the `check*` validators plus
   `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
   `Sub`/`subApp`/`CommandPayloadOf`/`commandNodes`), then
   the test blocks.
+- `src/completion.zig` — the completion feature. Public `Completion`
+  (`Shell`, `Error`, `route_marker`, `FsOptions`, `Suggestion`, `Predictor`,
+  `disabled`/`fs`/`launch`/`call`/`custom`, and the lazy `Of(NS)` handle)
+  comes first, then the private `Level`/`Binding`/`Model` tables and
+  `model`/`modelWalk`/`isNativeFs`/`routeBinding`; entry, row, quoting,
+  install-target and argument-candidate builders; the emitters
+  (`emitBash`/`emitZsh`/`emitFish` with their native-fs, inline, dynamic and
+  slot-predictor helpers); the route (`freeSuggestions`, `renderSuggestions`,
+  `fsSuggestions`, `routeSuggestions`, `route`, `routeDiagnose`); then the
+  M19–M26 tests. All completion code lives here.
+- `src/completion_fixture.zig` — predictor fixture application and its
+  declaration; built as an executable by `completion-test`.
 - `src/completion_test.zig` — opt-in shell integration tests (syntax checks,
-  semantic bash/fish cases, zsh sourcing smoke test); imports the public
-  `dap` module and never runs under `zig build test`.
-- `src/root.zig` — public module root; explicit re-exports from `dap.zig`.
+  the static command matrix, and the predictor matrix through the fixture
+  executable); imports the public `dap` module and never runs under
+  `zig build test`.
+- `src/root.zig` — public module root; explicit re-exports from `dap.zig`
+  (`Completion` is one of them).
 
 ## Conventions
 
@@ -279,15 +301,16 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   otherwise prints the block standalone (`printDiagnosticsStandalone`); a
   failed render or diagnostic build falls back to the standalone lines so
   diagnostics are never lost.
-- Completion is static and lazy. `CLI.completion(allocator, app_name,
-  shell)` (beside `helpData`/`helpText`/`usage`) builds a `CLI.Completion`
-  handle without rendering, validating, or allocating; `app_name` is the only
-  runtime input besides the allocator and shell. The `Completion` type is
-  `CompletionOf(NS)`, specialized per generated namespace and re-aliasable
-  through the command shell. Its `text()` validates `app_name` and renders
-  the script (the caller owns and frees the string); `show(io)` renders and
-  writes it to stdout; `install(io, environ)` renders and drops it into the
-  shell's discovery directory (bash under
+- Completion is lazy, model-driven and split across two files.
+  `CLI.completion(allocator, app_name, shell)` (beside
+  `helpData`/`helpText`/`usage`) builds a `CLI.Completion` handle without
+  rendering, validating, or allocating; `app_name` is the only runtime input
+  besides the allocator and shell. The `Completion` public type lives in
+  `completion.zig`; `generate` aliases `Completion.Of(NS)` per namespace and
+  the command shell re-aliases it. Its `text()` validates `app_name` and
+  renders the script (the caller owns and frees the string); `show(io)`
+  renders and writes it to stdout; `install(io, environ)` renders and drops it
+  into the shell's discovery directory (bash under
   `$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh under
   `$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under
   `$XDG_CONFIG_HOME/fish/completions/<app>.fish`, falling back to
@@ -303,11 +326,19 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `error.InvalidAppName`. Registration quotes `app_name` verbatim; shell
   identifiers come only from `completionIdent` (bytes outside `[A-Za-z0-9_]`
   become `_`): bash `_dap_<ident>`, zsh `_<ident>`, fish
-  `__dap_<ident>_complete`. `completionLevels(NS, &.{})` builds a pre-order
-  `CompletionLevel` table by re-instantiating `Sub(c.Cmd, subApp(NS.app_meta,
-  c))`: each level carries its rank, usage path, effective flags
-  (ancestors first, own after, injected builtin once), own arguments, and own
-  commands. Candidates come from `CompletionEntry` rows: one row per flag
+  `__dap_<ident>_complete`.
+- `model(NS)` builds one pre-order `Model` by re-instantiating
+  `Sub(c.Cmd, subApp(NS.app_meta, c))`. `Model.levels` holds `Level` values
+  (rank, usage path, effective flags, own arguments, own commands), and
+  `Model.bindings` is a dense first-seen table of route-backed value targets.
+  Each level's `flag_bindings`/`argument_bindings` are aligned with its
+  `flags`/`arguments` and hold a `?usize` index into `Model.bindings`.
+  Effective flags keep ancestors first, own after, the injected builtin once;
+  an inherited flag reuses the ancestor's binding index (matched by its
+  globally unique long name). Only `.callback` and non-native `.fs` create
+  bindings; `null`, `.disabled`, native `.fs`, `.launch` and `.call` create
+  none. Native means `wildcard == "*"` and `root == null`.
+- Static candidates come from `CompletionEntry` rows: one row per flag
   (`--long` primary, `-short` alias) and one per command (primary wire name,
   synonym alias; empty and `-`-leading spellings are dropped), plus
   `completionArgumentEntries` for a positional slot (enumeration wire names,
@@ -331,22 +362,73 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   inserts `-` rather than `--`, and menu selection can reach the alias.
   fish prints `candidate<TAB>description` in the same order from a static
   per-level table and registers with `-k`; merged rows carry the alias in the
-  description,
-  unrepresentable spellings degrade as before, and `-f` stays omitted. bash
-  keeps plain per-spelling names in `COMPREPLY` and `-o default`. Enumeration
-  value positions stay ASCII-sorted and unpartitioned. No `Alt` pruning, no
-  library candidates after `--`, deterministic bytes and exactly one trailing
-  `\n`. The example
-  tree declares a `completion` command whose `main` calls `Completion.show`
-  and returns before any other output, so
+  description, unrepresentable spellings degrade as before, and `-f` is always
+  used. bash keeps plain per-spelling names in `COMPREPLY` and `-o default`.
+  Enumeration value positions stay ASCII-sorted and unpartitioned. No `Alt`
+  pruning, no library candidates after `--`, deterministic bytes and exactly
+  one trailing `\n`.
+- Predictors. `Flag(T)`/`Argument(T)` carry
+  `completion: ?Completion.Predictor = null`, copied into `Spec.completion`
+  by `declCompletion`/`specFromField`, so `Group` and `Alt` members are
+  covered. A predictor on a `bool` or an `Enumeration` result is a
+  `@compileError` (`isEnumerationType` checks the `dap_enumeration` marker
+  both `Enumeration` shapes declare), including `.disabled`. `null` and native
+  `.fs` behave identically and keep the shell fallback. `.disabled` emits
+  nothing and suppresses the fallback for that target. Non-native `.fs` lists
+  files under `root` with a basename-only `*`/`?` wildcard; `.all` adds every
+  gated directory, directories end in `/`, dot entries require a `.` prefix,
+  values omit the root prefix, and results are sorted and deduplicated. A
+  missing directory is an empty result, not an error; unknown entry kinds are
+  classified with `statFile` following symlinks.
+- Dynamic emission. When `Model.bindings.len != 0` each script gains a route
+  helper (bash `_dap_<ident>_dynamic`, zsh `_<ident>_dynamic`, fish
+  `__dap_<ident>_dynamic`) that invokes the binary at the current command word
+  (bash `"${COMP_WORDS[0]}"`, zsh `"$words[1]"`, fish `(commandline -opc)[1]`)
+  with the marker, binding index, the value part of the current word, and the
+  words before it. That helper is omitted entirely when no binding exists.
+  Native FS arms use `compgen -f`/`-d` + `compopt -o filenames` in bash,
+  `_files`/`_files -/` in zsh, and `__fish_complete_path`/
+  `__fish_complete_directories` in fish. An explicit non-native predictor
+  starts its bash arm with `compopt +o default`, never calls `_files` in zsh
+  (returns `0` instead), and contributes no path fallback in fish, so an
+  empty result stays empty. `launch` renders a shell-quoted literal command
+  (`$cur` expands the current word); `call` inserts its string verbatim.
+  Inline and dynamic stdout is parsed as `value` or `value<TAB>help`: bash
+  drops the suffix, zsh renders it as `value  -- help` through `compadd`,
+  fish prints `candidate<TAB>description`. Dynamic values combine with the
+  static rows per target: they replace the slot's static values, append after
+  static flag rows on a non-empty prefix with deduplication, and run
+  immediately on an empty positional word. `--flag=value` strips
+  `--flag=` and re-attaches it; after `--` no predictor runs.
+- Route. The root `parse` checks `args[0] == Completion.route_marker` before
+  any parsing and, only at `_command_rank == 0`, calls
+  `completion_mod.route(@This(), std.Options.debug_io, allocator, environ,
+  args)`. Child levels never recognize the marker. `routeSuggestions(NS, io,
+  allocator, args)` is the pure split: it requires the marker, a numeric
+  index (into `Model.bindings`), `cur`, and at least one line word; misuse is
+  `error.RouteMisuse`. `route` renders the complete payload, writes and
+  flushes it, frees suggestions and the buffer, then exits `0`; a predictor
+  failure exits `1` and misuse exits `2`, with stdout empty in both cases.
+  Diagnostics go to stderr only when `_DAP_DIAGNOSTICS` is exactly `1`.
+  A callback receives the allocator, the stripped `cur`, and the line
+  including the program; it owns the returned slice, every `value` and every
+  non-null `help`, and static literals are invalid. `freeSuggestions` frees a
+  successful result. Because the route runs at the very start of `parse`, an
+  application must do no file, socket, or network work before `parse`.
+- The example tree declares a `completion` command whose `main` calls
+  `Completion.show` and returns before any other output, so
   `zig build run -- --required 0 completion <shell>` pipes cleanly. Two test
-  surfaces with a hard split: the M19 block in `src/dap.zig` is pure Zig under
-  `zig build test`; real shells are exercised only by
-  `src/completion_test.zig` under optional `zig build completion-test`.
+  surfaces with a hard split: the M19–M26 blocks in `src/completion.zig` are
+  pure Zig under `zig build test`; real shells are exercised only by
+  `src/completion_test.zig` under optional `zig build completion-test`. The
+  shell suite renders `src/completion_fixture.zig` and executes it as
+  `bin/dap-predictor-test` through the real route.
 - Ordering inside `src/dap.zig`: public data types first, then private
   help/builtin scaffolding, then the private `suggest*` family, then the
-  completion scaffolding, then the public `generate` entry point, then private
-  normalization/decode helpers, then tests.
+  completion bridge, then the public `generate` entry point, then private
+  normalization/decode helpers, then tests. `src/completion.zig` puts the
+  public `Completion` namespace first, then private model/entry/emitter code,
+  then the route, then its tests.
 
 ## Notes
 

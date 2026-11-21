@@ -1,21 +1,18 @@
 # dap SDK reference
 
-Audience: an LLM (or a person) **using** the `dap` library as a dependency to
-build a command-line program. This is not a guide to working on `dap` itself
-(that is `AGENTS.md`).
+Audience: an LLM (or a person) **using** the `dap` library as a dependency to build a command-line program. This is not
+a guide to working on `dap` itself (that is `AGENTS.md`).
 
-`dap` is a declarative command-line parser for **Zig 0.16.0**. You describe the
-program's flags and arguments once, as a struct literal, and `dap.generate`
-produces, at compile time, a parser plus a strongly-typed result struct.
+`dap` is a declarative command-line parser for **Zig 0.16.0**. You describe the program's flags and arguments once, as a
+struct literal, and `dap.generate` produces, at compile time, a parser plus a strongly-typed result struct.
 
 ```zig
 const CLI = dap.generate(app, def);       // app: dap.App, def: declaration struct
 const cli = try CLI.parse(allocator, environ, args, &diag);   // returns CLI.View
 ```
 
-The declaration is comptime data. Both `generate` arguments are `comptime`, so
-every name, type and default is resolved by the compiler. There is no runtime
-schema.
+The declaration is comptime data. Both `generate` arguments are `comptime`, so every name, type and default is resolved
+by the compiler. There is no runtime schema.
 
 ---
 
@@ -27,8 +24,7 @@ schema.
 const dap = @import("dap");
 ```
 
-In a consumer's `build.zig`, add the dependency and attach it to the module
-that needs it:
+In a consumer's `build.zig`, add the dependency and attach it to the module that needs it:
 
 ```zig
 const dap_module = b.addModule("dap", .{
@@ -39,8 +35,7 @@ const dap_module = b.addModule("dap", .{
 exe.root_module.addImport("dap", dap_module);
 ```
 
-Everything public is re-exported from `src/root.zig`; there is no separate
-"prelude" module.
+Everything public is re-exported from `src/root.zig`; there is no separate "prelude" module.
 
 ---
 
@@ -92,8 +87,7 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-The bundled manual example lives in `src/main.zig`; run it with
-`zig build run -- --help`.
+The bundled manual example lives in `src/main.zig`; run it with `zig build run -- --help`.
 
 ---
 
@@ -101,33 +95,31 @@ The bundled manual example lives in `src/main.zig`; run it with
 
 The declaration is an **anonymous struct literal**. Each field is one of:
 
-| Declaration            | Field kind | Appears on `View` as                    |
-|------------------------|------------|-----------------------------------------|
-| `dap.Flag(T){...}`     | flag       | `T` (or `?T` when optional)             |
-| `dap.Argument(T){...}` | argument   | `T` (or `?T` only if declared optional) |
-| `dap.Group(def, name)` | group      | its members, flattened                  |
-| `dap.Alt(.{...})`      | alt        | `?Union` (one per Alt)                  |
-| `dap.Command(meta, def)` | command  | `?View` under a `_`-prefixed name (`_cmd`) |
+| Declaration              | Field kind | Appears on `View` as                       |
+| ------------------------ | ---------- | ------------------------------------------ |
+| `dap.Flag(T){...}`       | flag       | `T` (or `?T` when optional)                |
+| `dap.Argument(T){...}`   | argument   | `T` (or `?T` only if declared optional)    |
+| `dap.Group(def, name)`   | group      | its members, flattened                     |
+| `dap.Alt(.{...})`        | alt        | `?Union` (one per Alt)                     |
+| `dap.Command(meta, def)` | command    | `?View` under a `_`-prefixed name (`_cmd`) |
 
-Order matters: `View` fields appear in declaration order, with the injected
-`builtin_help: bool` first (§6), then a zero-sized `__command<rank>` tag, then
-the `Alt` unions and the per-command sub-`View`s. Declaration field names must
-not start with `_`; that prefix is reserved for the command `View` fields, and
-the double-underscore tag name cannot collide with either.
+Order matters: `View` fields appear in declaration order, with the injected `builtin_help: bool` first (§6), then a
+zero-sized `__command<rank>` tag, then the `Alt` unions and the per-command sub-`View`s. Declaration field names must
+not start with `_`; that prefix is reserved for the command `View` fields, and the double-underscore tag name cannot
+collide with either.
 
 ### 3.1 Flag names
 
-Field names are **wire names verbatim** (`dry_run` → `--dry_run`). A
-dash-spelled wire name requires an explicit `.long`. A field name must not
-begin with `_`: that prefix is reserved for the `_`-prefixed command fields
-the `View` carries (§3.7, §5).
+Field names are **wire names verbatim** (`dry_run` → `--dry_run`). A dash-spelled wire name requires an explicit
+`.long`. A field name must not begin with `_`: that prefix is reserved for the `_`-prefixed command fields the `View`
+carries (§3.7, §5).
 
 ```zig
 .dry_run = dap.Flag(bool){ .long = "dry-run" },   // -> --dry-run
 ```
 
-`--long` accepts `--name value` and `--name=value`. Short names are always
-explicit via `.short`; `-s value`, `-s=value` are accepted.
+`--long` accepts `--name value` and `--name=value`. Short names are always explicit via `.short`; `-s value`, `-s=value`
+are accepted.
 
 ### 3.2 `Flag(T)`
 
@@ -158,8 +150,7 @@ pub fn Argument(comptime T: type) type {
 }
 ```
 
-Arguments fill positional slots in declaration order. Only the **last**
-declared argument may carry a default.
+Arguments fill positional slots in declaration order. Only the **last** declared argument may carry a default.
 
 ### 3.4 `Default(T)` and `defaultValue`
 
@@ -174,14 +165,13 @@ pub fn Default(comptime T: type) type {
 pub fn defaultValue(comptime T: type, vT: T) Default(T);  // == .{ .direct = vT }
 ```
 
-Precedence when nothing is on the wire: **env value > direct default > zero
-value**. A spec with a default is not required; a spec without one is.
+Precedence when nothing is on the wire: **env value > direct default > zero value**. A spec with a default is not
+required; a spec without one is.
 
 ### 3.5 `Group(def, name)`
 
-A purely declarative grouping that affects only help output. Members are
-flattened into `View` in declaration order, and the group name becomes a
-heading. Flags and arguments are grouped in separate namespaces.
+A purely declarative grouping that affects only help output. Members are flattened into `View` in declaration order, and
+the group name becomes a heading. Flags and arguments are grouped in separate namespaces.
 
 ```zig
 .server = dap.Group(.{
@@ -192,14 +182,12 @@ heading. Flags and arguments are grouped in separate namespaces.
 // cli.host, cli.port are ordinary View fields.
 ```
 
-Nested groups are rejected at compile time. A `Group` name must not collide
-with any `Alt` branch tag.
+Nested groups are rejected at compile time. A `Group` name must not collide with any `Alt` branch tag.
 
 ### 3.6 `Alt(.{...})` and `VariantNamed`
 
-An `Alt` declares **mutually exclusive** groups of flags. Each anonymous-struct
-field is a branch; the field name (or a `VariantNamed` override) is the branch
-tag and the help-group heading.
+An `Alt` declares **mutually exclusive** groups of flags. Each anonymous-struct field is a branch; the field name (or a
+`VariantNamed` override) is the branch tag and the help-group heading.
 
 ```zig
 .source = dap.Alt(.{
@@ -215,16 +203,14 @@ tag and the help-group heading.
 Rules:
 
 - Branches may contain **only flags**.
-- Branch flags **must not declare defaults** (a default would imply implicit
-  activation).
+- Branch flags **must not declare defaults** (a default would imply implicit activation).
 - Optional flags are not allowed inside branches.
 - Branch tags must be unique; a tag must not equal a `Group` name.
 - Flag names (long and short) must be unique across branches and the parent.
 
-Semantics: the union is `null` until one branch member is seen, then it holds
-that branch's payload struct. Every member of the active branch is required
-(no defaults exist). Seeing members of two branches is a `ConflictingAlt`
-error. Each branch renders a usage alternation clause and a help heading.
+Semantics: the union is `null` until one branch member is seen, then it holds that branch's payload struct. Every member
+of the active branch is required (no defaults exist). Seeing members of two branches is a `ConflictingAlt` error. Each
+branch renders a usage alternation clause and a help heading.
 
 ```zig
 if (cli.source) |src| switch (src) {
@@ -235,9 +221,8 @@ if (cli.source) |src| switch (src) {
 
 ### 3.7 `Command(meta, def)`, `CommandMeta`
 
-A subcommand is a **sibling field** of the parent declaration, not a wrapper.
-Each command field is a `Command(meta, def)` where `def` is an ordinary
-declaration struct (which may itself contain further `Command` fields).
+A subcommand is a **sibling field** of the parent declaration, not a wrapper. Each command field is a
+`Command(meta, def)` where `def` is an ordinary declaration struct (which may itself contain further `Command` fields).
 
 ```zig
 pub const CommandMeta = struct {
@@ -252,32 +237,26 @@ pub const CommandMeta = struct {
 .stop = dap.Command(.{ .name = "halt", .help = "Stop." }, .{}),
 ```
 
-The first argument is typed `CommandMeta`, so an anonymous struct literal
-coerces. Each command field contributes one `?View` field to the parent
-`View`, stored under the declaration field name prefixed with `_` (`_start`),
-`null` unless the command's wire name (`.name` orelse the field name) appears.
-This raw `_`-prefixed field is how the parsed sub-view is carried; declaration
-field names must not themselves begin with `_` (that prefix is reserved, §13),
-and consumers normally reach the active command through `command` below:
+The first argument is typed `CommandMeta`, so an anonymous struct literal coerces. Each command field contributes one
+`?View` field to the parent `View`, stored under the declaration field name prefixed with `_` (`_start`), `null` unless
+the command's wire name (`.name` orelse the field name) appears. This raw `_`-prefixed field is how the parsed sub-view
+is carried; declaration field names must not themselves begin with `_` (that prefix is reserved, §13), and consumers
+normally reach the active command through `command` below:
 
 ```zig
 // View field: cli._start, cli._stop
 if (cli._start) |s| try serve(s.name);
 ```
 
-Handoff: a positional token equal to a registered command name terminates the
-current parse and invokes that subcommand's parse on the remaining tokens
-(again from its own index 0). Command names must be unique within a level and
-a command field name must not collide with a flag or group-member name;
-commands nest arbitrarily. Nested commands read as
-`cli._parent.?._child.?.file`.
+Handoff: a positional token equal to a registered command name terminates the current parse and invokes that
+subcommand's parse on the remaining tokens (again from its own index 0). Command names must be unique within a level and
+a command field name must not collide with a flag or group-member name; commands nest arbitrarily. Nested commands read
+as `cli._parent.?._child.?.file`.
 
-When a declaration carries at least one command, its generated namespace also
-exposes `command(view) ?CommandPayload` — the official, switch-shaped way to
-reach the active command. `CommandPayload` is a tagged union with one member
-per command, keyed by the **plain declaration field name** (neither the wire
-name, nor the `_`-prefixed `View` field: a `stop` field stored as `_stop` and
-wire-named `halt` switches as `.stop`), each payload the subcommand's `View`:
+When a declaration carries at least one command, its generated namespace also exposes `command(view) ?CommandPayload` —
+the official, switch-shaped way to reach the active command. `CommandPayload` is a tagged union with one member per
+command, keyed by the **plain declaration field name** (neither the wire name, nor the `_`-prefixed `View` field: a
+`stop` field stored as `_stop` and wire-named `halt` switches as `.stop`), each payload the subcommand's `View`:
 
 ```zig
 if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -288,20 +267,16 @@ if (CLI.command(cli)) |cmd| switch (cmd) {
 }
 ```
 
-At most one command field is ever non-null (the scan hands off at most once),
-so `command` returns the single active branch or `null`. It allocates nothing
-and cannot fail. A declaration with no commands exposes neither `command` nor
-`CommandPayload` (a reference is a compile error), so the accessor is always
-safe to call where a level declares subcommands and simply absent otherwise.
+At most one command field is ever non-null (the scan hands off at most once), so `command` returns the single active
+branch or `null`. It allocates nothing and cannot fail. A declaration with no commands exposes neither `command` nor
+`CommandPayload` (a reference is a compile error), so the accessor is always safe to call where a level declares
+subcommands and simply absent otherwise.
 
-The accessor is generic over the `View`: pass a sub-`View` from any level of
-the tree and it resolves that level's union, so dispatch nests as deep as the
-commands go. The registry of levels is comptime-only, keyed by `View` type.
-`View` is an `@Struct` and Zig interns those structurally, but every generated
-`View` carries a zero-sized tag field named `__command<rank>` (its pre-order
-rank in the command tree) after the spec fields, so each level's type is
-nominally distinct and a `View` value identifies exactly one level. The tag
-never affects parsing, `deinit`, or help.
+The accessor is generic over the `View`: pass a sub-`View` from any level of the tree and it resolves that level's
+union, so dispatch nests as deep as the commands go. The registry of levels is comptime-only, keyed by `View` type.
+`View` is an `@Struct` and Zig interns those structurally, but every generated `View` carries a zero-sized tag field
+named `__command<rank>` (its pre-order rank in the command tree) after the spec fields, so each level's type is
+nominally distinct and a `View` value identifies exactly one level. The tag never affects parsing, `deinit`, or help.
 
 ```zig
 if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -318,22 +293,18 @@ if (CLI.command(cli)) |cmd| switch (cmd) {
 }
 ```
 
-A leaf `View` (a level declaring no subcommands) is a compile error, as is a
-value that is not a `View` of this command tree.
+A leaf `View` (a level declaring no subcommands) is a compile error, as is a value that is not a `View` of this command
+tree.
 
-Flag long names and short aliases must be **globally unique across the entire
-command tree**, not merely within a level: whenever help is requested, flags
-from every ancestor level merge into the active scope (see §10.5), so a name
-reused at two levels (or across sibling commands) would be ambiguous. This is
-enforced at compile time (§13).
+Flag long names and short aliases must be **globally unique across the entire command tree**, not merely within a level:
+whenever help is requested, flags from every ancestor level merge into the active scope (see §10.5), so a name reused at
+two levels (or across sibling commands) would be ambiguous. This is enforced at compile time (§13).
 
-Because flags of all levels merge, `-h`/`--help` is *context-sensitive*: a
-request after a command describes that command's scope. `app -h` shows the
-app; `app svc -h` shows `svc` (its arguments/subcommands plus the merged flag
-set); `app svc build -h` shows the deepest scope. The usage header
-reconstructs the path, e.g. `Usage: app svc build ...`. A help token before
-the commands (`app -h svc build`) resolves to the deepest command actually
-entered, matching the same rule.
+Because flags of all levels merge, `-h`/`--help` is _context-sensitive_: a request after a command describes that
+command's scope. `app -h` shows the app; `app svc -h` shows `svc` (its arguments/subcommands plus the merged flag set);
+`app svc build -h` shows the deepest scope. The usage header reconstructs the path, e.g. `Usage: app svc build ...`. A
+help token before the commands (`app -h svc build`) resolves to the deepest command actually entered, matching the same
+rule.
 
 ---
 
@@ -346,8 +317,7 @@ Builtin value types work out of the box:
 - all float types (`f16`…`f128`, including `f80`)
 - `dap.String` (`[]const u8`)
 
-`bool` decoding accepts `true`/`false` and `1`/`0`. Integers parse base 10;
-floats use `std.fmt.parseFloat`.
+`bool` decoding accepts `true`/`false` and `1`/`0`. Integers parse base 10; floats use `std.fmt.parseFloat`.
 
 ### 4.1 Custom value types
 
@@ -359,15 +329,12 @@ pub fn encode(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error
 pub fn deinit(self: *Self, allocator: std.mem.Allocator) void
 ```
 
-These three are the stable contract; more optional methods may be added later.
-`decode` is a static constructor: it takes the allocator and the wire token and
-returns a fully built value, so a type with internal allocations (arg arrays,
-nested buffers) can own them. `dap.DecodeError` folds in the allocator's error
-set for that reason. `decode` returning `InvalidWire` means "this token is not
-the right shape"; `InvalidValue` means "shape is fine, value rejected".
-`encode` builds the wire spelling into allocator-owned memory the caller frees.
-`deinit` releases the value's internals; it must not call
-`allocator.destroy(self)` (the value is a copy, see §12).
+These three are the stable contract; more optional methods may be added later. `decode` is a static constructor: it
+takes the allocator and the wire token and returns a fully built value, so a type with internal allocations (arg arrays,
+nested buffers) can own them. `dap.DecodeError` folds in the allocator's error set for that reason. `decode` returning
+`InvalidWire` means "this token is not the right shape"; `InvalidValue` means "shape is fine, value rejected". `encode`
+builds the wire spelling into allocator-owned memory the caller frees. `deinit` releases the value's internals; it must
+not call `allocator.destroy(self)` (the value is a copy, see §12).
 
 ```zig
 const Port = struct {
@@ -388,13 +355,12 @@ const Port = struct {
 };
 ```
 
-If a value type does not satisfy `isDecodable` (no `decode`/`encode`/`deinit`,
-or an unsupported pointer), the declaration is a **compile error**.
+If a value type does not satisfy `isDecodable` (no `decode`/`encode`/`deinit`, or an unsupported pointer), the
+declaration is a **compile error**.
 
 ### 4.2 `Enumeration(T)` and `Enum`
 
-`Enumeration` builds a value type from named branches. Each branch is a
-`dap.Enum`, optionally overriding its wire name:
+`Enumeration` builds a value type from named branches. Each branch is a `dap.Enum`, optionally overriding its wire name:
 
 ```zig
 pub const Enum = struct {
@@ -411,8 +377,7 @@ const Mode = dap.Enumeration(.{
 
 The resulting type exposes:
 
-- `view` — a Zig enum (`EnumView`) with one tag per branch, defaulting to the
-  first branch;
+- `view` — a Zig enum (`EnumView`) with one tag per branch, defaulting to the first branch;
 - `EnumView` — that enum type, for comparisons;
 - `names` — the wire names in declaration order;
 - `decode` / `encode` / `deinit`.
@@ -427,9 +392,8 @@ Use it as a `Flag`/`Argument` value type:
 // --mode glacial   -> cli.mode.view == Mode.EnumView.slow
 ```
 
-Duplicate wire names are a compile error. An **empty** `Enumeration` is
-degenerate: it yields a type with `decode`/`encode`/`deinit` only (no `view`,
-`EnumView` or `names`) and rejects every token.
+Duplicate wire names are a compile error. An **empty** `Enumeration` is degenerate: it yields a type with
+`decode`/`encode`/`deinit` only (no `view`, `EnumView` or `names`) and rejects every token.
 
 ---
 
@@ -439,13 +403,11 @@ degenerate: it yields a type with `decode`/`encode`/`deinit` only (no `view`,
 
 - `builtin_help: bool` first (the injected `-h, --help`, §6);
 - one field per spec, in declaration order;
-- a zero-sized `__command<rank>` tag after the specs, where `rank` is the
-  level's pre-order position in the command tree. It only makes each level's
-  `View` nominally distinct; ignore it;
-- one `?Union` field per `Alt` and one `?View` field per command, after the
-  specs. A command's `View` field carries a `_` prefix (`_stop`); the plain
-  name is the tag of the `command` union (§3.7). Declaration field names must
-  not begin with `_`.
+- a zero-sized `__command<rank>` tag after the specs, where `rank` is the level's pre-order position in the command
+  tree. It only makes each level's `View` nominally distinct; ignore it;
+- one `?Union` field per `Alt` and one `?View` field per command, after the specs. A command's `View` field carries a
+  `_` prefix (`_stop`); the plain name is the tag of the `command` union (§3.7). Declaration field names must not begin
+  with `_`.
 
 `CLI.parse`:
 
@@ -458,44 +420,39 @@ pub fn parse(
 ) ParseError!View
 ```
 
-`args` is **pure payload**: iteration starts at index `0` and never skips a
-token, at every level (root and subcommands). Pass `os.argv[1..]` equivalent.
+`args` is **pure payload**: iteration starts at index `0` and never skips a token, at every level (root and
+subcommands). Pass `os.argv[1..]` equivalent.
 
-`parse` is self-contained and **terminating** (see §9): on success it returns
-the `View`; on failure it prints diagnostics + help to stderr and
-`std.process.exit(1)`; on a help request it prints help to stdout and
-`std.process.exit(0)`. The declared error union is therefore not observed in
-normal use.
+`parse` is self-contained and **terminating** (see §9): on success it returns the `View`; on failure it prints
+diagnostics + help to stderr and `std.process.exit(1)`; on a help request it prints help to stdout and
+`std.process.exit(0)`. The declared error union is therefore not observed in normal use.
 
 Generated namespace members:
 
-| Member                          | Description                                              |
-|---------------------------------|----------------------------------------------------------|
-| `View`                          | The result struct (see above).                           |
-| `parse(alloc, environ, args, diag) ParseError!View` | Parse and return `View` (exits on help/failure). |
-| `helpText(alloc) !String`       | Caller-owned rendered help using `app.help_renderer.style`. |
-| `helpData(alloc) !HelpData`     | Runtime description; `HelpData.renderCompact(alloc)` renders it. |
-| `usage(view) !void`             | Print context-sensitive help for a `View` of **any level** (like `command`): the scopes from this namespace's level down to that view's level, then the descendants still active in it. |
-| `completion(alloc, app_name, shell) !String` | Generate a bash/zsh/fish completion script for the whole tree; **root namespace only** (a child call is a compile error). |
-| `app_meta`                      | The `App` passed in.                                     |
-| `specs`                         | Normalized comptime spec table.                          |
-| `commands`                      | The detected command entries (slice; empty when none).   |
-| `CommandPayload`                | Tagged union of command fields; **only when subcommands exist**. |
-| `command(view) ?CommandPayload` | Wrap the active subcommand's `View` of **any level** into that level's union, else `null`; **only when subcommands exist**. |
-| `deinit(&view, alloc)`           | Release every owned field of a `View` from a successful parse (see §12). |
+| Member                                              | Description                                                                                                                                                                             |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `View`                                              | The result struct (see above).                                                                                                                                                          |
+| `parse(alloc, environ, args, diag) ParseError!View` | Parse and return `View` (exits on help/failure).                                                                                                                                        |
+| `helpText(alloc) !String`                           | Caller-owned rendered help using `app.help_renderer.style`.                                                                                                                             |
+| `helpData(alloc) !HelpData`                         | Runtime description; `HelpData.renderCompact(alloc)` renders it.                                                                                                                        |
+| `usage(view) !void`                                 | Print context-sensitive help for a `View` of **any level** (like `command`): the scopes from this namespace's level down to that view's level, then the descendants still active in it. |
+| `completion(alloc, app_name, shell) !String`        | Generate a bash/zsh/fish completion script for the whole tree; **root namespace only** (a child call is a compile error).                                                               |
+| `app_meta`                                          | The `App` passed in.                                                                                                                                                                    |
+| `specs`                                             | Normalized comptime spec table.                                                                                                                                                         |
+| `commands`                                          | The detected command entries (slice; empty when none).                                                                                                                                  |
+| `CommandPayload`                                    | Tagged union of command fields; **only when subcommands exist**.                                                                                                                        |
+| `command(view) ?CommandPayload`                     | Wrap the active subcommand's `View` of **any level** into that level's union, else `null`; **only when subcommands exist**.                                                             |
+| `deinit(&view, alloc)`                              | Release every owned field of a `View` from a successful parse (see §12).                                                                                                                |
 
-`deinit` is a **namespace-level function**, not a method on `View`. `View` is a
-generated struct with fields only, so it has no decls: write
-`CLI.deinit(&view, allocator)`, never `view.deinit(allocator)` (the latter is a
-"no field or member function named 'deinit'" compile error). Because it mutates
-the view, the local must be `var`.
+`deinit` is a **namespace-level function**, not a method on `View`. `View` is a generated struct with fields only, so it
+has no decls: write `CLI.deinit(&view, allocator)`, never `view.deinit(allocator)` (the latter is a "no field or member
+function named 'deinit'" compile error). Because it mutates the view, the local must be `var`.
 
 ### 5.1 Completion scripts
 
-`CLI.completion` builds a lazy `CLI.Completion` handle for the whole command
-tree, statically from the declaration. Construction is infallible and does no
-work (no `View`, no parse, no validation, no allocation, no environment, no
-file I/O):
+`CLI.completion` builds a lazy `CLI.Completion` handle for the whole command tree, statically from the declaration.
+Construction is infallible and does no work (no `View`, no parse, no validation, no allocation, no environment, no file
+I/O):
 
 ```zig
 var completion = CLI.completion(allocator, "my-app", .zsh);
@@ -503,25 +460,20 @@ const script = try completion.text();
 defer allocator.free(script);
 ```
 
-`dap.CompletionShell` is `.bash`, `.zsh` or `.fish`. `text()` renders a
-caller-owned, deterministic script ending with exactly one `\n`; errors are
-`OutOfMemory` and `error.InvalidAppName` (validation runs before any
-allocation). `show(io)` renders and writes the script to stdout.
-`install(io, environ)` renders and writes it to the shell's discovery
-directory (bash under `$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh
-under `$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under
-`$XDG_CONFIG_HOME/fish/completions/<app>.fish`), falling back to
-`$HOME/.local/share` and `$HOME/.config` and creating parent directories.
-`environ` is the process environment, typically `init.minimal.environ`.
+`dap.Completion.Shell` is `.bash`, `.zsh` or `.fish`. `text()` renders a caller-owned, deterministic script ending with
+exactly one `\n`; errors are `OutOfMemory` and `error.InvalidAppName` (validation runs before any allocation).
+`show(io)` renders and writes the script to stdout. `install(io, environ)` renders and writes it to the shell's
+discovery directory (bash under `$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh under
+`$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under `$XDG_CONFIG_HOME/fish/completions/<app>.fish`), falling back to
+`$HOME/.local/share` and `$HOME/.config` and creating parent directories. `environ` is the process environment,
+typically `init.minimal.environ`.
 
-`app_name` is the name the script **registers**, not `App.name` (which is a
-possibly multi-word usage path). It must be non-empty ASCII, must not start
-with `-`, must not contain `/`, whitespace or control bytes, and may only use
-`A-Za-z0-9._+-`. Passing an installed alias as `app_name` is how one installs
-the same program under another name.
+`app_name` is the name the script **registers**, not `App.name` (which is a possibly multi-word usage path). It must be
+non-empty ASCII, must not start with `-`, must not contain `/`, whitespace or control bytes, and may only use
+`A-Za-z0-9._+-`. Passing an installed alias as `app_name` is how one installs the same program under another name.
 
-Only the **root** namespace may call it: a subcommand level cannot reconstruct
-its ancestors' flags, so `Sub.completion(...)` is a compile error.
+Only the **root** namespace may call it: a subcommand level cannot reconstruct its ancestors' flags, so
+`Sub.completion(...)` is a compile error.
 
 Writing the script manually remains possible:
 
@@ -531,35 +483,82 @@ app completion zsh  > "${fpath[1]}/_app"
 app completion fish > ~/.config/fish/completions/app.fish
 ```
 
-The zsh file name must match `_<ident>`, where `ident` is `app_name` with every
-byte outside `[A-Za-z0-9_]` replaced by `_` (`my-app` -> `_my_app`); the
-registration itself always uses `app_name` verbatim. The script is a snapshot of
-the declaration: regenerate it when flags or commands change. Sanitization is
-not injective, so two `dap` CLIs can collide in one bash or fish session.
+The zsh file name must match `_<ident>`, where `ident` is `app_name` with every byte outside `[A-Za-z0-9_]` replaced by
+`_` (`my-app` -> `_my_app`); the registration itself always uses `app_name` verbatim. The script is a snapshot of the
+declaration: regenerate it when flags or commands change. Sanitization is not injective, so two `dap` CLIs can collide
+in one bash or fish session.
+
+#### Predictors
+
+`Flag(T)` and `Argument(T)` gain one field:
+
+```zig
+completion: ?dap.Completion.Predictor = null,
+```
+
+`null` leaves the shell's own fallback untouched. The constructors are:
+
+```zig
+const dap = @import("dap");
+
+dap.Completion.fs(.{ .wildcard = "*.toml", .type = .all, .root = "config" })
+dap.Completion.disabled()
+dap.Completion.launch(.{ "git", "ls-files", "$cur" })
+dap.Completion.call("printf '%s\\n' \"$cur\"-one")
+dap.Completion.custom(suggestItems)
+```
+
+- `fs` with `wildcard = "*"` and no `root` is the native mapping and behaves exactly like `null`: bash
+  `compgen -f`/`-d`, zsh `_files`/`_files -/`, fish `__fish_complete_path`/`__fish_complete_directories`. Every other
+  `fs` combination runs the binary. Directories end in `/`, dot entries require a leading `.` in the typed name, and
+  emitted values are relative to `root`.
+- `disabled` emits nothing and suppresses the fallback for that target.
+- `launch` accepts a tuple, array or slice of strings; `$cur` expands the current word, and the current word is not
+  appended otherwise.
+- `call` is one string inserted verbatim into every dialect. It must be valid in each shell you generate for and sees
+  `cur` and `line`.
+- `custom` takes
+  `*const fn (std.mem.Allocator, []const u8, []const []const u8) anyerror![]const dap.Completion.Suggestion` and runs in
+  the binary through the hidden route.
+
+A predictor is legal on plain flags, optional flags, `Group` and `Alt` members, positional arguments, and targets with a
+default. It is a `@compileError` on `bool` and `Enumeration` targets, including `.disabled`. It replaces the static
+value candidates for its target. On a positional slot it runs on an empty word; after `--` it never runs; `--flag=value`
+strips `--flag=` before matching and re-attaches it to every result. Only `null` and native `fs` keep a file fallback;
+an explicit predictor that returns nothing stays empty.
+
+The callback owns its result. Allocate the slice, each `value` and each non-null `help` with the passed allocator;
+static literals are invalid. The route frees a successful result after rendering. A callback that fails must release its
+own partial result.
+
+The runtime route is a hidden call into the application itself. The shell invokes
+`app ---608b59fe-b7a9-407a-b0f5-77640a2c1957 <index> <cur> <line...>`. The first argument is the exact marker; the
+application checks it before parsing anything. `index` addresses a compile-time binding and is used only by callback
+predictors and non-native filesystem predictors. The application writes one candidate per line to stdout, either `value`
+or `value<TAB>help`, and exits `0` on success (including zero candidates), `1` on predictor failure, and `2` on misuse.
+Stdout is empty on any non-zero exit. Diagnostics go to stderr only when `_DAP_DIAGNOSTICS=1`. Because the route runs at
+the very start of `parse`, an application must do no file, socket, or network work before `parse` is called.
+
+The name catalog stays a generated snapshot; only predictor-backed values are queried when the user presses Tab.
 
 ---
 
 ## 6. Builtin help flag
 
-A `-h, --help` flag is injected at the **beginning** of every declaration
-before normalization. Its `View` field is `builtin_help: bool`, positioned
-first.
+A `-h, --help` flag is injected at the **beginning** of every declaration before normalization. Its `View` field is
+`builtin_help: bool`, positioned first.
 
-When `-h`/`--help` is seen (bare, or `--help=true`), the parse **bypasses all
-required checks and validations**, renders help to stdout, and exits `0`.
-`--help=false` is honored and does not trigger help.
+When `-h`/`--help` is seen (bare, or `--help=true`), the parse **bypasses all required checks and validations**, renders
+help to stdout, and exits `0`. `--help=false` is honored and does not trigger help.
 
-The request is honored **anywhere in the active command chain**: a deep
-`app svc build -h` (or a help token before the commands, `app -h svc build`)
-bypasses the required checks of every ancestor level too, and renders the
-context-sensitive help of the deepest active command (§10.5). Every level's
-declaration carries the builtin, but a merged rendering shows `-h, --help`
-exactly once.
+The request is honored **anywhere in the active command chain**: a deep `app svc build -h` (or a help token before the
+commands, `app -h svc build`) bypasses the required checks of every ancestor level too, and renders the
+context-sensitive help of the deepest active command (§10.5). Every level's declaration carries the builtin, but a
+merged rendering shows `-h, --help` exactly once.
 
 Consequences:
 
-- Declaring your own field named `help` with `.long = "help"` is a compile
-  error (duplicate long flag).
+- Declaring your own field named `help` with `.long = "help"` is a compile error (duplicate long flag).
 - Help output always lists `-h, --help` first in the flags section.
 
 ---
@@ -568,17 +567,15 @@ Consequences:
 
 ### 7.1 Derived `required`
 
-A flag or argument is **required iff it has no default** (neither direct nor
-env). This is uniform across types.
+A flag or argument is **required iff it has no default** (neither direct nor env). This is uniform across types.
 
 ### 7.2 Boolean flags
 
 Boolean flags are a deliberate exception:
 
 - They are **always optional**; an omitted bool flag is `false`.
-- A direct default of `true` is a **compile error**. To express "on by
-  default", use a negative long name defaulting to `false`:
-  `--no-color` with `.default = dap.defaultValue(bool, false)`.
+- A direct default of `true` is a **compile error**. To express "on by default", use a negative long name defaulting to
+  `false`: `--no-color` with `.default = dap.defaultValue(bool, false)`.
 - An optional bool renders bracketed (`[--flag]`) in the usage header.
 
 ### 7.3 Optional flags (`?T`)
@@ -590,12 +587,10 @@ Wrap a flag to make its `View` field optional:
 .label = @as(?dap.Flag([]const u8), dap.Flag([]const u8){ .long = "label" }),
 ```
 
-Both spellings store a genuine `?Flag(T)`. The `View` field is `?T`, `null`
-when absent. Rules:
+Both spellings store a genuine `?Flag(T)`. The `View` field is `?T`, `null` when absent. Rules:
 
 - Optional flags **must not declare a default** (direct or env).
-- Validation is **skipped** for `null` and runs normally when a value is
-  present.
+- Validation is **skipped** for `null` and runs normally when a value is present.
 - Optional `Argument`s are rejected (`?Argument` is not supported).
 - Optional flags are **not allowed inside `Alt` branches**.
 
@@ -603,21 +598,17 @@ when absent. Rules:
 
 ## 8. Parsing rules and edge cases
 
-- **Terminator.** `--` makes every following token a literal positional and
-  disables command handoff, so command-like or flag-like literals can be
-  passed through.
+- **Terminator.** `--` makes every following token a literal positional and disables command handoff, so command-like or
+  flag-like literals can be passed through.
 - **Missing value.** A non-bool flag given without a value is `MissingValue`.
-- **Unknown flag.** An unmatched `--long` or `-s` token is `UnknownFlag`. A
-  token that misses the active level's own specs is first retried against every
-  ancestor level's specs (nearest first), since each ancestor's flags merge
-  into a deep help scope and are globally unique; a hit assigns into that
-  ancestor's `View`, so `app sub --root-flag` works.
-- **Too many arguments.** A positional token with no free slot is
-  `TooManyArguments`.
-- **Zero values.** An absent spec with a defaultless, optional, or bool type
-  falls back to a zero value (`""` for strings, `0`/`false`/`null` otherwise).
-- **Env decoding.** An env value is decoded like a wire token; a malformed one
-  is reported with the field name. A non-WTF-8 env value is `InvalidWtf8`.
+- **Unknown flag.** An unmatched `--long` or `-s` token is `UnknownFlag`. A token that misses the active level's own
+  specs is first retried against every ancestor level's specs (nearest first), since each ancestor's flags merge into a
+  deep help scope and are globally unique; a hit assigns into that ancestor's `View`, so `app sub --root-flag` works.
+- **Too many arguments.** A positional token with no free slot is `TooManyArguments`.
+- **Zero values.** An absent spec with a defaultless, optional, or bool type falls back to a zero value (`""` for
+  strings, `0`/`false`/`null` otherwise).
+- **Env decoding.** An env value is decoded like a wire token; a malformed one is reported with the field name. A
+  non-WTF-8 env value is `InvalidWtf8`.
 
 ---
 
@@ -640,30 +631,26 @@ pub const ParseError = error{
 
 `Diag` carries detail for the most recent failed parse:
 
-| Field     | Meaning                              | Ownership                    |
-|-----------|--------------------------------------|------------------------------|
-| `field`   | Declaration field name that failed.  | Borrowed (comptime).         |
-| `token`   | Offending argv token.                | Borrowed (caller argv).      |
-| `message` | Human-readable validation message.   | Owned; free via `deinit`.    |
+| Field     | Meaning                             | Ownership                 |
+| --------- | ----------------------------------- | ------------------------- |
+| `field`   | Declaration field name that failed. | Borrowed (comptime).      |
+| `token`   | Offending argv token.               | Borrowed (caller argv).   |
+| `message` | Human-readable validation message.  | Owned; free via `deinit`. |
 
 ```zig
 var diag: dap.Diag = .{};
 defer diag.deinit(allocator);   // frees only `message`
 ```
 
-**`parse` never returns an error to the caller.** Internally it runs the parse
-pipeline, and:
+**`parse` never returns an error to the caller.** Internally it runs the parse pipeline, and:
 
-- on any `ParseError` it prints `field`/`token`/`message` plus the help text to
-  **stderr** and calls `std.process.exit(1)`;
-- on a help request it prints help to **stdout** and calls
-  `std.process.exit(0)`.
+- on any `ParseError` it prints `field`/`token`/`message` plus the help text to **stderr** and calls
+  `std.process.exit(1)`;
+- on a help request it prints help to **stdout** and calls `std.process.exit(0)`.
 
-Because of this, `try CLI.parse(...)` is idiomatic: there is nothing to handle
-for a CLI that should just report and exit. If you need error handling instead
-of process exit, you cannot reach the internal `parseInner`; design around
-`helpData`/`helpText` and your own driver, or treat `parse`'s exit as the
-contract.
+Because of this, `try CLI.parse(...)` is idiomatic: there is nothing to handle for a CLI that should just report and
+exit. If you need error handling instead of process exit, you cannot reach the internal `parseInner`; design around
+`helpData`/`helpText` and your own driver, or treat `parse`'s exit as the contract.
 
 ---
 
@@ -671,11 +658,10 @@ contract.
 
 Two layers:
 
-1. `CLI.helpText(allocator) !String` — fill an `App`-configured description and
-   render it with `app.help_renderer.style`. Returns a caller-owned string.
-2. `CLI.helpData(allocator) !HelpData` — fill a runtime, plain-data description
-   for custom UIs (completion, man pages) or to render manually with
-   `HelpData.renderCompact(allocator)`.
+1. `CLI.helpText(allocator) !String` — fill an `App`-configured description and render it with
+   `app.help_renderer.style`. Returns a caller-owned string.
+2. `CLI.helpData(allocator) !HelpData` — fill a runtime, plain-data description for custom UIs (completion, man pages)
+   or to render manually with `HelpData.renderCompact(allocator)`.
 
 ```zig
 const text = try CLI.helpText(allocator);
@@ -716,8 +702,8 @@ pub const HelpRendererHighlight = union(enum) {
 };
 ```
 
-Custom-style tip: set `App.help_renderer.style = .{ .custom = myRenderer }`.
-The callback receives the filled `HelpData` and returns an owned string.
+Custom-style tip: set `App.help_renderer.style = .{ .custom = myRenderer }`. The callback receives the filled `HelpData`
+and returns an owned string.
 
 ### 10.2 Layout
 
@@ -741,16 +727,14 @@ Group
   -v, --value=1    Value of items.
 ```
 
-- Short and long names occupy aligned sub-columns; the value placeholder is
-  `=DEFAULT` when a direct default exists, else `=NAME` (upper-cased).
+- Short and long names occupy aligned sub-columns; the value placeholder is `=DEFAULT` when a direct default exists,
+  else `=NAME` (upper-cased).
 - Flag groups are ordered by name, with the ungrouped bucket first.
-- In the usage header: required flags render as `--name` / `--name=VALUE`,
-  optional bools as `[--flag]`, positionals as `<arg>` or `[<arg>]` when they
-  have a default, and `[flags]` appears when there are defaulted flags.
-- Optional (`?T`) flags are listed in the flags section but omit from the
-  usage header.
-- `Alt` flags are not listed individually in the usage line; each `Alt`
-  contributes one parenthesized alternation clause:
+- In the usage header: required flags render as `--name` / `--name=VALUE`, optional bools as `[--flag]`, positionals as
+  `<arg>` or `[<arg>]` when they have a default, and `[flags]` appears when there are defaulted flags.
+- Optional (`?T`) flags are listed in the flags section but omit from the usage header.
+- `Alt` flags are not listed individually in the usage line; each `Alt` contributes one parenthesized alternation
+  clause:
 
 ```text
 Usage: dap-example (--file=FILE | --url=URL) <string> [flags]
@@ -758,8 +742,7 @@ Usage: dap-example (--file=FILE | --url=URL) <string> [flags]
 
 ### 10.3 `HelpData` structure
 
-`HelpData` is plain data, all allocated with the caller's allocator and
-released with `HelpData.deinit`:
+`HelpData` is plain data, all allocated with the caller's allocator and released with `HelpData.deinit`:
 
 ```zig
 pub const HelpData = struct {
@@ -792,51 +775,41 @@ pub const HelpData = struct {
 };
 ```
 
-`usage_alts` holds one `Usage` per `Alt`; each `Usage.branches` is one entry
-per tag, holding slices of `Flag` that **reference entries already owned by**
-`flag_groups` (so `deinit` frees only the outer arrays).
+`usage_alts` holds one `Usage` per `Alt`; each `Usage.branches` is one entry per tag, holding slices of `Flag` that
+**reference entries already owned by** `flag_groups` (so `deinit` frees only the outer arrays).
 
 ### 10.4 Highlighting
 
-`App.help_renderer.highlight` selects an ANSI scheme: `flat` (none), `bold`
-(default), `color`, or `custom` with a `HelpHighlight`. A scheme has tokens for
-the usage header (app name, required flag name/value, optionals, arguments) and
-for sections (`groups`, `args`, `flags` name/value). Column widths are measured
-on the raw text before codes are emitted, so highlighting never disturbs
-alignment.
+`App.help_renderer.highlight` selects an ANSI scheme: `flat` (none), `bold` (default), `color`, or `custom` with a
+`HelpHighlight`. A scheme has tokens for the usage header (app name, required flag name/value, optionals, arguments) and
+for sections (`groups`, `args`, `flags` name/value). Column widths are measured on the raw text before codes are
+emitted, so highlighting never disturbs alignment.
 
 ### 10.5 Context-sensitive (merged) help
 
-When help is requested after one or more subcommands, the rendering describes
-the **deepest active command**. The parse walks the runtime `View` chain
-recursively (`helpRequested` / `appendActiveScopes`), builds one `HelpData`
-per active level (root first), and folds them with `absorbScope`:
+When help is requested after one or more subcommands, the rendering describes the **deepest active command**. The parse
+walks the runtime `View` chain recursively (`helpRequested` / `appendActiveScopes`), builds one `HelpData` per active
+level (root first), and folds them with `absorbScope`:
 
-- **Flags accumulate downwards**: flag groups merge by name (the ungrouped
-  bucket merges as one, and same-named `Group`/`Alt` groups from different
-  levels combine into a single block under one header). Entries are moved, not
+- **Flags accumulate downwards**: flag groups merge by name (the ungrouped bucket merges as one, and same-named
+  `Group`/`Alt` groups from different levels combine into a single block under one header). Entries are moved, not
   copied.
-- **Arguments and subcommands come from the deepest scope only**: `arg_groups`
-  and `commands` are replaced by the deeper level's.
-- **`name` becomes the command path**: e.g. `app svc build`, so the usage
-  header reads `Usage: app svc build <target> [flags]`.
+- **Arguments and subcommands come from the deepest scope only**: `arg_groups` and `commands` are replaced by the deeper
+  level's.
+- **`name` becomes the command path**: e.g. `app svc build`, so the usage header reads
+  `Usage: app svc build <target> [flags]`.
 - **`Alt` usage clauses accumulate** root-first.
 - The injected `-h, --help` is deduped, so it appears once.
 
-Rendering then reuses the same `renderCompact` (or `.custom` renderer)
-unchanged. Root-scope help is byte-identical to a non-merged rendering. On a
-*parse failure* (not a help request) the help page is that of the deepest
-command entered: every level entered before the error stays linked from its
-parent's View, so the same merge reconstructs the command path; a failure
-before any handoff renders the unchanged root page.
+Rendering then reuses the same `renderCompact` (or `.custom` renderer) unchanged. Root-scope help is byte-identical to a
+non-merged rendering. On a _parse failure_ (not a help request) the help page is that of the deepest command entered:
+every level entered before the error stays linked from its parent's View, so the same merge reconstructs the command
+path; a failure before any handoff renders the unchanged root page.
 
-`CLI.usage(view)` prints exactly this merged text. It is generic over the
-`View` type, like `command`: a sub-view from any level is accepted, the
-namespaces on the path from the root down to that level are merged in, and
-the descendants still active in `view` are appended. Calling it on the root
-namespace with either the root view or a dispatched sub-view yields the same
-help, so a "no subcommand given" branch can print its own level's usage with
-`CLI.usage(c)`:
+`CLI.usage(view)` prints exactly this merged text. It is generic over the `View` type, like `command`: a sub-view from
+any level is accepted, the namespaces on the path from the root down to that level are merged in, and the descendants
+still active in `view` are appended. Calling it on the root namespace with either the root view or a dispatched sub-view
+yields the same help, so a "no subcommand given" branch can print its own level's usage with `CLI.usage(c)`:
 
 ```zig
 if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -875,15 +848,13 @@ dap.Validate.stringNotEmpty        // fn (Allocator, String) Error!?String
 dap.Validate.intNotZero(u8)        // comptime factory over an integer type
 ```
 
-Signature: `fn (std.mem.Allocator, T) std.mem.Allocator.Error!?String`. Return
-`null` on success, an **allocated** message on failure; you may also return
-`error.OutOfMemory`.
+Signature: `fn (std.mem.Allocator, T) std.mem.Allocator.Error!?String`. Return `null` on success, an **allocated**
+message on failure; you may also return `error.OutOfMemory`.
 
-Validation runs in two places: on every absent spec's resolved value, and over
-the members of an active `Alt` branch. It runs regardless of whether the value
-came from the wire, an env var, or a direct default. On failure, `parse`
-reports `InvalidValue` with `diag.field` and `diag.message` (the message is
-freed by `Diag.deinit`; when `diag` is `null`, `dap` frees it internally).
+Validation runs in two places: on every absent spec's resolved value, and over the members of an active `Alt` branch. It
+runs regardless of whether the value came from the wire, an env var, or a direct default. On failure, `parse` reports
+`InvalidValue` with `diag.field` and `diag.message` (the message is freed by `Diag.deinit`; when `diag` is `null`, `dap`
+frees it internally).
 
 Inline example:
 
@@ -903,29 +874,21 @@ Inline example:
 
 ## 12. Ownership
 
-- **The `View` owns everything it stores.** `[]const u8` fields (wire, env and
-  direct defaults included) are duplicated with the allocator passed to `parse`;
-  custom-type fields own their internals. Release them with
-  `CLI.deinit(&view, allocator)`, which frees string slices, calls a custom
-  type's `deinit`, recurses into optionals, releases only the active `Alt`
-  branch, and recurses into every activated command sub-`View`. It is valid
-  once on a `View` from a **successful** `parse` and is **not idempotent** (a
-  second call double-frees). `args`/`environ` are borrowed only during `parse`;
-  after it returns the `View` references neither.
-- `deinit` is a **namespace function**, not a method: call
-  `CLI.deinit(&view, allocator)`. `View` is a generated struct with no decls,
-  so `view.deinit(...)` does not compile, and the receiver must be a `var`.
-- A custom `decode` returns `Self` **by value**; its `deinit` must release
-  internals without `allocator.destroy(self)`. A custom struct's comptime
-  direct default is routed through an `encode`/`decode` roundtrip so the value
-  in the `View` is fully owned (never pointing at comptime memory).
-- An **arena** remains the simplest lifetime; `CLI.deinit` matters when a plain
-  allocator is used.
-- `Diag.deinit` frees only the allocated `message`; `field` and `token` are
-  borrowed.
+- **The `View` owns everything it stores.** `[]const u8` fields (wire, env and direct defaults included) are duplicated
+  with the allocator passed to `parse`; custom-type fields own their internals. Release them with
+  `CLI.deinit(&view, allocator)`, which frees string slices, calls a custom type's `deinit`, recurses into optionals,
+  releases only the active `Alt` branch, and recurses into every activated command sub-`View`. It is valid once on a
+  `View` from a **successful** `parse` and is **not idempotent** (a second call double-frees). `args`/`environ` are
+  borrowed only during `parse`; after it returns the `View` references neither.
+- `deinit` is a **namespace function**, not a method: call `CLI.deinit(&view, allocator)`. `View` is a generated struct
+  with no decls, so `view.deinit(...)` does not compile, and the receiver must be a `var`.
+- A custom `decode` returns `Self` **by value**; its `deinit` must release internals without `allocator.destroy(self)`.
+  A custom struct's comptime direct default is routed through an `encode`/`decode` roundtrip so the value in the `View`
+  is fully owned (never pointing at comptime memory).
+- An **arena** remains the simplest lifetime; `CLI.deinit` matters when a plain allocator is used.
+- `Diag.deinit` frees only the allocated `message`; `field` and `token` are borrowed.
 - `helpText` and `renderCompact` return caller-owned strings.
-- `helpData` returns a `HelpData` whose every string/slice is caller-owned;
-  release with `HelpData.deinit`.
+- `helpData` returns a `HelpData` whose every string/slice is caller-owned; release with `HelpData.deinit`.
 
 ---
 
@@ -933,30 +896,25 @@ Inline example:
 
 These mistakes are compile errors, not runtime errors:
 
-- A declaration field that is not a `Flag`, `Argument`, `Group`, `Alt`,
-  or `Command`.
-- A declaration field whose name starts with `_` (the prefix is reserved for
-  the `_`-prefixed command fields the `View` carries; §3.7, §5).
+- A declaration field that is not a `Flag`, `Argument`, `Group`, `Alt`, or `Command`.
+- A declaration field whose name starts with `_` (the prefix is reserved for the `_`-prefixed command fields the `View`
+  carries; §3.7, §5).
 - Duplicate long flag names, duplicate short flag names, duplicate field names.
-- **Duplicate flag names across levels**: because flags of every ancestor level
-  merge into a deep help scope, long names and short aliases must be globally
-  unique across the whole command tree (sibling commands included). The message
-  names both level paths, e.g. `duplicate long flag '--verbose' at 'app svc'
-  and 'app svc build'; flag names must be globally unique across the command
-  tree (fields 'verbose' / 'verbose')`. The injected builtin and positional
-  arguments are exempt.
-- Duplicate command names within a level; a command field name colliding with
-  a flag or group-member name; duplicate `Enumeration` wire names.
-- Mixing subcommands and positional arguments in one declaration (a command
-  token hands the rest of the wire to the subcommand, so a parent positional
-  could never be filled).
+- **Duplicate flag names across levels**: because flags of every ancestor level merge into a deep help scope, long names
+  and short aliases must be globally unique across the whole command tree (sibling commands included). The message names
+  both level paths, e.g.
+  `duplicate long flag '--verbose' at 'app svc' and 'app svc build'; flag names must be globally unique across the command tree (fields 'verbose' / 'verbose')`.
+  The injected builtin and positional arguments are exempt.
+- Duplicate command names within a level; a command field name colliding with a flag or group-member name; duplicate
+  `Enumeration` wire names.
+- Mixing subcommands and positional arguments in one declaration (a command token hands the rest of the wire to the
+  subcommand, so a parent positional could never be filled).
 - An `Argument` with a default that is not the last argument.
 - A value type that is not decodable (missing `decode`/`encode`/`deinit`).
 - A boolean flag with a direct default of `true`.
-- An optional flag with a default; an optional `Argument`; an optional flag
-  inside an `Alt` branch.
-- An `Alt` with zero branches, duplicate branch tags, a non-flag branch member,
-  a defaulted branch member, or a tag colliding with a `Group` name.
+- An optional flag with a default; an optional `Argument`; an optional flag inside an `Alt` branch.
+- An `Alt` with zero branches, duplicate branch tags, a non-flag branch member, a defaulted branch member, or a tag
+  colliding with a `Group` name.
 - Declaring a `--help` flag when the builtin is injected.
 
 ---
@@ -964,28 +922,22 @@ These mistakes are compile errors, not runtime errors:
 ## 14. Semantics cheat sheet
 
 - Every `parse` is pure payload: no token is skipped, at any nesting level.
-- Field names are wire names verbatim; dashes need explicit `.long`. Field
-  names must not start with `_` (reserved for the `_`-prefixed command
-  `View` fields).
-- `required` is derived: required ⇔ no default (bools excepted: always
-  optional, default `false`).
+- Field names are wire names verbatim; dashes need explicit `.long`. Field names must not start with `_` (reserved for
+  the `_`-prefixed command `View` fields).
+- `required` is derived: required ⇔ no default (bools excepted: always optional, default `false`).
 - Precedence: wire > env > direct default > zero value.
 - Defaults allowed only on the last argument.
-- Subcommand handoff triggers on a positional equal to a command name; `--`
-  disables it.
-- `CLI.command(cli) ?CommandPayload` switches on the active subcommand (tags
-  are the plain declaration field names; the `View` stores it `_`-prefixed);
-  present only when the level declares commands. The accessor accepts a
-  `View` of any level, so dispatch nests; a leaf view is a compile error.
-- `Alt`: one active branch max; `ConflictingAlt` otherwise; all members of the
-  active branch are required.
+- Subcommand handoff triggers on a positional equal to a command name; `--` disables it.
+- `CLI.command(cli) ?CommandPayload` switches on the active subcommand (tags are the plain declaration field names; the
+  `View` stores it `_`-prefixed); present only when the level declares commands. The accessor accepts a `View` of any
+  level, so dispatch nests; a leaf view is a compile error.
+- `Alt`: one active branch max; `ConflictingAlt` otherwise; all members of the active branch are required.
 - Optional flags yield `?T`; defaults forbidden; validation skipped when null.
-- Builtin `-h/--help` bypasses checks, prints help, exits 0 — at any depth;
-  deep help merges ancestor flags and scopes to the deepest active command.
+- Builtin `-h/--help` bypasses checks, prints help, exits 0 — at any depth; deep help merges ancestor flags and scopes
+  to the deepest active command.
 - Flag names/aliases are globally unique across the command tree.
-- The `View` owns every stored string and custom value; release it with
-  `CLI.deinit(&view, allocator)` (a namespace function, not a `View` method)
-  on a successful parse, once and not idempotently.
+- The `View` owns every stored string and custom value; release it with `CLI.deinit(&view, allocator)` (a namespace
+  function, not a `View` method) on a successful parse, once and not idempotently.
 - `parse` exits the process on help/failure; it does not return errors.
 
 ---
@@ -1000,8 +952,7 @@ zig build completion-test  # opt-in: generated scripts in real shells
 zig build run -- --help
 ```
 
-The example binary also prints completion scripts (the root declares a required
-flag, hence `--required 0`):
+The example binary also prints completion scripts (the root declares a required flag, hence `--required 0`):
 
 ```sh
 zig build run -- --required 0 completion bash
