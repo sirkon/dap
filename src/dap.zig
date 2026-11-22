@@ -1167,6 +1167,39 @@ pub const _completion_internal = struct {
 
 pub const Completion = completion_mod.Completion;
 
+const checks_mod = @import("checks.zig");
+
+comptime {
+    // Force analysis of the checks module so its tests are collected when this
+    // file is the `zig test` root, despite the two-file import cycle.
+    _ = checks_mod;
+}
+
+const checks_bridge_Field = Field;
+const checks_bridge_Spec = Spec;
+const checks_bridge_NormResult = NormResult;
+const checks_bridge_CommandEntry = CommandEntry;
+const checks_bridge_fieldsOf = fieldsOf;
+const checks_bridge_typeOfField = typeOfField;
+const checks_bridge_normalize = normalize;
+const checks_bridge_withBuiltinHelp = withBuiltinHelp;
+const checks_bridge_specFromField = specFromField;
+const checks_bridge_builtin_help_field = builtin_help_field;
+
+/// Internal bridge for `checks.zig`; not part of the public API.
+pub const _checks_internal = struct {
+    pub const Field = checks_bridge_Field;
+    pub const Spec = checks_bridge_Spec;
+    pub const NormResult = checks_bridge_NormResult;
+    pub const CommandEntry = checks_bridge_CommandEntry;
+    pub const fieldsOf = checks_bridge_fieldsOf;
+    pub const typeOfField = checks_bridge_typeOfField;
+    pub const normalize = checks_bridge_normalize;
+    pub const withBuiltinHelp = checks_bridge_withBuiltinHelp;
+    pub const specFromField = checks_bridge_specFromField;
+    pub const builtin_help_field = checks_bridge_builtin_help_field;
+};
+
 /// Highlight category a compact-help fragment belongs to.
 const HelpStyle = enum {
     plain,
@@ -1975,7 +2008,7 @@ fn suggestLoad(
             },
             .short_flag => {},
             .cmd => inline for (cmds) |c| {
-                inline for (comptime commandSpellings(c)) |spelling| {
+                inline for (comptime checks_mod.commandSpellings(c)) |spelling| {
                     if (suggestIsPrefix(body, spelling)) prefix_count += 1;
                 }
             },
@@ -2013,7 +2046,7 @@ fn suggestLoad(
         },
         .cmd => {
             inline for (cmds) |c| {
-                inline for (comptime commandSpellings(c)) |spelling| {
+                inline for (comptime checks_mod.commandSpellings(c)) |spelling| {
                     suggestConsider(&best, body, spelling, null, .cmd, true, prefix_ok);
                 }
             }
@@ -2071,7 +2104,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     // into a deep help scope, so a name reused anywhere in the command tree
     // would be ambiguous. Runs after `normalize`'s own checks so same-level
     // collisions keep their better existing messages.
-    comptime checkGlobalFlagNames(collectFlagOrigins(norm, &[_]String{app.name}, &.{}));
+    comptime checks_mod.checkGlobalFlagNames(checks_mod.collectFlagOrigins(norm, &[_]String{app.name}, &.{}));
 
     const field_names = blk: {
         var names: []const String = &.{};
@@ -3628,159 +3661,11 @@ fn altSpecs(comptime AT: type, comptime field_name: String) []const Spec {
     return out;
 }
 
-/// Reject declaration fields whose names start with `_`. The leading
-/// underscore is reserved: command fields are surfaced in the `View` under a
-/// `_`-prefixed name (the plain name is the branch of the `command` union).
-/// Applies to the top level of every declaration, including command bodies,
-/// which `normalize` recurses into; group and `Alt` members are checked where
-/// their specs are built.
-fn checkNoUnderscoreFields(comptime def: anytype) void {
-    comptime {
-        for (fieldsOf(@TypeOf(def))) |f| {
-            if (std.mem.startsWith(u8, f.name, "_")) {
-                @compileError("declaration field name '" ++ f.name ++ "' must not start with '_'");
-            }
-        }
-    }
-}
-
-/// Every wire spelling of a command at its level: the primary name first,
-/// then the synonym when declared.
-fn commandSpellings(comptime c: CommandEntry) []const String {
-    if (c.synonym) |s| return &[_]String{ c.name, s };
-    return &[_]String{c.name};
-}
-
 /// Whether `tok` names `c`, matching its primary wire name or its synonym.
 fn commandMatches(comptime c: CommandEntry, tok: String) bool {
     if (std.mem.eql(u8, c.name, tok)) return true;
     if (c.synonym) |s| return std.mem.eql(u8, s, tok);
     return false;
-}
-
-fn checkCommandNames(comptime commands: []const CommandEntry) void {
-    comptime {
-        // Names and synonyms share one namespace at a level: a synonym is an
-        // alternative spelling of a command, so it may not shadow another
-        // command or repeat a name already taken.
-        const Named = struct {
-            spelling: String,
-            field: String,
-        };
-        var all: []const Named = &.{};
-        for (commands) |c| {
-            if (c.synonym) |s| {
-                if (std.mem.eql(u8, s, c.name)) {
-                    @compileError("command synonym '" ++ s ++ "' on field '" ++ c.field ++ "' duplicates its own name");
-                }
-            }
-            for (commandSpellings(c)) |spelling| {
-                all = all ++ &[_]Named{.{ .spelling = spelling, .field = c.field }};
-            }
-        }
-        for (all, 0..) |a, i| {
-            for (all[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a.spelling, b.spelling)) {
-                    @compileError("duplicate command name '" ++ a.spelling ++ "' on fields '" ++ a.field ++ "' and '" ++ b.field ++ "'");
-                }
-            }
-        }
-    }
-}
-
-fn checkCommandFieldNames(comptime specs: []const Spec, comptime commands: []const CommandEntry) void {
-    comptime {
-        for (commands) |c| {
-            for (specs) |s| {
-                if (std.mem.eql(u8, c.field, s.name)) {
-                    @compileError("command field '" ++ c.field ++ "' collides with a flag or group member of the same name");
-                }
-            }
-        }
-    }
-}
-
-/// Mixing subcommands with positional arguments is ambiguous: once a command
-/// token is seen the remaining tokens are handed off to the subcommand, so a
-/// parent-level positional could never be filled. Reject the combination.
-fn checkCommandArgumentMix(comptime specs: []const Spec, comptime commands: []const CommandEntry) void {
-    comptime {
-        if (commands.len == 0) return;
-        for (specs) |s| {
-            if (s.kind == .argument) {
-                @compileError("declaration mixes subcommands with positional argument '" ++ s.name ++
-                    "'; a declaration may have commands or positional arguments, not both");
-            }
-        }
-    }
-}
-
-fn checkDuplicates(comptime specs: []const Spec) void {
-    comptime {
-        for (specs, 0..) |a, i| {
-            if (a.kind != .flag) continue;
-            for (specs[i + 1 ..]) |b| {
-                if (b.kind != .flag) continue;
-                if (std.mem.eql(u8, a.long, b.long)) {
-                    @compileError("duplicate long flag '--" ++ a.long ++ "' on fields '" ++ a.name ++ "' and '" ++ b.name ++ "'");
-                }
-            }
-            if (a.short) |sa| {
-                for (specs[i + 1 ..]) |b| {
-                    if (b.short) |sb| {
-                        if (std.mem.eql(u8, sa, sb)) {
-                            @compileError("duplicate short flag '-" ++ sa ++ "' on fields '" ++ a.name ++ "' and '" ++ b.name ++ "'");
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn checkFieldNames(comptime specs: []const Spec) void {
-    comptime {
-        for (specs, 0..) |a, i| {
-            for (specs[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a.name, b.name)) {
-                    @compileError("duplicate field name '" ++ a.name ++ "' (from a group member or another declaration)");
-                }
-            }
-        }
-    }
-}
-
-fn checkArgumentDefaults(comptime specs: []const Spec) void {
-    comptime {
-        for (specs, 0..) |a, i| {
-            if (a.kind != .argument) continue;
-            const has_default = (a.default != null or a.default_env != null);
-            if (!has_default) continue;
-            for (specs[i + 1 ..]) |b| {
-                if (b.kind == .argument) {
-                    @compileError("argument '" ++ a.name ++ "' has a default but is not the last argument");
-                }
-            }
-        }
-    }
-}
-
-/// Reject two group declarations that share a name. Groups are introduced by a
-/// `Group` field (one name) or by an `Alt` (one name per branch tag). Members
-/// of the same group legitimately share the name, so the check runs over the
-/// distinct declaration names, not over the flattened specs. Arguments live in
-/// a separate namespace and are not considered.
-fn checkGroupDefs(comptime names: []const String) void {
-    comptime {
-        for (names, 0..) |a, i| {
-            if (a.len == 0) continue;
-            for (names[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a, b)) {
-                    @compileError("duplicate group name '" ++ a ++ "'");
-                }
-            }
-        }
-    }
 }
 
 /// The wire name of a command: `cmd_meta.name` when set, the declaration
@@ -3795,87 +3680,6 @@ fn commandWireName(comptime meta: CommandMeta, comptime field: String) String {
 /// (`stop`). Consumers reach commands through `namespace.command`.
 fn viewCommandField(comptime field: String) String {
     return "_" ++ field;
-}
-
-/// One flag discovered somewhere in the declaration tree, together with the
-/// level path it lives at. Drives the global uniqueness check (D6).
-const FlagOrigin = struct {
-    long: String,
-    short: ?String,
-    field: String,
-    path: []const String,
-};
-
-/// Join a level path with single spaces for diagnostics.
-fn levelPath(comptime path: []const String) String {
-    comptime {
-        var out: String = "";
-        for (path, 0..) |seg, i| {
-            if (i != 0) out = out ++ " ";
-            out = out ++ seg;
-        }
-        return out;
-    }
-}
-
-/// Flatten the whole declaration tree into a table of flag origins, walking
-/// levels through `normalize` exactly as `generate` does (groups and `Alt`
-/// branches flatten into `norm.specs` for free). The injected builtin help
-/// flag and positional arguments are excluded (D6): the builtin is present at
-/// every level by design, and arguments only ever render at the deepest level.
-fn collectFlagOrigins(
-    comptime norm: NormResult,
-    comptime path: []const String,
-    comptime acc: []const FlagOrigin,
-) []const FlagOrigin {
-    comptime {
-        @setEvalBranchQuota(1_000_000);
-        var out = acc;
-        for (norm.specs) |s| {
-            if (s.kind != .flag) continue;
-            if (std.mem.eql(u8, s.name, builtin_help_field)) continue;
-            out = out ++ &[_]FlagOrigin{.{
-                .long = s.long,
-                .short = s.short,
-                .field = s.name,
-                .path = path,
-            }};
-        }
-        for (norm.commands) |c| {
-            const child = normalize(withBuiltinHelp(c.Cmd.cmd_def));
-            out = collectFlagOrigins(child, path ++ &[_]String{c.name}, out);
-        }
-        return out;
-    }
-}
-
-/// Pairwise long/short uniqueness over the flattened tree, reporting both
-/// level paths in the message. Flags of every ancestor level merge into a
-/// deep help scope, so a name reused anywhere in the command tree would be
-/// ambiguous; sibling commands are covered too (D6).
-fn checkGlobalFlagNames(comptime origins: []const FlagOrigin) void {
-    comptime {
-        for (origins, 0..) |a, i| {
-            for (origins[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a.long, b.long)) {
-                    @compileError("duplicate long flag '--" ++ a.long ++ "' at '" ++ levelPath(a.path) ++
-                        "' and '" ++ levelPath(b.path) ++ "'; flag names must be globally unique " ++
-                        "across the command tree (fields '" ++ a.field ++ "' / '" ++ b.field ++ "')");
-                }
-            }
-            if (a.short) |sa| {
-                for (origins[i + 1 ..]) |b| {
-                    if (b.short) |sb| {
-                        if (std.mem.eql(u8, sa, sb)) {
-                            @compileError("duplicate short flag '-" ++ sa ++ "' at '" ++ levelPath(a.path) ++
-                                "' and '" ++ levelPath(b.path) ++ "'; flag names must be globally unique " ++
-                                "across the command tree (fields '" ++ a.field ++ "' / '" ++ b.field ++ "')");
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn normalize(comptime def: anytype) NormResult {
@@ -3905,11 +3709,10 @@ fn commandSubtreeCount(comptime def: anytype) usize {
 /// `generate` passes `app._command_rank`; the ranks end up in the generated
 /// `View` tag field and keep every level's `View` type distinct.
 fn normalizeRanked(comptime def: anytype, comptime base_rank: usize) NormResult {
-    comptime checkNoUnderscoreFields(def);
+    comptime checks_mod.checkNoUnderscoreFields(def);
     var specs: []const Spec = &.{};
     var commands: []const CommandEntry = &.{};
     var alts: []const AltLevel = &.{};
-    var group_names: []const String = &.{};
     var next_rank: usize = base_rank + 1;
 
     inline for (fieldsOf(@TypeOf(def))) |f| {
@@ -3927,11 +3730,9 @@ fn normalizeRanked(comptime def: anytype, comptime base_rank: usize) NormResult 
                 next_rank += 1 + commandSubtreeCount(V.cmd_def);
             } else if (@hasDecl(V, "dap_kind") and V.dap_kind == .group) {
                 specs = specs ++ groupSpecs(V.group_def, V.group_name);
-                group_names = group_names ++ &[_]String{V.group_name};
             } else if (@hasDecl(V, "dap_kind") and V.dap_kind == .alt) {
                 specs = specs ++ altSpecs(V, f.name);
                 alts = alts ++ &[_]AltLevel{.{ .field = f.name, .AT = V }};
-                inline for (V.tag_names) |tn| group_names = group_names ++ &[_]String{tn};
             } else {
                 @compileError("unknown type-valued declaration field '" ++ f.name ++ "'");
             }
@@ -3940,13 +3741,12 @@ fn normalizeRanked(comptime def: anytype, comptime base_rank: usize) NormResult 
         }
     }
 
-    checkDuplicates(specs);
-    checkFieldNames(specs);
-    checkArgumentDefaults(specs);
-    checkGroupDefs(group_names);
-    checkCommandNames(commands);
-    checkCommandFieldNames(specs, commands);
-    checkCommandArgumentMix(specs, commands);
+    checks_mod.checkDuplicates(specs);
+    checks_mod.checkFieldNames(specs);
+    checks_mod.checkArgumentDefaults(specs);
+    checks_mod.checkCommandNames(commands);
+    checks_mod.checkCommandFieldNames(specs, commands);
+    checks_mod.checkCommandArgumentMix(specs, commands);
 
     return .{ .specs = specs, .commands = commands, .alts = alts };
 }
@@ -6131,14 +5931,46 @@ test "M12: duplicate tags via VariantNamed are a compile error" {
     }
 }
 
-test "M12: an Alt branch name clashing with a Group name is a compile error" {
-    if (false) {
-        const Bad = .{
-            .g = Group(.{ .p = Flag(u8){} }, "alt1"),
-            .mode = Alt(.{ .alt1 = .{ .q = Flag(u8){} } }),
-        };
-        comptime _ = normalize(Bad);
-    }
+test "M12: an Alt branch tag may equal a Group name and shares its help section" {
+    const C = generate(App{ .name = "grouped", .help = "" }, .{
+        .g = Group(.{ .p = Flag(u8){} }, "alt1"),
+        .mode = Alt(.{ .alt1 = .{ .q = Flag(u8){} } }),
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const help = try C.helpText(a);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, help, "alt1"));
+    try std.testing.expect(std.mem.indexOf(u8, help, "--p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--q") != null);
+}
+
+test "M12: duplicate group names merge into one help section" {
+    const C = generate(App{ .name = "grouped", .help = "" }, .{
+        .one = Group(.{ .a = Flag(u8){} }, "shared"),
+        .two = Group(.{ .b = Flag(u8){} }, "shared"),
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const help = try C.helpText(a);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, help, "shared"));
+    try std.testing.expect(std.mem.indexOf(u8, help, "--a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--b") != null);
+}
+
+test "M12: two Alt fields sharing a branch tag share one help section" {
+    const C = generate(App{ .name = "tagged", .help = "" }, .{
+        .one = Alt(.{ .fast = .{ .a = Flag(u8){} } }),
+        .two = Alt(.{ .fast = .{ .b = Flag(u8){} } }),
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const help = try C.helpText(a);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, help, "fast"));
+    try std.testing.expect(std.mem.indexOf(u8, help, "--a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--b") != null);
 }
 
 test "M12: non-flag Alt member is a compile error" {

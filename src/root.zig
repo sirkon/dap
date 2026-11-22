@@ -28,3 +28,4 @@ pub const HelpRendererHighlight = @import("dap.zig").HelpRendererHighlight;
 pub const HelpHighlight = @import("dap.zig").HelpHighlight;
 pub const Completion = @import("dap.zig").Completion;
 pub const generate = @import("dap.zig").generate;
+pub const Compose = @import("compose.zig").Compose;

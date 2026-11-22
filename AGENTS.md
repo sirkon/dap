@@ -9,9 +9,11 @@ declaration.
 
 ## Status: implemented
 
-The core pipeline is implemented and green. `zig build test` and
-`zig test src/dap.zig` both pass (314 tests, the milestone-tagged M1–M26
-blocks). There is no `PLAN.md`; the test names are the plan of record.
+The core pipeline is implemented and green. `zig build test` (both test roots),
+`zig test src/dap.zig` (317 tests) and `zig test src/compose.zig` (338 tests,
+including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) pass.
+The milestone-tagged M1–M26 blocks are the plan of record; there is no
+`PLAN.md`.
 
 - `src/dap.zig` holds the DSL, spec normalization, `generate`,
   `Enumeration`, `Command`, `Alt`, runtime help (`HelpData` +
@@ -22,6 +24,15 @@ blocks). There is no `PLAN.md`; the test names are the plan of record.
   `Completion` namespace, the `Level`/`Binding`/`Model` tables, script
   emitters, the hidden route, and the M19–M26 tests. It imports `dap.zig`
   directly; the cycle resolves lazily.
+- `src/checks.zig` owns the declaration checks that used to live in `dap.zig`
+  (`checkNoUnderscoreFields`, `commandSpellings`, the command/duplicate/field/
+  argument checks, `FlagOrigin`/`levelPath`/`collectFlagOrigins`/
+  `checkGlobalFlagNames`) plus `validLongName`/`validPrefix`/`checkPrefix` and
+  the cross-input planner `concatPlan` used by composition. `dap.zig` imports
+  it for `normalize`/`generate`; the cycle resolves lazily.
+- `src/compose.zig` owns declaration composition: the public `Compose`
+  namespace with `shift`/`concat` and its tests. It imports `dap.zig` and
+  `checks.zig`; `dap.zig` never imports it.
 - `src/stdcompare.zig` holds the private `levenshtein` helper the suggester
   ranks with; it is imported directly by `dap.zig` (not re-exported).
 - `src/completion_fixture.zig` is the predictor fixture application: it
@@ -36,8 +47,10 @@ blocks). There is no `PLAN.md`; the test names are the plan of record.
   `usingnamespace`; exports are explicit).
 - `build.zig` exposes a public `dap` module rooted at `src/root.zig`, builds a
   `dap-example` executable from `src/main.zig` with a `run` step, a `test` step
-  compiling/running tests from `src/dap.zig`, and a separate `completion-test`
-  step for `src/completion_test.zig`. The completion step also builds the
+  compiling/running tests from `src/dap.zig` **and** `src/compose.zig` (two
+  roots: `dap.zig` never imports compose, so a second artifact is the only way
+  the step reaches it), and a separate `completion-test` step for
+  `src/completion_test.zig`. The completion step also builds the
   fixture executable and passes its path through a `build_options` module.
   `test` never depends on `completion-test`, so it never spawns a shell.
 - `build.zig.zon` sets `.name = .dap` and `.minimum_zig_version = "0.17.0"`.
@@ -76,10 +89,13 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `Defaults`/`DefaultRepr`, `normalize`/`normalizeRanked`,
   `commandSubtreeCount`, `specFromField`, `declCompletion`,
   `groupSpecs`, `altSpecs`, `specViewType`, `assignValue`, `helpRequested`,
-  `validateAlt`, `resolveAbsent`, the `check*` validators plus
-  `FlagOrigin`/`levelPath`/`collectFlagOrigins`/`checkGlobalFlagNames` and
-  `Sub`/`subApp`/`CommandPayloadOf`/`commandNodes`), then
-  the test blocks.
+  `validateAlt`, `resolveAbsent`, `Sub`/`subApp`/`CommandPayloadOf`/
+  `commandNodes`), then the test blocks. The `check*` validators and the
+  global flag-name walk live in `checks.zig`; `dap.zig` reaches them through
+  the narrow `_checks_internal` bridge (`Field`, `Spec`, `NormResult`,
+  `CommandEntry`, `fieldsOf`, `typeOfField`, `normalize`, `withBuiltinHelp`,
+  `specFromField`, `builtin_help_field`), the same arrangement as
+  `_completion_internal`.
 - `src/completion.zig` — the completion feature. Public `Completion`
   (`Shell`, `Error`, `route_marker`, `FsOptions`, `Suggestion`, `Predictor`,
   `disabled`/`fs`/`launch`/`call`/`custom`, and the lazy `Of(NS)` handle)
@@ -96,8 +112,19 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   the static command matrix, and the predictor matrix through the fixture
   executable); imports the public `dap` module and never runs under
   `zig build test`.
+- `src/checks.zig` — shared checks and the composition planner. Moved checks
+  keep their `dap.zig` message shapes. `concatPlan(left, right)` validates a
+  pair and returns the per-result-field plan (`copy_left`, `copy_right`,
+  `merge_group`, `merge_alt`). Also defines `validLongName`/`validPrefix`
+  (used by `shift`) and exposes `Field`/`fieldsOf`/`typeOfField` to compose.
+- `src/compose.zig` — `pub const Compose` with `shift` and `concat`. Private
+  helpers build the composed `@Struct` types (`Shifted`, `Concat`,
+  `ShiftedAltDict`, `MergedDict`) and the value holders behind each field's
+  `default_value_ptr`. Tests cover shift, concat, merges and end-to-end
+  `generate`/`parse`/`helpText`.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`
-  (`Completion` is one of them).
+  (`Completion` is one of them) plus `pub const Compose =
+  @import("compose.zig").Compose;`.
 
 ## Conventions
 
@@ -164,8 +191,11 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `ConflictingAlt` on a second branch) and `validateAlt` runs in Phase 1.5;
   Alt members are skipped by the flat POST-PASS/VALIDATE phases, and `Alt`
   itself already rejects zero branches, duplicate tags, non-flag members,
-  defaulted members, and optional members at comptime. `checkGroupDefs`
-  rejects an Alt tag colliding with a `Group` name.
+  defaulted members, and optional members at comptime. Duplicate *help group
+  names* are legal: a `Group` name may repeat and may equal an `Alt` branch
+  tag; `helpData` buckets specs by first-seen group name, so the rows render
+  in one section. Only the tag set inside one `Alt` (the payload-union tags)
+  must stay unique.
 - Subcommands are sibling `Command(meta, def)` fields. `normalize` collects
   them via the `.command` `dap_kind` dispatch into `NormResult.commands`, a
   slice of `CommandEntry` (`field` = declaration field name, the union tag;
@@ -200,6 +230,45 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   long/long or short/short collision with both level paths in the message;
   sibling commands are covered too. This runs in `generate` right after
   `normalize`'s own per-level checks.
+- Composition is orthogonal to the core: `dap.zig` never imports
+  `compose.zig`, `root.zig` republishes `Compose`, and both combinators run
+  before `generate` injects `-h, --help`. They return declaration *values*
+  with an inferred type (private `Shifted(decl, prefix)` /
+  `Concat(left, right)`), so the result feeds `generate` directly. Composed
+  declarations rebuild every field's `default_value_ptr` (values are read
+  through field attributes) while preserving `@"comptime"`; merged
+  group/`Alt` members keep their types and values, so their attributes are
+  copied verbatim.
+  - `shift(decl, prefix)`: `prefix` is comptime, non-empty, and must spell a
+    valid long name (`checks.validLongName`: no byte `<= 0x20`, `0x7f` or `=`,
+    no leading or trailing `-`) or such a name plus one trailing `-`. Every
+    flag, at every level and inside every `Group`/`Alt`/`Command`, gets
+    `long = prefix ++ (old_long orelse field_name)` and `short = null`.
+    Field names, group names, `Alt` tags, command wire names, arguments and
+    defaults/validations/help/i18n/predictors are preserved. Composition is
+    prefix-outer: `shift(shift(d, "a-"), "b-")` yields `--b-a-…`.
+    `dap` still does not validate long names declared directly; the predicate
+    is applied by `shift` only.
+  - `concat(left, right)`: `left` fields first, then right-only fields;
+    identities are `.{}` and nesting is associative in declaration order. A
+    name declared by both sides merges only as `Group` + `Group` (equal
+    `group_name`; members concatenated left-then-right) or `Alt` + `Alt`
+    (branch dictionaries concatenated left-then-right), otherwise it is a
+    field-name clash. `checks.concatPlan` performs every check and returns the
+    per-field plan (`copy_left`/`copy_right`/`merge_group`/`merge_alt`), so
+    the pairing decision exists once: flat field names (normalized specs, so
+    group and `Alt` members are covered), positional argument display names,
+    whole-tree long/short flags (group and `Alt` members included),
+    top-level command wire names/synonyms, and inside a merged `Alt`
+    duplicate branch field names and tags. Messages name the class and the
+    dotted declaration-field path on each side, e.g.
+    `field name 'port' clash in declarations (left g.port, right g.port)`;
+    classes are `field name`, `flag name` (dash-inclusive), `command name`,
+    `argument name`, `alt branch name`, plus
+    `group 'g' name conflict: left 'a' != right 'b'`. Duplicate group names
+    are not compared (help merges them). Structural rules stay with
+    `generate`, so a pair it rejects fails at the `generate` call site.
+
 - A level that declares commands additionally exposes a switch-shaped accessor
   (D7–D10). Because Zig has no `comptime if` at container scope, `generate`
   builds its namespace under a local `Base` and, when `cmd_entries.len == 0`,
@@ -425,10 +494,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `bin/dap-predictor-test` through the real route.
 - Ordering inside `src/dap.zig`: public data types first, then private
   help/builtin scaffolding, then the private `suggest*` family, then the
-  completion bridge, then the public `generate` entry point, then private
-  normalization/decode helpers, then tests. `src/completion.zig` puts the
-  public `Completion` namespace first, then private model/entry/emitter code,
-  then the route, then its tests.
+  completion bridge and the `_checks_internal` bridge, then the public
+  `generate` entry point, then private normalization/decode helpers, then
+  tests. `src/completion.zig` puts the public `Completion` namespace first,
+  then private model/entry/emitter code, then the route, then its tests.
+  `src/checks.zig` puts the shared types/bridge imports first, then the moved
+  checks, then the long-name predicates, then the `concat` planner and its
+  walkers, then tests. `src/compose.zig` puts `Compose` first, then the
+  shift/concat builders and merge helpers, then tests.
 
 ## Notes
 
