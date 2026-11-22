@@ -10,29 +10,29 @@ You declare the command line once, as a struct literal. `dap.generate` turns tha
 <!-- BEGIN mktoc -->
 
 - [dap](#dap)
-- [A first program](#a-first-program)
-- [Common tasks](#common-tasks)
-  - ["Not supplied" must be different from zero](#not-supplied-must-be-different-from-zero)
-  - [Use the environment, then a literal default](#use-the-environment-then-a-literal-default)
-  - [Reject invalid input with a useful message](#reject-invalid-input-with-a-useful-message)
-  - [Organize the help page](#organize-the-help-page)
-  - [Let the user pick exactly one mode](#let-the-user-pick-exactly-one-mode)
-  - [Add subcommands](#add-subcommands)
-  - [Accept a value the standard types cannot express](#accept-a-value-the-standard-types-cannot-express)
-  - [Shape the help output](#shape-the-help-output)
-  - [Offer shell completion](#offer-shell-completion)
-  - [Reuse or rename a declaration](#reuse-or-rename-a-declaration)
-  - [Free what the parser allocated](#free-what-the-parser-allocated)
-- [Reference](#reference)
+- [Install](#install)
+- [A flat CLI](#a-flat-cli)
+- [A commanded CLI](#a-commanded-cli)
+- [Capabilities](#capabilities)
 - [Building and testing](#building-and-testing)
+
 <!-- END mktoc -->
 
-## A first program
+## Install
 
-**The problem.** A download tool needs a `-l/--login` option with an environment fallback, a checked integer option, a
-required file argument, and `--help`.
+Add this package as a dependency named `dap`, then import the module into the executable:
 
-**The solution.** Write the declaration and generate the parser:
+```zig
+const dap = @import("dap");
+```
+
+The `build.zig` wiring, the generated namespace and its full contract are in
+[AGENTS-SDK.md §1](./AGENTS-SDK.md#1-module-wiring) and [§2](./AGENTS-SDK.md#2-generated-namespace).
+
+## A flat CLI
+
+A download tool with a `-l/--login` option that falls back to `$USER`, a checked integer option, a required file
+argument, and the always-present `--help`:
 
 ```zig
 const std = @import("std");
@@ -70,360 +70,120 @@ pub fn main(init: std.process.Init) !void {
     defer diag.deinit(arena);
 
     // `argv[1..]` is pure payload: no binary name, no skipped token.
-    var cli = try CLI.parse(arena, init.minimal.environ, argv[1..], &diag);
+    const cli = try CLI.parse(arena, init.minimal.environ, argv[1..], &diag);
 
     std.debug.print("{s} level={d} {s}\n", .{ cli.login, cli.level, cli.path });
 }
 ```
-
-The generated `CLI.View` mirrors the declaration. `cli.login` is a `[]const u8`, `cli.level` a `u8`, `cli.path` a
-`[]const u8`; each one has already been decoded and validated.
 
 ```sh
 $ api-downloader -l alice report.json
 $ api-downloader --help
 ```
 
-`-h`/`--help` is always present. A bad value prints a diagnostic and the relevant help page to stderr and exits
-non-zero. A successful parse returns a `View` you own; an arena frees it in one go.
+`CLI.View` mirrors the declaration: `cli.login` is a `[]const u8`, `cli.level` a `u8`, `cli.path` a `[]const u8`, each
+already decoded and validated. A bad value prints a diagnostic plus the relevant help page to stderr and exits non-zero;
+`-h`/`--help` prints help and exits cleanly. A successful parse returns a `View` you own, and an arena frees it in one
+go.
 
-## Common tasks
+## A commanded CLI
 
-### "Not supplied" must be different from zero
-
-**The problem.** For an integer or boolean option, `0` and `false` are valid inputs, so a zero value cannot tell whether
-the user typed the flag.
-
-**The solution.** Declare an optional flag. Its `View` field becomes `?T`:
+A workspace tool with global flags, two verbs, a nested command, and a hidden `completion` command that prints a shell
+script generated from the same declaration:
 
 ```zig
+const std = @import("std");
+const dap = @import("dap");
+
 const def = .{
-    .jobs = dap.Optional(dap.Flag(u32){ .short = "j", .help = "Worker count." }),
-};
-
-if (cli.jobs) |n| {
-    std.debug.print("{d} workers\n", .{n});
-} else {
-    std.debug.print("automatic worker count\n", .{});
-}
-```
-
-The field is `null` when the flag is absent and contains a normal checked value when it is present. Optional flags
-cannot declare defaults, optional `Argument`s are not supported, and validation is skipped while the flag is absent.
-
-### Use the environment, then a literal default
-
-**The problem.** A setting should come from an environment variable, then from a built-in value, and only then fail if
-required.
-
-**The solution.** `Default(T)` has an `env` name and a `direct` value; `dap.defaultValue` is shorthand for a direct
-default:
-
-```zig
-.user = dap.Flag([]const u8){
-    .default = dap.Default([]const u8){ .env = "API_USER" },
-},
-.retries = dap.Flag(u8){
-    .default = dap.defaultValue(u8, 3),
-},
-```
-
-Precedence is **argv > environment > direct default > type zero value**. A flag or argument with a default is optional;
-one without a default is required. Only the last positional argument may carry a default.
-
-### Reject invalid input with a useful message
-
-**The problem.** A value looks usable at the type level but is still wrong for the program.
-
-**The solution.** Attach a validation function. Ready-made ones cover non-empty strings and non-zero integers:
-
-```zig
-.name = dap.Flag([]const u8){
-    .validation = dap.Validate.stringNotEmpty,
-},
-.count = dap.Flag(u8){
-    .validation = dap.Validate.intNotZero(u8),
-},
-```
-
-A custom validator has the signature `fn (std.mem.Allocator, T) std.mem.Allocator.Error!?String` and returns `null` on
-success or a freshly allocated message on failure. Validation runs on wire values, environment values and defaults
-alike.
-
-### Organize the help page
-
-**The problem.** A long flag list is hard to scan.
-
-**The solution.** Wrap related flags or arguments in `Group`, optionally with a heading:
-
-```zig
-const def = .{
-    .server = dap.Group(.{
-        .host = dap.Flag([]const u8){ .help = "Host name." },
-        .port = dap.Flag(u16){ .default = dap.defaultValue(u16, 8080) },
-    }, "Server"),
-};
-```
-
-`Group` only affects help output; the `View` still has flat `cli.host` and `cli.port` fields. It accepts flags and
-positional arguments, not other groups.
-
-### Let the user pick exactly one mode
-
-**The problem.** `--file` and `--url` are alternatives, and passing both is a usage error.
-
-**The solution.** Declare an `Alt`. Each branch is a set of flags; the generated field is a nullable union:
-
-```zig
-const def = .{
-    .source = dap.Alt(.{
-        .file = .{
-            .file = dap.Flag([]const u8){ .short = "f", .help = "Read a file." },
-        },
-        .remote = dap.VariantNamed("net", .{
-            .url = dap.Flag([]const u8){ .help = "Read a URL." },
-        }),
-    }),
-};
-
-if (cli.source) |src| switch (src) {
-    .file => |p| try readFile(p.file),
-    .net => |p| try readUrl(p.url),
-} else {
-    // no branch was selected
-}
-```
-
-Branch members must be flags, must not have defaults, and may not be optional. Activating two branches at once is a
-parse error. Help shows one alternation clause such as `(--file=FILE | --url=URL)`. A `VariantNamed` overrides the
-branch tag used by the union and by help; without it the branch field name is the tag.
-
-### Add subcommands
-
-**The problem.** The program has several verbs (`build`, `serve`) that share global flags but have their own options.
-
-**The solution.** Declare each command as a sibling `Command(meta, def)`. Dispatch with `CLI.command`:
-
-```zig
-const def = .{
-    .verbose = dap.Flag(bool){ .short = "v" },
+    .verbose = dap.Flag(bool){ .short = "v", .help = "Print extra detail." },
     .build = dap.Command(.{ .help = "Compile the project." }, .{
-        .jobs = dap.Flag(u8){ .short = "j" },
+        .jobs = dap.Flag(u8){ .short = "j", .default = dap.defaultValue(u8, 1), .help = "Parallel jobs." },
+        .release = dap.Flag(bool){ .short = "r", .help = "Optimize for speed." },
     }),
-    .serve = dap.Command(.{ .help = "Run the server." }, .{
-        .addr = dap.Argument([]const u8){ .help = "Listen address." },
+    .serve = dap.Command(.{ .help = "Run the development server." }, .{
+        .addr = dap.Flag([]const u8){ .help = "Listen address." },
+        .watch = dap.Command(.{ .help = "Rebuild on change." }, .{}),
+    }),
+    .completion = dap.Command(.{ .help = "Print a completion script." }, .{
+        .shell = dap.Argument(dap.Completion.ShellType){ .help = "Target shell." },
     }),
 };
 
-if (CLI.command(cli)) |cmd| switch (cmd) {
-    .build => |b| try build(b.jobs),
-    .serve => |s| try serve(s.addr),
-} else {
-    try CLI.usage(cli);
+const CLI = dap.generate(
+    dap.App{ .name = "workspace", .help = "Build and run the project." },
+    def,
+);
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(arena);
+
+    var diag: dap.Diag = .{};
+    defer diag.deinit(arena);
+
+    var cli = try CLI.parse(arena, init.minimal.environ, argv[1..], &diag);
+    defer CLI.deinit(&cli, arena);
+
+    if (CLI.command(cli)) |cmd| switch (cmd) {
+        .completion => |c| {
+            try CLI.completion(arena, "workspace", switch (c.shell.view) {
+                .bash => .bash,
+                .zsh => .zsh,
+                .fish => .fish,
+            }).show(init.io);
+            return;
+        },
+        .build => |b| std.debug.print("build jobs={d} release={}\n", .{ b.jobs, b.release }),
+        .serve => |s| std.debug.print("serve {s}\n", .{s.addr}),
+    } else {
+        try CLI.usage(cli);
+    }
+
+    if (cli.verbose) std.debug.print("verbose on\n", .{});
 }
 ```
 
-The switch tags are the declaration field names; the command wire name defaults to the field name and can be changed
-with `.name = "..."`. Command definitions nest, and `CLI.command` accepts a `View` from any level, so dispatch can go as
-deep as the declaration does.
-
-Flags are addressable anywhere on the command line: `app serve --verbose --addr :8080` assigns `--verbose` to the root
-`View`. Names must therefore be unique across the whole command tree, which the compiler enforces. `--` ends flag and
-command recognition, so literal arguments can follow it.
-
-Help follows the entered path: `app serve -h` describes `serve` with the root flags merged in, and a failure deep in the
-tree renders that level's help page.
-
-### Accept a value the standard types cannot express
-
-**The problem.** A flag carries a structured value, such as `HOST:PORT`, or a fixed set of words.
-
-**The solution.** For a fixed set, use `Enumeration`:
-
-```zig
-const Mode = dap.Enumeration(.{
-    .fast = dap.Enum{},
-    .glacial = dap.Enum{ .name = "slow" },
-});
-
-.mode = dap.Flag(Mode){
-    .default = dap.Default(Mode){ .direct = Mode{ .view = .glacial } },
-},
-
-// --mode slow  ->  cli.mode.view == Mode.EnumView.glacial
+```sh
+$ workspace --verbose build --release --jobs 4
+$ workspace serve --addr :8080 watch
+$ workspace completion zsh
+$ workspace serve --help
 ```
 
-The wire names also feed shell completion. For anything else, provide a type with three methods:
+The `switch` tags are the declaration field names, not the wire names. Flags are addressable anywhere on the command
+line: `workspace serve --verbose --addr :8080` assigns `--verbose` to the root `View`, so long and short names are
+globally unique across the whole tree and the compiler enforces it. Commands nest, and `CLI.command` accepts a `View`
+from any level, so dispatch can go as deep as the declaration does.
 
-```zig
-const Endpoint = struct {
-    host: []const u8,
-    port: u16,
+Help follows the entered path: `workspace serve --help` describes `serve` with the root flags merged in, and a failure
+deep in the tree renders that level's page. `CLI.usage(cli)` prints the same page, which is useful when no command was
+given. Completion is generated from the declaration; `CLI.completion(allocator, app_name, shell)` is lazy, and
+`app_name` is the name the script registers, not `App.name`. The route it serves for dynamic values runs at the very
+start of `CLI.parse`, so do file, socket or network work only after parsing.
 
-    pub fn decode(allocator: std.mem.Allocator, data: []const u8) dap.DecodeError!Endpoint {
-        const colon = std.mem.indexOfScalar(u8, data, ':') orelse return error.InvalidWire;
-        const port = std.fmt.parseInt(u16, data[colon + 1 ..], 10) catch return error.InvalidWire;
-        return .{
-            .host = try allocator.dupe(u8, data[0..colon]),
-            .port = port,
-        };
-    }
+## Capabilities
 
-    pub fn encode(self: *Endpoint, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
-        return std.fmt.allocPrint(allocator, "{s}:{d}", .{ self.host, self.port });
-    }
+Everything below is specified in detail in [AGENTS-SDK.md](./AGENTS-SDK.md).
 
-    pub fn deinit(self: *Endpoint, allocator: std.mem.Allocator) void {
-        allocator.free(self.host);
-    }
-};
-```
-
-`decode` returns a fully owned value, `encode` returns an allocator-owned wire spelling, and `deinit` releases the
-value's internals. `CLI.deinit(&cli, arena)` calls it for every stored field.
-
-### Shape the help output
-
-**The problem.** The built-in help is close, but the program needs a different layout or structured access to the help
-model.
-
-**The solution.** The default `App` configuration renders a compact two-column page through `CLI.helpText`:
-
-```zig
-const text = try CLI.helpText(allocator);
-defer allocator.free(text);
-```
-
-For custom rendering, ask for the plain-data model, or choose a custom renderer in `App`:
-
-```zig
-var data = try CLI.helpData(allocator);
-defer data.deinit(allocator);
-const text = try data.renderCompact(allocator);
-defer allocator.free(text);
-```
-
-```zig
-const app = dap.App{
-    .name = "api-downloader",
-    .help = "Download a file from the API.",
-    .help_renderer = .{
-        .style = .{ .custom = myRenderer },
-        .highlight = .{ .color = {} },
-    },
-};
-```
-
-Highlighting can be plain (`flat`), bold (the default), colored, or a custom `HelpHighlight` scheme. `CLI.usage(view)`
-prints the same context-sensitive page for any `View`, which is useful when no subcommand was given.
-
-### Offer shell completion
-
-**The problem.** Users expect Tab completion for flags, subcommands and values.
-
-**The solution.** Generate the script from the same declaration. A common pattern is a hidden `completion` command:
-
-```zig
-const Shell = dap.Enumeration(.{
-    .bash = dap.Enum{},
-    .zsh = dap.Enum{},
-    .fish = dap.Enum{},
-});
-
-const def = .{
-    .completion = dap.Command(.{ .help = "Print a completion script." }, .{
-        .shell = dap.Argument(Shell){ .help = "Target shell." },
-    }),
-};
-
-// in main, before other work:
-if (CLI.command(cli)) |cmd| switch (cmd) {
-    .completion => |c| {
-        try CLI.completion(arena, "api-downloader", switch (c.shell.view) {
-            .bash => .bash,
-            .zsh => .zsh,
-            .fish => .fish,
-        }).show(init.io);
-        return;
-    },
-    else => {},
-};
-```
-
-`CLI.completion(allocator, app_name, shell)` builds a lazy handle for the whole tree. `text()` returns the script,
-`show(io)` writes it to stdout, and `install(io, environ)` writes it to the shell's discovery directory. `app_name` is
-the name the script registers; it is not `App.name`. Regenerate the script whenever the declaration changes.
-
-Values can be predicted too. Set `completion` on a flag or argument:
-
-```zig
-.config = dap.Flag(dap.String){
-    .completion = dap.Completion.fs(.{ .wildcard = "*.toml", .root = "config" }),
-},
-.item = dap.Argument(dap.String){
-    .completion = dap.Completion.custom(suggestItems),
-},
-```
-
-| Declaration                                     | Values offered                         |
-| ----------------------------------------------- | -------------------------------------- |
-| `null` (default)                                | the shell's normal file completion     |
-| `dap.Completion.fs(.{})`                        | same as `null`                         |
-| `dap.Completion.fs(.{ .wildcard = "*.zig" })`   | matching files, resolved by the binary |
-| `dap.Completion.disabled()`                     | nothing, and no file fallback          |
-| `dap.Completion.launch(.{ "git", "ls-files" })` | output of a literal command            |
-| `dap.Completion.call("...")`                    | a shell expression inserted verbatim   |
-| `dap.Completion.custom(cb)`                     | a callback running inside the binary   |
-
-A predictor replaces the static values for its target. `fs` filters by file name (`*` and `?`), optionally under a
-`root` directory; `.type = .dir` lists directories only. `launch` substitutes `$cur` with the word being completed,
-while `call` is dialect-specific shell code. Callbacks own every string they return and are invoked through a hidden
-route.
-
-The route runs at the very start of `CLI.parse`, before any parsing. An application that inspects files, sockets or
-network state before calling `parse` can break completion; do that work after `parse` instead.
-
-### Reuse or rename a declaration
-
-**The problem.** Flags from a library collide with the application's flags, or two independently written option sets
-need to be combined.
-
-**The solution.** `dap.Compose` transforms declaration values before `generate`:
-
-```zig
-const db = .{ .port = dap.Flag(u16){ .short = "p" } };
-const app = .{ .verbose = dap.Flag(bool){ .short = "v" } };
-
-const CLI = dap.generate(dap.App{ .name = "app", .help = "" }, dap.Compose.concat(
-    app,
-    dap.Compose.shift(db, "db-"),
-));
-// --verbose, --db-port; -p is dropped by shift
-```
-
-`shift(decl, prefix)` prefixes every flag's long name at every level and removes short names; `concat(left, right)`
-appends `right`'s fields after `left`'s. Same-named `Group`s with the same heading merge their members, and same-named
-`Alt`s merge their branches; other same-named fields, flags, commands or positional names are compile errors. Both
-operations are comptime-only and allocation-free.
-
-### Free what the parser allocated
-
-**The problem.** Strings and custom values in the `View` are allocated.
-
-**The solution.** Use an arena, or call the generated deinitializer:
-
-```zig
-var cli = try CLI.parse(allocator, environ, args, &diag);
-defer CLI.deinit(&cli, allocator);
-```
-
-`CLI.deinit` is a namespace function, not a method on the view: `cli.deinit(...)` does not compile. It releases string
-fields, custom value internals, the active `Alt` branch and every active subcommand `View`. Call it once, on a `View`
-from a successful parse.
-
-## Reference
-
-The complete API, constraints and behavioral details are in [AGENTS-SDK.md](./AGENTS-SDK.md).
+| Capability          | What you get                                                                                              | Reference                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Flags and arguments | `Flag(T)` and `Argument(T)`, verbatim wire names, short aliases, requiredness derived from defaults       | [§3.1–3.3](./AGENTS-SDK.md#31-names-and-requirements)      |
+| Defaults            | environment fallback, direct defaults, `dap.defaultValue`; precedence `argv > env > direct > zero`        | [§3.4](./AGENTS-SDK.md#34-defaultt-and-defaultvalue)       |
+| Optional flags      | `?T` view fields so "absent" differs from zero; no defaults, no optional arguments                        | [§3.5](./AGENTS-SDK.md#35-optional-flags)                  |
+| Help grouping       | `Group` sections and headings, flat view fields                                                           | [§3.6](./AGENTS-SDK.md#36-groupdef-name)                   |
+| Alternatives        | `Alt` branches with typed nullable unions, `VariantNamed` tags, conflict detection                        | [§3.7](./AGENTS-SDK.md#37-alt-and-variantnamed)            |
+| Subcommands         | nested `Command`, synonyms, typed dispatch via `CLI.command`, global flag names, `--` terminator          | [§3.8](./AGENTS-SDK.md#38-commandmeta-def-and-commandmeta) |
+| Composition         | `Compose.shift` prefixing and short-name stripping, `Compose.concat` merging, compile-time clashes        | [§3.9](./AGENTS-SDK.md#39-composition)                     |
+| Value types         | builtin integers, floats and strings, plus any type with `decode`/`encode`/`deinit`                       | [§4](./AGENTS-SDK.md#4-value-types)                        |
+| Enumerations        | fixed wire-name sets via `Enumeration`, per-value help, completion candidates                             | [§4.3](./AGENTS-SDK.md#43-enumerationt-and-enum)           |
+| Validation          | `Validate.stringNotEmpty`, `Validate.intNotZero`, custom validators over wire, env and default values     | [§10](./AGENTS-SDK.md#10-validation)                       |
+| Diagnostics         | `Diag` messages, offending token and field, Levenshtein typo suggestions, failure exit behavior           | [§7](./AGENTS-SDK.md#7-errors-and-diagnostics)             |
+| Help rendering      | compact two-column page, `HelpData` model, custom renderers, highlight schemes, context-sensitive `usage` | [§8](./AGENTS-SDK.md#8-help)                               |
+| Shell completion    | bash/zsh/fish scripts, install targets, static candidates, argument values                                | [§9](./AGENTS-SDK.md#9-completion)                         |
+| Predictors          | native file fallback, `fs`, `disabled`, `launch`, `call`, `custom` callbacks through the hidden route     | [§9.2](./AGENTS-SDK.md#92-predictors)                      |
+| Ownership           | `CLI.deinit` releases strings, custom values, the active `Alt` branch and nested views                    | [§11](./AGENTS-SDK.md#11-ownership)                        |
+| Compile-time checks | declaration errors, duplicate names, global flag uniqueness, structural constraints                       | [§12](./AGENTS-SDK.md#12-compile-time-constraints)         |
 
 ## Building and testing
 

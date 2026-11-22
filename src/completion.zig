@@ -33,6 +33,25 @@ pub const Completion = struct {
     /// Shell dialect a completion script is generated for.
     pub const Shell = enum { bash, zsh, fish };
 
+    /// A type for CLI flags/commands/arguments to generate completion stuff.
+    pub const ShellType = Enumeration(.{
+        .bash = dap.Enum{
+            .name = "bash",
+            .help = "Bash shell.",
+            .i18n = "builtin.bash_shell",
+        },
+        .zsh = dap.Enum{
+            .name = "zsh",
+            .help = "Zsh shell.",
+            .i18n = "builtin.zsh_shell",
+        },
+        .fish = dap.Enum{
+            .name = "fish",
+            .help = "Fish shell.",
+            .i18n = "builtin.fish_shell",
+        },
+    });
+
     /// Errors a completion-script render can produce.
     pub const Error = std.mem.Allocator.Error || error{InvalidAppName};
 
@@ -1692,7 +1711,7 @@ fn appendBashDynamicHelper(
         \\    local idx=$1 prefix=$2 cur=$3
         \\    local -a line=("${COMP_WORDS[@]:0:$COMP_CWORD}")
         \\    local out cand c
-        \\    if out=$("${COMP_WORDS[0]}" 
+        \\    if out=$("${COMP_WORDS[0]}"
     );
     try appendQuoted(out, allocator, Completion.route_marker, .posix);
     try out.appendSlice(allocator, " \"$idx\" \"$cur\" \"${line[@]}\"); then\n");
@@ -1727,7 +1746,7 @@ fn appendZshDynamicHelper(
     try out.appendSlice(allocator,
         \\    local idx=$1 prefix=$2 cur=$3
         \\    local out
-        \\    if out=$("$words[1]" 
+        \\    if out=$("$words[1]"
     );
     try appendQuoted(out, allocator, Completion.route_marker, .posix);
     try out.appendSlice(allocator, " \"$idx\" \"$cur\" \"${words[@]:0:$((CURRENT - 1))}\"); then\n");
@@ -1785,7 +1804,7 @@ fn appendFishDynamicHelper(
         \\    if test -z "$bin"
         \\        return
         \\    end
-        \\    set -l out ($bin 
+        \\    set -l out ($bin
     );
     try appendQuoted(out, allocator, Completion.route_marker, .fish);
     try out.appendSlice(allocator, " \"$idx\" \"$cur\" (commandline -opc))\n");
@@ -2081,7 +2100,7 @@ fn emitBash(
         \\            i=$((i + 1))
         \\            continue
         \\        fi
-        \\        if 
+        \\        if
     );
     try appendBashFnName(&out, allocator, ident, "_value_flag \"$tok\"; then\n");
     try out.appendSlice(allocator,
@@ -2123,7 +2142,7 @@ fn emitBash(
         \\    if (( literal )); then
         \\        return
         \\    fi
-        \\    if [[ $cur == '=' ]] && 
+        \\    if [[ $cur == '=' ]] &&
     );
     try appendBashFnName(&out, allocator, ident, "_value_flag \"$prev\"; then\n");
     try out.appendSlice(allocator,
@@ -2131,7 +2150,7 @@ fn emitBash(
         \\        vform=eq
         \\    elif [[ $prev == '=' ]] && (( COMP_CWORD >= 2 )); then
         \\        vflag=${COMP_WORDS[COMP_CWORD-2]}
-        \\    elif 
+        \\    elif
     );
     try appendBashFnName(&out, allocator, ident, "_value_flag \"$prev\"; then\n");
     try out.appendSlice(allocator,
@@ -2279,7 +2298,7 @@ fn emitBash(
         \\    esac
         \\}
         \\
-        \\complete -o default -F 
+        \\complete -o default -F
     );
     try appendBashFnName(&out, allocator, ident, " ");
     try appendQuoted(&out, allocator, app_name, .posix);
@@ -2445,7 +2464,7 @@ fn emitZsh(
         \\            i=$(( i + 1 ))
         \\            continue
         \\        fi
-        \\        if 
+        \\        if
     );
     try appendZshFnName(&out, allocator, ident, "_value_flag \"$tok\"; then\n");
     try out.appendSlice(allocator,
@@ -2488,7 +2507,7 @@ fn emitZsh(
         \\        return 1
         \\    fi
         \\    if (( CURRENT >= 2 )); then
-        \\        if [[ $PREFIX == '=' ]] && 
+        \\        if [[ $PREFIX == '=' ]] &&
     );
     try appendZshFnName(&out, allocator, ident, "_value_flag \"$words[CURRENT-1]\"; then\n");
     try out.appendSlice(allocator,
@@ -2496,7 +2515,7 @@ fn emitZsh(
         \\            vform=eq
         \\        elif [[ $words[CURRENT-1] == '=' ]] && (( CURRENT >= 3 )); then
         \\            vflag=$words[CURRENT-2]
-        \\        elif 
+        \\        elif
     );
     try appendZshFnName(&out, allocator, ident, "_value_flag \"$words[CURRENT-1]\"; then\n");
     try out.appendSlice(allocator,
@@ -3165,7 +3184,7 @@ fn emitFish(
         \\            set i (math $i + 1)
         \\            continue
         \\        end
-        \\        if 
+        \\        if
     );
     try appendFishFnName(&out, allocator, ident, "_value_flag $tok\n");
     try out.appendSlice(allocator,
@@ -3218,7 +3237,7 @@ fn emitFish(
         \\        set vflag (string split -m 1 '=' -- $cur)[1]
         \\        set vform full
         \\    else if test -n "$prev"
-        \\        if 
+        \\        if
     );
     try appendFishFnName(&out, allocator, ident, "_value_flag $prev\n");
     try out.appendSlice(allocator,
