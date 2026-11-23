@@ -350,7 +350,7 @@ const App = dap.App;
 
 const ShiftLib = .{
     .port = Flag(u16){ .short = "p", .help = "Port." },
-    .user = Flag(String){ .long = "user-name", .short = "u", .i18n = "flag.user" },
+    .user = Flag(String){ .long = "user-name", .short = "u", .i18n = "flag_user" },
     .token = dap.Optional(Flag(String){ .long = "token", .short = "t" }),
     .extra = Flag(u8){
         .short = "e",
@@ -382,7 +382,7 @@ test "Compose.shift rewrites long names, drops shorts, preserves the rest" {
 
     try std.testing.expectEqualStrings("db-user-name", shifted.user.long.?);
     try std.testing.expect(shifted.user.short == null);
-    try std.testing.expectEqualStrings("flag.user", shifted.user.i18n.?);
+    try std.testing.expectEqualStrings("flag_user", shifted.user.i18n.?);
 
     try std.testing.expectEqualStrings("db-token", shifted.token.?.long.?);
     try std.testing.expect(shifted.token.?.short == null);
@@ -437,7 +437,7 @@ test "Compose.shift end to end: generate, parse, help" {
     var diag: dap.Diag = .{};
     defer diag.deinit(a);
 
-    var view = try CLI.parse(a, std.process.Environ.empty, &.{ "--db-port", "80", "--db-host", "h", "--db-n", "2" }, &diag);
+    var view = try CLI.parse(a, std.process.Environ.empty, null, &.{ "--db-port", "80", "--db-host", "h", "--db-n", "2" }, &diag);
     defer CLI.deinit(&view, a);
     try std.testing.expectEqual(@as(u16, 80), view.port);
     try std.testing.expectEqualStrings("h", view.host);
@@ -460,6 +460,14 @@ test "Compose.concat preserves left-then-right field order" {
     try std.testing.expectEqualStrings("three", fields[2].name);
     try std.testing.expectEqualStrings("four", fields[3].name);
     try std.testing.expectEqual(Flag(u8), @TypeOf(merged.three));
+}
+
+test "Compose.concat preserves i18n keys" {
+    const a = .{ .user = Flag(String){ .i18n = "flag_user" } };
+    const b = .{ .host = Flag(String){ .help = "Host." } };
+    const merged = Compose.concat(a, b);
+    try std.testing.expectEqualStrings("flag_user", merged.user.i18n.?);
+    try std.testing.expect(merged.host.i18n == null);
 }
 
 test "Compose.concat identities and associativity" {
@@ -540,7 +548,7 @@ test "Compose.concat end to end: generate, parse, merged help" {
     var diag: dap.Diag = .{};
     defer diag.deinit(al);
 
-    var view = try CLI.parse(al, std.process.Environ.empty, &.{
+    var view = try CLI.parse(al, std.process.Environ.empty, null, &.{
         "--port",    "80",    "--host", "h", "--retries", "3",
         "--verbose", "--dry",
     }, &diag);

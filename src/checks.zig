@@ -243,6 +243,107 @@ pub fn checkGlobalFlagNames(comptime origins: []const FlagOrigin) void {
     }
 }
 
+/// One i18n key discovered somewhere in the declaration tree, together with
+/// the literal help text it will translate and the level path it lives at.
+pub const I18nOrigin = struct {
+    key: String,
+    literal: String,
+    field: String,
+    path: []const String,
+};
+
+/// Whether `s` is a well-formed i18n key: `[_A-Za-z][_0-9A-Za-z]*`, ASCII
+/// only, non-empty. Mirrors the private predicate `i18n.zig` validates user
+/// maps with; keeping the copy here avoids adding public API to that module.
+pub fn validI18nKey(comptime s: String) bool {
+    if (s.len == 0) return false;
+    if (!std.ascii.isAlphabetic(s[0]) and s[0] != '_') return false;
+    for (s[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+    return true;
+}
+
+/// Flatten the whole declaration tree into a table of i18n origins, walking
+/// levels through `normalize` exactly as `generate` does (groups and `Alt`
+/// branches flatten into `norm.specs` for free). `app_key` is non-null only
+/// for the root call: a child `App.i18n` is derived from its command meta's
+/// key, which the parent already recorded, so passing `null` in recursion
+/// keeps one origin per command rather than a duplicate. The injected builtin
+/// help spec is skipped structurally; its key is a builtin constant.
+pub fn collectI18n(
+    comptime norm: NormResult,
+    comptime app_help: String,
+    comptime app_key: ?String,
+    comptime path: []const String,
+    comptime acc: []const I18nOrigin,
+) []const I18nOrigin {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var out = acc;
+        if (app_key) |key| {
+            out = out ++ &[_]I18nOrigin{.{
+                .key = key,
+                .literal = app_help,
+                .field = "help",
+                .path = path,
+            }};
+        }
+        for (norm.specs) |s| {
+            const key = s.i18n orelse continue;
+            if (std.mem.eql(u8, s.name, builtin_help_field)) continue;
+            out = out ++ &[_]I18nOrigin{.{
+                .key = key,
+                .literal = s.help,
+                .field = s.name,
+                .path = path,
+            }};
+        }
+        for (norm.commands) |c| {
+            if (c.Cmd.cmd_meta.i18n) |key| {
+                out = out ++ &[_]I18nOrigin{.{
+                    .key = key,
+                    .literal = c.Cmd.cmd_meta.help,
+                    .field = c.field,
+                    .path = path,
+                }};
+            }
+            const child = normalize(withBuiltinHelp(c.Cmd.cmd_def));
+            out = collectI18n(child, c.Cmd.cmd_meta.help, null, path ++ &[_]String{c.name}, out);
+        }
+        return out;
+    }
+}
+
+/// Three passes over the collected keys: each is a valid field name, none
+/// shadows a builtin translation, and no key is used twice in the tree.
+pub fn checkI18nKeys(comptime origins: []const I18nOrigin) void {
+    comptime {
+        for (origins) |o| {
+            if (!validI18nKey(o.key)) {
+                @compileError("i18n key '" ++ o.key ++ "' on '" ++ levelPath(o.path) ++ ":" ++ o.field ++
+                    "' is not a valid field name ([_A-Za-z][_0-9A-Za-z]*)");
+            }
+        }
+        const builtin_keys = [_]String{ "builtin_help", "builtin_bash_shell", "builtin_zsh_shell", "builtin_fish_shell" };
+        for (origins) |o| {
+            for (builtin_keys) |b| {
+                if (std.mem.eql(u8, o.key, b)) {
+                    @compileError("i18n key '" ++ o.key ++ "' collides with a builtin translation");
+                }
+            }
+        }
+        for (origins, 0..) |a, i| {
+            for (origins[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a.key, b.key)) {
+                    @compileError("i18n key '" ++ a.key ++ "' is used by both '" ++ levelPath(a.path) ++ ":" ++ a.field ++
+                        "' and '" ++ levelPath(b.path) ++ ":" ++ b.field ++ "'");
+                }
+            }
+        }
+    }
+}
+
 /// Whether `s` is a well-formed long flag name: non-empty, no whitespace or
 /// control byte, no `=`, and no leading or trailing `-`. Bytes are otherwise
 /// accepted verbatim (non-ASCII included), matching the fact that `dap` does
@@ -647,4 +748,80 @@ test "checks: valid long names and shift prefixes" {
     try std.testing.expect(!validPrefix("a--"));
     try std.testing.expect(!validPrefix("a b-"));
     try std.testing.expect(!validPrefix("a="));
+}
+test "checks: validI18nKey table" {
+    try std.testing.expect(validI18nKey("a"));
+    try std.testing.expect(validI18nKey("_a"));
+    try std.testing.expect(validI18nKey("A9_"));
+    try std.testing.expect(validI18nKey("flag_user"));
+    try std.testing.expect(validI18nKey("builtin_help"));
+    try std.testing.expect(!validI18nKey(""));
+    try std.testing.expect(!validI18nKey("1a"));
+    try std.testing.expect(!validI18nKey("a-b"));
+    try std.testing.expect(!validI18nKey("a.b"));
+    try std.testing.expect(!validI18nKey("a b"));
+    try std.testing.expect(!validI18nKey("a\n"));
+    try std.testing.expect(!validI18nKey("é"));
+}
+
+const I18nTestDef = .{
+    .verbose = dap.Flag(bool){ .i18n = "verbose_flag" },
+    .net = dap.Group(.{
+        .host = dap.Flag(dap.String){ .i18n = "group_host" },
+    }, "network"),
+    .speed = dap.Alt(.{
+        .fast = .{ .fast = dap.Flag(u8){ .i18n = "alt_fast" } },
+    }),
+    .serve = dap.Command(.{ .help = "Serve.", .i18n = "cmd_serve" }, .{
+        .src = dap.Argument(dap.String){ .i18n = "arg_src" },
+        .inner = dap.Flag(u32){ .i18n = "flag_inner" },
+    }),
+};
+
+test "checks: collectI18n walks the tree once per key" {
+    const norm = comptime normalize(withBuiltinHelp(I18nTestDef));
+    const origins = comptime collectI18n(norm, "Do things.", "app_help", &[_]String{"app"}, &.{});
+
+    try std.testing.expectEqual(@as(usize, 7), origins.len);
+    const expected_fields = [_]String{ "help", "verbose", "host", "fast", "serve", "src", "inner" };
+    const expected_keys = [_]String{ "app_help", "verbose_flag", "group_host", "alt_fast", "cmd_serve", "arg_src", "flag_inner" };
+    for (origins, 0..) |o, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], o.field);
+        try std.testing.expectEqualStrings(expected_keys[i], o.key);
+    }
+
+    // The injected builtin help spec never produces an origin.
+    for (origins) |o| try std.testing.expect(!std.mem.eql(u8, o.field, builtin_help_field));
+
+    // A command's meta key and the child App key derived from it are one
+    // origin, so the tree's keys are all unique.
+    comptime checkI18nKeys(origins);
+}
+
+test "checks: checkI18nKeys rejects an invalid key" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .bad = dap.Flag(u8){ .i18n = "bad-key" },
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+test "checks: checkI18nKeys rejects a duplicate key" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .a = dap.Flag(u8){ .i18n = "same_key" },
+            .b = dap.Flag(u8){ .i18n = "same_key" },
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+test "checks: checkI18nKeys rejects a builtin collision" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .a = dap.Flag(u8){ .i18n = "builtin_help" },
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
 }

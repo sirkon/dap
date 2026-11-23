@@ -89,6 +89,6 @@ pub fn main(init: std.process.Init) !void {
     var diag: dap.Diag = .{};
     defer diag.deinit(arena);
 
-    var cli = try CLI.parse(arena, init.minimal.environ, argv[1..], &diag);
+    var cli = try CLI.parse(arena, init.minimal.environ, null, argv[1..], &diag);
     defer CLI.deinit(&cli, arena);
 }

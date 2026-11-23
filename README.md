@@ -13,6 +13,7 @@ You declare the command line once, as a struct literal. `dap.generate` turns tha
 - [Install](#install)
 - [A flat CLI](#a-flat-cli)
 - [A commanded CLI](#a-commanded-cli)
+- [Internationalization](#internationalization)
 - [Capabilities](#capabilities)
 - [Building and testing](#building-and-testing)
 
@@ -70,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     defer diag.deinit(arena);
 
     // `argv[1..]` is pure payload: no binary name, no skipped token.
-    const cli = try CLI.parse(arena, init.minimal.environ, argv[1..], &diag);
+    const cli = try CLI.parse(arena, init.minimal.environ, null, argv[1..], &diag);
 
     std.debug.print("{s} level={d} {s}\n", .{ cli.login, cli.level, cli.path });
 }
@@ -122,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
     var diag: dap.Diag = .{};
     defer diag.deinit(arena);
 
-    var cli = try CLI.parse(arena, init.minimal.environ, argv[1..], &diag);
+    var cli = try CLI.parse(arena, init.minimal.environ, null, argv[1..], &diag);
     defer CLI.deinit(&cli, arena);
 
     if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -162,6 +163,45 @@ given. Completion is generated from the declaration; `CLI.completion(allocator, 
 `app_name` is the name the script registers, not `App.name`. The route it serves for dynamic values runs at the very
 start of `CLI.parse`, so do file, socket or network work only after parsing.
 
+## Internationalization
+
+Help and diagnostics can be rendered in a locale chosen at runtime from the environment. A declaration names a
+translation with `.i18n` (field-name-shaped keys, unique across the whole tree); a caller registers translations with
+`CLI.i18n()` and hands the builder to `parse`:
+
+```zig
+const def = .{
+    .login = dap.Flag([]const u8){
+        .short = "l",
+        .i18n = "login_help",
+        .help = "User login.",
+    },
+};
+
+const CLI = dap.generate(
+    dap.App{ .name = "api-downloader", .help = "Download a file.", .i18n = "app_help" },
+    def,
+);
+
+// Every declared key must be supplied; `append` rejects a missing one at comptime.
+const i18n = CLI.i18n()
+    .append("ru", dap.I18n.ru.withUser(.{
+        .app_help = "Скачать файл.",
+        .login_help = "Логин пользователя.",
+    }));
+
+// In main:
+var cli = try CLI.parse(arena, init.minimal.environ, &i18n, argv[1..], &diag);
+```
+
+`parse` reads `LC_ALL`, `LC_MESSAGES` and `LANG` in that order and matches the full tag (`ru_RU`), then the language
+(`ru`), then the declaration default for anything else. The selection is stored in the `View` and threaded through the
+command handoff, so `-h`/`--help`, the failure page and `CLI.usage(view)` all render with it, while `CLI.helpText` keeps
+the declaration default. Passing `null` as the builder selects that same generated default, whose text is the `.help`
+literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`, `ko` and `ja`;
+`withUser` replaces the user map and seeds the four builtin strings. A key the selected locale lacks is
+`error.UnknownTranslationKey`, never an English fallback. Shell completion is never localized.
+
 ## Capabilities
 
 Everything below is specified in detail in [AGENTS-SDK.md](./AGENTS-SDK.md).
@@ -177,13 +217,14 @@ Everything below is specified in detail in [AGENTS-SDK.md](./AGENTS-SDK.md).
 | Composition         | `Compose.shift` prefixing and short-name stripping, `Compose.concat` merging, compile-time clashes        | [§3.9](./AGENTS-SDK.md#39-composition)                     |
 | Value types         | builtin integers, floats and strings, plus any type with `decode`/`encode`/`deinit`                       | [§4](./AGENTS-SDK.md#4-value-types)                        |
 | Enumerations        | fixed wire-name sets via `Enumeration`, per-value help, completion candidates                             | [§4.3](./AGENTS-SDK.md#43-enumerationt-and-enum)           |
-| Validation          | `Validate.stringNotEmpty`, `Validate.intNotZero`, custom validators over wire, env and default values     | [§10](./AGENTS-SDK.md#10-validation)                       |
+| Validation          | `Validate.stringNotEmpty`, `Validate.intNotZero`, custom validators over wire, env and default values     | [§11](./AGENTS-SDK.md#11-validation)                       |
 | Diagnostics         | `Diag` messages, offending token and field, Levenshtein typo suggestions, failure exit behavior           | [§7](./AGENTS-SDK.md#7-errors-and-diagnostics)             |
 | Help rendering      | compact two-column page, `HelpData` model, custom renderers, highlight schemes, context-sensitive `usage` | [§8](./AGENTS-SDK.md#8-help)                               |
-| Shell completion    | bash/zsh/fish scripts, install targets, static candidates, argument values                                | [§9](./AGENTS-SDK.md#9-completion)                         |
-| Predictors          | native file fallback, `fs`, `disabled`, `launch`, `call`, `custom` callbacks through the hidden route     | [§9.2](./AGENTS-SDK.md#92-predictors)                      |
-| Ownership           | `CLI.deinit` releases strings, custom values, the active `Alt` branch and nested views                    | [§11](./AGENTS-SDK.md#11-ownership)                        |
-| Compile-time checks | declaration errors, duplicate names, global flag uniqueness, structural constraints                       | [§12](./AGENTS-SDK.md#12-compile-time-constraints)         |
+| Localization        | `.i18n` keys on the app, flags, arguments and commands, environment-selected locales, prefilled templates | [§9](./AGENTS-SDK.md#9-internationalization)               |
+| Shell completion    | bash/zsh/fish scripts, install targets, static candidates, argument values                                | [§10](./AGENTS-SDK.md#10-completion)                       |
+| Predictors          | native file fallback, `fs`, `disabled`, `launch`, `call`, `custom` callbacks through the hidden route     | [§10.2](./AGENTS-SDK.md#102-predictors)                    |
+| Ownership           | `CLI.deinit` releases strings, custom values, the active `Alt` branch and nested views                    | [§12](./AGENTS-SDK.md#12-ownership)                        |
+| Compile-time checks | declaration errors, duplicate names, global flag uniqueness, structural constraints                       | [§13](./AGENTS-SDK.md#13-compile-time-constraints)         |
 
 ## Building and testing
 

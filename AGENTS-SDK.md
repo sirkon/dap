@@ -8,8 +8,8 @@ lives in `AGENTS.md`.
 turns it into a namespace containing a parser, a typed result struct, and renderers for help and shell completion.
 
 ```zig
-const CLI = dap.generate(app, def);                          // app: dap.App, def: declaration struct
-const cli = try CLI.parse(allocator, environ, args, &diag);  // returns CLI.View
+const CLI = dap.generate(app, def);                                  // app: dap.App, def: declaration struct
+const cli = try CLI.parse(allocator, environ, null, args, &diag);    // returns CLI.View
 ```
 
 All names, types, defaults and constraints are resolved by the compiler. There is no runtime schema and no reflection.
@@ -44,21 +44,25 @@ The public surface is re-exported from `src/root.zig`. There is no prelude.
 `dap.generate(app: dap.App, def: anytype)` is a comptime function returning a namespace. The following members are part
 of the public contract:
 
-| Member | Type | Description |
-| --- | --- | --- |
-| `View` | type | Result struct for one successful parse. |
-| `parse` | `fn (alloc, environ, args, diag) ParseError!View` | Parse the payload. Exits on help and usage failure (§6). |
-| `deinit` | `fn (*View, alloc) void` | Release every owned field. Namespace function, not a method. |
-| `helpText` | `fn (alloc) Allocator.Error!String` | Render help with `app.help_renderer.style`. Caller owns the result. |
-| `helpData` | `fn (alloc) Allocator.Error!HelpData` | Build the plain-data help model. Caller releases it. |
-| `usage` | `fn (anytype) Allocator.Error!void` | Print the context-sensitive help page for a `View` of any level. |
-| `completion` | `fn (alloc, app_name, shell) Completion` | Build a lazy completion-script handle. Root level only. |
-| `command` | `fn (anytype) ?CommandPayload` | Switch over the active subcommand. Present only when the level declares commands. |
-| `CommandPayload` | type | Union of subcommand `View`s. Present only with commands. |
-| `app_meta` | `dap.App` | The `App` passed to `generate`. |
+| Member           | Type                                                          | Description                                                                       |
+| ---------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `View`           | type                                                          | Result struct for one successful parse.                                           |
+| `parse`          | `fn (alloc, environ, i18n, args, diag) ParseError!View`       | Parse the payload. Exits on help and usage failure (§6).                          |
+| `deinit`         | `fn (*View, alloc) void`                                      | Release every owned field. Namespace function, not a method.                      |
+| `helpText`       | `fn (alloc) HelpError!String`                                 | Render help with `app.help_renderer.style` and the declaration default locale.    |
+| `helpData`       | `fn (alloc) Allocator.Error!HelpData`                         | Build the plain-data help model. Caller releases it.                              |
+| `usage`          | `fn (anytype) HelpError!void`                                 | Print the context-sensitive page for a `View`, in the locale it carries.          |
+| `completion`     | `fn (alloc, app_name, shell) Completion`                      | Build a lazy completion-script handle. Root level only.                           |
+| `i18n`           | `fn () I18n.Builder`                                          | Root-only builder seeded with the default locale and required keys.               |
+| `default_locale` | `I18n.Locale`                                                 | The generated, complete default locale for this declaration.                      |
+| `i18n_keys`      | `[]const dap.String`                                          | Every key translation must supply, including `builtin_help`.                      |
+| `command`        | `fn (anytype) ?CommandPayload`                                | Switch over the active subcommand. Present only when the level declares commands. |
+| `CommandPayload` | type                                                          | Union of subcommand `View`s. Present only with commands.                          |
+| `app_meta`       | `dap.App`                                                     | The `App` passed to `generate`.                                                   |
 
-`View`, `parse`, `helpText`, `helpData`, `usage`, `completion` and `deinit` exist at every command level. `command` and
-`CommandPayload` exist only at levels that declare at least one command; referencing them elsewhere is a compile error.
+`View`, `parse`, `helpText`, `helpData`, `usage`, `completion`, `i18n`, `default_locale`, `i18n_keys` and `deinit`
+exist at every command level, but `i18n()` is a compile error on a non-root namespace. `command` and `CommandPayload`
+exist only at levels that declare at least one command; referencing them elsewhere is a compile error.
 
 `App`:
 
@@ -66,7 +70,7 @@ of the public contract:
 pub const App = struct {
     name: String,           // usage name or command path, e.g. "app" or "app svc"
     help: String,           // description shown by help
-    i18n: ?String = null,
+    i18n: ?String = null,   // translation key for `help`
     help_renderer: struct {
         style: HelpRendererStyle = .{ .compact = {} },
         highlight: HelpRendererHighlight = .{ .bold = {} },
@@ -89,6 +93,10 @@ optional flag. Declaration order determines `View` field order and positional ar
 - A flag or argument is required if and only if it has no default. Booleans are exempt: an omitted boolean flag is
   `false`, and a direct default of `true` is a compile error. Use a negative long name defaulting to `false` to express
   "on by default".
+- `.i18n` names a translation for `.help`: a field-name-shaped identifier (`[_A-Za-z][_0-9A-Za-z]*`, ASCII, non-empty)
+  that is unique across the whole declaration tree and never one of `builtin_help`, `builtin_bash_shell`,
+  `builtin_zsh_shell` or `builtin_fish_shell`. `App.i18n` and `CommandMeta.i18n` participate. Without a registered
+  locale the declaration's generated English locale resolves the key to the same `.help` literal.
 
 Long flags accept `--name value` and `--name=value`. Short flags are always explicit through `.short` and accept
 `-s value` and `-s=value`.
@@ -99,15 +107,15 @@ Long flags accept `--name value` and `--name=value`. Short flags are always expl
 pub fn Flag(comptime T: type) type
 ```
 
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `long` | `?String` | `null` (field name) | Long wire name. |
-| `short` | `?String` | `null` | Short alias, without the dash. |
-| `default` | `?Default(T)` | `null` | Env or direct default. |
-| `validation` | `?fn (Allocator, T) Allocator.Error!?String` | `null` | Value check. |
-| `help` | `String` | `""` | Help description. |
-| `i18n` | `?String` | `null` | Translation key. |
-| `completion` | `?Completion.Predictor` | `null` | Completion value source. |
+| Field        | Type                                         | Default             | Meaning                        |
+| ------------ | -------------------------------------------- | ------------------- | ------------------------------ |
+| `long`       | `?String`                                    | `null` (field name) | Long wire name.                |
+| `short`      | `?String`                                    | `null`              | Short alias, without the dash. |
+| `default`    | `?Default(T)`                                | `null`              | Env or direct default.         |
+| `validation` | `?fn (Allocator, T) Allocator.Error!?String` | `null`              | Value check.                   |
+| `help`       | `String`                                     | `""`                | Help description.              |
+| `i18n`       | `?String`                                    | `null`              | Translation key for `help`.    |
+| `completion` | `?Completion.Predictor`                      | `null`              | Completion value source.       |
 
 A non-boolean flag consumes one value. A boolean flag consumes no value.
 
@@ -117,14 +125,14 @@ A non-boolean flag consumes one value. A boolean flag consumes no value.
 pub fn Argument(comptime T: type) type
 ```
 
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `name` | `?String` | `null` (field name) | Display name in help. |
-| `default` | `?Default(T)` | `null` | Env or direct default; last argument only. |
-| `validation` | `?fn (Allocator, T) Allocator.Error!?String` | `null` | Value check. |
-| `help` | `String` | `""` | Help description. |
-| `i18n` | `?String` | `null` | Translation key. |
-| `completion` | `?Completion.Predictor` | `null` | Completion value source. |
+| Field        | Type                                         | Default             | Meaning                                    |
+| ------------ | -------------------------------------------- | ------------------- | ------------------------------------------ |
+| `name`       | `?String`                                    | `null` (field name) | Display name in help.                      |
+| `default`    | `?Default(T)`                                | `null`              | Env or direct default; last argument only. |
+| `validation` | `?fn (Allocator, T) Allocator.Error!?String` | `null`              | Value check.                               |
+| `help`       | `String`                                     | `""`                | Help description.                          |
+| `i18n`       | `?String`                                    | `null`              | Translation key for `help`.                |
+| `completion` | `?Completion.Predictor`                      | `null`              | Completion value source.                   |
 
 Arguments fill positional slots in declaration order. Only the last declared argument may carry a default. An argument
 without a default is required. Optional arguments are not supported.
@@ -209,15 +217,15 @@ pub const CommandMeta = struct {
     name: ?String = null,    // wire name; defaults to the field name
     synonym: ?String = null, // alternative wire spelling
     help: String = "",
-    i18n: ?String = null,
+    i18n: ?String = null,    // translation key for `help`
 };
 
 pub fn Command(comptime meta: CommandMeta, comptime def: anytype) type
 ```
 
 A command is a sibling field of the parent declaration. Its `def` is an ordinary declaration and may contain further
-commands. The parent `View` stores the parsed sub-`View` under the declaration field name prefixed with `_`
-(`_build`), set to `null` unless the command appears.
+commands. The parent `View` stores the parsed sub-`View` under the declaration field name prefixed with `_` (`_build`),
+set to `null` unless the command appears.
 
 A positional token equal to a command's primary name or synonym terminates the current level and parses the remaining
 tokens at the subcommand level, starting again at index 0. `--` disables both flag recognition and command handoff.
@@ -253,9 +261,9 @@ A leaf `View` (a level with no commands) is not a valid argument. Flags typed af
 current level, then against each ancestor level, nearest first. This makes `app serve --verbose` assign the root flag
 into the root `View`.
 
-Flag long names and short aliases must be unique across the entire command tree, not only within a level, because
-deep help merges ancestor flags. Command names and synonyms must be unique within a level. Mixing commands with
-positional arguments in one declaration is rejected.
+Flag long names and short aliases must be unique across the entire command tree, not only within a level, because deep
+help merges ancestor flags. Command names and synonyms must be unique within a level. Mixing commands with positional
+arguments in one declaration is rejected.
 
 ### 3.9 Composition
 
@@ -274,8 +282,8 @@ help/i18n strings and completion predictors are preserved. An implicit long name
 remains empty.
 
 `prefix` is comptime and concatenated without a separator. It must be non-empty and must be a valid long name,
-optionally followed by one trailing `-`. A valid long name is non-empty, contains no byte `<= 0x20`, `0x7f` or `=`,
-and has no leading or trailing `-`. The outer call's prefix appears first: `shift(shift(decl, "a-"), "b-")` yields
+optionally followed by one trailing `-`. A valid long name is non-empty, contains no byte `<= 0x20`, `0x7f` or `=`, and
+has no leading or trailing `-`. The outer call's prefix appears first: `shift(shift(decl, "a-"), "b-")` yields
 `--b-a-...`.
 
 `concat(left, right)` places `left`'s fields before `right`'s. Fields pair by declaration field name:
@@ -331,9 +339,8 @@ A missing method, or an unsupported type, is a compile error.
 
 ```zig
 pub const Enum = struct {
-    name: ?String = null, // wire name; defaults to the field name
-    help: String = "",
-    i18n: ?String = null,
+    name: ?String = null,        // wire name; defaults to the field name
+    completion_help: String = "", // shell completion description; never localized
 };
 
 pub fn Enumeration(comptime branches: anytype) type
@@ -351,8 +358,10 @@ The result is a value type with:
 - `view`: a Zig enum with one tag per branch, defaulting to the first branch;
 - `EnumView`: the enum type;
 - `names`: the wire names in declaration order;
-- `helps`: the branch help strings in declaration order;
+- `helps`: the branch `completion_help` strings in declaration order;
 - `decode`, `encode`, `deinit` satisfying §4.2.
+
+`Enum` has no i18n field: completion never localizes. Its `completion_help` is used only by the shell emitters.
 
 Use it like any other value type:
 
@@ -373,10 +382,11 @@ and rejects every token. Completion predictors are not allowed on `Enumeration` 
 `CLI.View` is a generated struct with the following layout, in order:
 
 1. `builtin_help: bool`, the injected `-h, --help` flag (always first);
-2. one field per declared flag or argument, in declaration order, with group members flattened; optional flags are
-   `?T`;
-3. one `?Union` field per `Alt`, in declaration order (tags are branch tags per §3.7);
-4. one `?Sub.View` field per command, in declaration order, named `_<field>`.
+2. one field per declared flag or argument, in declaration order, with group members flattened; optional flags are `?T`;
+3. a zero-sized `__command<rank>` tag that makes every level's `View` nominally distinct;
+4. a hidden `__i18n: *const dap.I18n.Locale`, the locale `parse` selected;
+5. one `?Union` field per `Alt`, in declaration order (tags are branch tags per §3.7);
+6. one `?Sub.View` field per command, in declaration order, named `_<field>`.
 
 `View` types of different command levels are distinct even when their layouts match. A `View` contains only fields;
 methods are exposed on the namespace, not on the value.
@@ -392,14 +402,18 @@ successful parse. It is not idempotent.
 ```zig
 pub fn parse(
     allocator: std.mem.Allocator,
-    environ: std.process.Environ, // by value
-    args: []const []const u8,     // payload, without the binary name
-    diag: ?*dap.Diag,             // may be null
+    environ: std.process.Environ,       // by value
+    i18n: ?*const dap.I18n.Builder,    // null selects the declaration default
+    args: []const []const u8,           // payload, without the binary name
+    diag: ?*dap.Diag,                   // may be null
 ) ParseError!View
 ```
 
 - `args` is pure payload. Parsing starts at index 0 and no token is skipped, at any command level. Pass the argument
   list with the binary name removed.
+- `i18n` selects the locale before scanning: `null` uses the generated default locale, a builder uses
+  `i18n.locale(environ)`. The selection reads `LC_ALL`, `LC_MESSAGES`, `LANG` in that order and is installed into the
+  root `View` and every active sub-`View`, so help and failure output are localized automatically.
 - On success, `parse` returns a fully decoded and validated `View`.
 - On a usage, decode or validation failure, `parse` prints diagnostics and the context-sensitive help page to stderr and
   calls `std.process.exit(1)`.
@@ -414,8 +428,8 @@ Parsing rules:
 - An unmatched long or short token is an `UnknownFlag` failure. It is first retried against ancestor levels.
 - A positional token with no free slot is a `TooManyArguments` failure.
 - A required flag or argument that never appears is a `MissingRequired` failure.
-- An absent optional value resolves to `null`; an absent value with a default resolves by §3.4. Absent booleans
-  resolve to `false`.
+- An absent optional value resolves to `null`; an absent value with a default resolves by §3.4. Absent booleans resolve
+  to `false`.
 
 ---
 
@@ -432,16 +446,22 @@ pub const ParseError = error{
     ConflictingAlt,
     InvalidWtf8,
 } || std.mem.Allocator.Error || DecodeError;
+
+pub const HelpError = std.mem.Allocator.Error || dap.I18n.Error;
 ```
+
+`HelpError` is the error set of `helpText`, `usage`, `HelpData.renderCompact` and custom renderers. Its i18n members are
+`error.UnknownTranslationKey` (a locale lacks a required key) and `error.UnsupportedLocale` (the lower-level lookup
+primitive; `Builder.locale` cannot return it).
 
 `Diag` records details of the most recent failed parse:
 
-| Field | Meaning | Ownership |
-| --- | --- | --- |
-| `field` | Declaration field that failed. | Borrowed. |
-| `token` | Offending argv token. | Borrowed. |
-| `message` | Validation message. | Allocated; free with `deinit`. |
-| `unknown` | Closest candidate when the token looked like a misspelled flag or command. | Borrowed. |
+| Field     | Meaning                                                                    | Ownership                      |
+| --------- | -------------------------------------------------------------------------- | ------------------------------ |
+| `field`   | Declaration field that failed.                                             | Borrowed.                      |
+| `token`   | Offending argv token.                                                      | Borrowed.                      |
+| `message` | Validation message.                                                        | Allocated; free with `deinit`. |
+| `unknown` | Closest candidate when the token looked like a misspelled flag or command. | Borrowed.                      |
 
 ```zig
 var diag: dap.Diag = .{};
@@ -452,8 +472,8 @@ defer diag.deinit(allocator); // frees only `message`
 `kind`, Levenshtein `distance` and a `reason` (`edit` or `prefix`). Its strings are borrowed from the declaration and
 remain valid after `parse`. Diagnostics include the suggestion automatically.
 
-`parse` never returns a usage error to the caller; it reports and exits. Applications that need different error
-handling should drive their own UI from `helpData`, because the internal parse pipeline is not public.
+`parse` never returns a usage error to the caller; it reports and exits. Applications that need different error handling
+should drive their own UI from `helpData`, because the internal parse pipeline is not public.
 
 ---
 
@@ -467,22 +487,27 @@ defer allocator.free(text);
 
 var data = try CLI.helpData(allocator);
 defer data.deinit(allocator);
-const same = try data.renderCompact(allocator);
+const same = try data.renderCompact(&CLI.default_locale, allocator);
 defer allocator.free(same);
 ```
 
-`helpText` builds a `HelpData` and renders it with `App.help_renderer.style`. `helpData` exposes the model for custom
-renderers, man pages or documentation. Nothing help-related runs unless one of these functions is called.
+`helpText` builds a `HelpData` and renders it with `App.help_renderer.style` and `CLI.default_locale`; it returns
+`HelpError!String` because a declared key may be missing. `helpData` exposes the model for custom renderers, man pages or
+documentation and takes the locale at render time. Nothing help-related runs unless one of these functions is called.
 
-`CLI.usage(view)` prints the context-sensitive help page for a `View` of any level, using the same renderer. It is the
-usual response when a command level was entered but no subcommand was selected.
+`CLI.usage(view)` prints the context-sensitive help page for a `View` of any level, using the same renderer and the locale
+carried by that `View`. It is the usual response when a command level was entered but no subcommand was selected.
 
 ### 8.2 `App` renderer configuration
 
 ```zig
 pub const HelpRendererStyle = union(enum) {
     compact: void, // default kong-style two-column layout
-    custom: *const fn (self: *const HelpData, allocator: std.mem.Allocator) std.mem.Allocator.Error!String,
+    custom: *const fn (
+        self: *const HelpData,
+        locale: *const I18n.Locale,
+        allocator: std.mem.Allocator,
+    ) HelpError!String,
 };
 
 pub const HelpRendererHighlight = union(enum) {
@@ -493,7 +518,8 @@ pub const HelpRendererHighlight = union(enum) {
 };
 ```
 
-A custom renderer receives the filled `HelpData` and returns a caller-owned string.
+A custom renderer receives the filled `HelpData`, the selected locale and the allocator, and returns a caller-owned
+string. Resolve keyed rows through `locale.require(key)`; a missing key is an error, never a literal fallback.
 
 ### 8.3 Compact layout
 
@@ -564,15 +590,26 @@ pub const HelpData = struct {
         alt: ?String = null,
         alt_branch: ?String = null,
         optional: bool = false,
+        i18n: ?String = null, // translation key for `help`
     };
-    pub const Argument = struct { name: String, help: String, default: ?String };
+    pub const Argument = struct {
+        name: String,
+        help: String,
+        default: ?String,
+        i18n: ?String = null, // translation key for `help`
+    };
     pub const FlagGroup = struct { name: ?String, flags: []Flag };
     pub const ArgGroup = struct { name: ?String, args: []Argument };
-    pub const CommandInfo = struct { name: String, help: String };
+    pub const CommandInfo = struct {
+        name: String,
+        help: String,
+        i18n: ?String = null, // translation key for `help`
+    };
     pub const Usage = struct { branches: [][]Flag };
 
     name: String,                       // usage path
     info: String,                       // app description
+    info_i18n: ?String = null,          // translation key for `info`
     flag_groups: []FlagGroup,
     arg_groups: []ArgGroup,
     usage_alts: []Usage,
@@ -581,12 +618,18 @@ pub const HelpData = struct {
     highlight: HelpRendererHighlight = .{ .flat = {} },
 
     pub fn deinit(self: *HelpData, allocator: std.mem.Allocator) void;
-    pub fn renderCompact(self: *const HelpData, allocator: std.mem.Allocator) std.mem.Allocator.Error!String;
+    pub fn renderCompact(
+        self: *const HelpData,
+        locale: *const I18n.Locale,
+        allocator: std.mem.Allocator,
+    ) HelpError!String;
 };
 ```
 
 `usage_alts` holds one entry per `Alt`; its flag slices reference entries owned by `flag_groups`. `deinit` frees only
-the outer arrays for those slices. `error_text` is borrowed and is used by the failure page.
+the outer arrays for those slices. `error_text` is borrowed and is used by the failure page. The `i18n` keys and
+`info_i18n` are duplicated by `helpData`, owned by `HelpData` and freed by `deinit`; `renderCompact` resolves them
+through the passed locale.
 
 ### 8.6 Highlighting
 
@@ -597,9 +640,103 @@ escape codes are emitted, so highlighting never disturbs alignment.
 
 ---
 
-## 9. Completion
+## 9. Internationalization
 
-### 9.1 Handle
+Declarations name translations with `.i18n` keys; a caller registers comptime locales and hands the builder to `parse`.
+The selected locale travels in the `View`, so `usage` renders post-parse without the environment. A non-null key that the
+selected locale lacks is `error.UnknownTranslationKey`, never an English fallback. A declaration that registers nothing
+renders its own `.help` literals byte-for-byte.
+
+```zig
+pub const I18n = struct {
+    pub const Error = error{ UnknownTranslationKey, UnsupportedLocale };
+    pub const Entry = struct { key: String, value: String };
+
+    pub const Locale = struct {
+        pub const Meta = struct {
+            usage: String, flags: String, cmds: String, args: String,
+            cmds_placeholder: String, flags_placeholder: String,
+        };
+        pub const Builtin = struct {
+            help: String, bash_shell: String, zsh_shell: String, fish_shell: String,
+        };
+        pub const Diag = struct {
+            field_invalid: String, token_invalid: String, message: String, did_you_mean: String,
+        };
+
+        meta: Meta,
+        builtin: Builtin,
+        diag: Diag,
+        user: Map(String),
+
+        pub fn default(comptime entries: []const Entry) Locale;
+        pub fn withUser(comptime self: Locale, comptime user_map: anytype) Locale;
+        pub fn get(self: Locale, key: String) ?String;
+        pub fn has(self: Locale, key: String) bool;
+        pub fn require(self: Locale, key: String) Error!String;
+    };
+
+    pub const Builder = struct {
+        locales: Map(Locale),
+        required: []const String,
+
+        pub fn init(comptime default: Locale, comptime required: []const String) Builder;
+        pub inline fn append(comptime self: Builder, comptime lang: String, comptime locale: Locale) Builder;
+        pub fn locale(self: *const Builder, environ: std.process.Environ) *const Locale;
+    };
+
+    pub fn normalizeTag(raw: String) String;
+    pub fn tagFromEnviron(environ: std.process.Environ) ?String;
+
+    pub const ru: Locale;
+    pub const zh: Locale;
+    pub const es: Locale;
+    pub const it: Locale;
+    pub const fr: Locale;
+    pub const de: Locale;
+    pub const ko: Locale;
+    pub const ja: Locale;
+};
+```
+
+- The default locale is generated per declaration from the `.help` literals plus the private English structural
+  template. There is no `I18n.en`, no `I18n.Translations` type, no `build` step and no fallback locale. `helpText`
+  always renders this default; `usage(view)` uses the selected locale carried by the view.
+- `Locale.withUser(user_map)` replaces the user map with `builtin_help`, `builtin_bash_shell`, `builtin_zsh_shell`,
+  `builtin_fish_shell` (seeded from the template) plus the struct's fields. Field names are validated as keys; a
+  builtin collision is a compile error. Extra fields are allowed, so one template can serve several declarations.
+- `Builder.init(default, required)` seeds `""` with the default locale and copies the required keys.
+  `Builder.append(lang, locale)` is comptime and rejects an empty or duplicate tag, an invalid locale (`Locale.validate`
+  checks non-empty `Meta`/`Builtin` and the exact `Diag` placeholder counts) and any missing required key, all at the
+  call site. A runtime `var` builder cannot satisfy these checks.
+- `normalizeTag` strips an `@modifier`, keeps the language for a `UTF-8`/`utf8` suffix (any case), and yields `""` for
+  another encoding, `C` or `POSIX`. `tagFromEnviron` reads the first non-empty of `LC_ALL`, `LC_MESSAGES`, `LANG`;
+  non-POSIX targets return `null`. Lookup tries the exact tag (`ru_RU`), the language (`ru`), then `""`.
+- The prefilled set is `ru`, `zh`, `es`, `it`, `fr`, `de`, `ko`, `ja`. Tags are the caller's choice: the Japanese
+  template is `ja` but is normally appended as `ja_JP` (and optionally also `ja`). `Meta` supplies headings and
+  placeholders, `Builtin` the four builtin pairs, and `Diag` the four diagnostic templates (one `{s}` for `field_invalid`,
+  `token_invalid` and `message`; two for `did_you_mean`).
+- `CLI.i18n()` seeds the builder with `CLI.default_locale` under `""` and `CLI.i18n_keys`; it is a compile error on a
+  non-root namespace. `CLI.default_locale` remains available for callers that intentionally render the declaration
+  default.
+
+```zig
+const i18n = CLI.i18n()
+    .append("ru", dap.I18n.ru.withUser(.{
+        .greeting = "Привет",
+    }));
+
+var cli = try CLI.parse(allocator, environ, &i18n, args, &diag);
+```
+
+---
+
+## 10. Completion
+
+Completion is never localized. It reads each `dap.Enum`'s `completion_help` only; no locale is threaded through the
+handle, the emitters or the route. The three shell labels exist only as inert data in the prefilled templates.
+
+### 10.1 Handle
 
 `CLI.completion(allocator, app_name, shell)` builds a `CLI.Completion` handle for the whole command tree. Construction
 is infallible and does no work: it takes no `View`, does not parse, does not read the environment, performs no I/O and
@@ -611,23 +748,23 @@ const script = try completion.text();
 defer allocator.free(script);
 ```
 
-| Member | Description |
-| --- | --- |
-| `dap.Completion.Shell` | `.bash`, `.zsh` or `.fish`. |
-| `text()` | Render a caller-owned deterministic script with exactly one trailing `\n`. |
-| `show(io)` | Render and write to stdout. |
-| `install(io, environ)` | Render and write to the shell's discovery directory. |
+| Member                 | Description                                                                |
+| ---------------------- | -------------------------------------------------------------------------- |
+| `dap.Completion.Shell` | `.bash`, `.zsh` or `.fish`.                                                |
+| `text()`               | Render a caller-owned deterministic script with exactly one trailing `\n`. |
+| `show(io)`             | Render and write to stdout.                                                |
+| `install(io, environ)` | Render and write to the shell's discovery directory.                       |
 
 `text` and `install` can fail with `std.mem.Allocator.Error` or `error.InvalidAppName`. `install` also returns
 `error.InstallUnsupported` when no home directory can be determined.
 
 Install locations are:
 
-| Shell | Path |
-| --- | --- |
-| bash | `$XDG_DATA_HOME/bash-completion/completions/<app>` |
-| zsh | `$XDG_DATA_HOME/zsh/site-functions/_<app>` |
-| fish | `$XDG_CONFIG_HOME/fish/completions/<app>.fish` |
+| Shell | Path                                               |
+| ----- | -------------------------------------------------- |
+| bash  | `$XDG_DATA_HOME/bash-completion/completions/<app>` |
+| zsh   | `$XDG_DATA_HOME/zsh/site-functions/_<app>`         |
+| fish  | `$XDG_CONFIG_HOME/fish/completions/<app>.fish`     |
 
 Missing XDG variables fall back to `$HOME/.local/share` and `$HOME/.config`; parent directories are created.
 
@@ -639,22 +776,22 @@ subcommand call is a compile error.
 The registration spelling is `app_name` verbatim. Shell identifiers are sanitized separately: every byte outside
 `[A-Za-z0-9_]` becomes `_`. The zsh autoload file name must match its function, `_<ident>`.
 
-The script is a snapshot of the declaration. Regenerate it when flags or commands change. Sanitization is not
-injective, so two CLIs can collide in one bash or fish session.
+The script is a snapshot of the declaration. Regenerate it when flags or commands change. Sanitization is not injective,
+so two CLIs can collide in one bash or fish session.
 
-### 9.2 Predictors
+### 10.2 Predictors
 
 `Flag(T)` and `Argument(T)` accept `completion: ?dap.Completion.Predictor = null`.
 
-| Constructor | Offered values |
-| --- | --- |
-| `null` | The shell's own file completion. |
-| `dap.Completion.fs(.{})` | Same as `null`; native mapping. |
-| `dap.Completion.fs(.{ .wildcard = "*.toml", .root = "config" })` | Matching files, listed by the binary. |
-| `dap.Completion.disabled()` | Nothing; suppresses the file fallback. |
-| `dap.Completion.launch(.{ "git", "ls-files", "$cur" })` | Output of a literal command line. |
-| `dap.Completion.call("...")` | Shell source inserted verbatim. |
-| `dap.Completion.custom(callback)` | Values produced by a callback in the binary. |
+| Constructor                                                      | Offered values                               |
+| ---------------------------------------------------------------- | -------------------------------------------- |
+| `null`                                                           | The shell's own file completion.             |
+| `dap.Completion.fs(.{})`                                         | Same as `null`; native mapping.              |
+| `dap.Completion.fs(.{ .wildcard = "*.toml", .root = "config" })` | Matching files, listed by the binary.        |
+| `dap.Completion.disabled()`                                      | Nothing; suppresses the file fallback.       |
+| `dap.Completion.launch(.{ "git", "ls-files", "$cur" })`          | Output of a literal command line.            |
+| `dap.Completion.call("...")`                                     | Shell source inserted verbatim.              |
+| `dap.Completion.custom(callback)`                                | Values produced by a callback in the binary. |
 
 `FsOptions`:
 
@@ -692,7 +829,7 @@ defaults. It is a compile error on `bool` and `Enumeration` targets, including `
 static values of its target. It runs on an empty positional word, never after `--`, and `--flag=value` strips the
 `--flag=` prefix before matching and re-attaches it to every result.
 
-### 9.3 Candidate selection
+### 10.3 Candidate selection
 
 The script tracks the current command level and the number of completed positional words. With an empty current word it
 shows one category, in order:
@@ -713,7 +850,7 @@ come before entries without help; ties are sorted by ASCII spelling. zsh renders
 fish emits `candidate<TAB>description` and registers with `-k`, and bash uses `COMPREPLY` with the default file
 fallback.
 
-### 9.4 Route contract
+### 10.4 Route contract
 
 Predictors that run in the binary use a hidden route. The shell invokes the program with a reserved first argument,
 followed by a binding index, the current value and the preceding words. `parse` recognizes this call before processing
@@ -758,7 +895,7 @@ if (CLI.command(cli)) |cmd| switch (cmd) {
 
 ---
 
-## 10. Validation
+## 11. Validation
 
 Validators have the signature:
 
@@ -773,13 +910,12 @@ dap.Validate.stringNotEmpty // non-empty dap.String
 dap.Validate.intNotZero(u8) // non-zero integer, comptime factory
 ```
 
-Validation runs on every value whether it came from argv, an environment variable or a direct default. It also runs
-over the members of an active `Alt` branch. A failed validation reports `InvalidValue` with `diag.field` and
-`diag.message`.
+Validation runs on every value whether it came from argv, an environment variable or a direct default. It also runs over
+the members of an active `Alt` branch. A failed validation reports `InvalidValue` with `diag.field` and `diag.message`.
 
 ---
 
-## 11. Ownership
+## 12. Ownership
 
 - `View` owns every string and custom value it stores. Strings from argv, the environment and direct defaults are
   duplicated with the allocator passed to `parse`.
@@ -790,10 +926,13 @@ over the members of an active `Alt` branch. A failed validation reports `Invalid
 - `Diag.deinit` frees only `message`; `field`, `token` and `unknown` are borrowed.
 - `helpText`, `HelpData.renderCompact`, `HelpData.deinit`, `Completion.text` and `Completion.install` return or release
   caller-owned memory.
+- `View.__i18n` is a pointer into comptime-static locale storage. It is never freed.
+- `HelpData` duplicates the i18n keys (`Flag.i18n`, `Argument.i18n`, `CommandInfo.i18n`, `info_i18n`) and frees them in
+  `deinit`; `error_text` stays borrowed.
 
 ---
 
-## 12. Compile-time constraints
+## 13. Compile-time constraints
 
 The following are compile errors:
 
@@ -810,42 +949,50 @@ The following are compile errors:
 - An `Alt` with zero branches, duplicate tags, a non-flag member, a defaulted member, or an optional member.
 - Declaring a field named `help` with `.long = "help"` (the builtin already owns it).
 - A completion predictor on a `bool` or `Enumeration` target.
+- An i18n key that is not `[_A-Za-z][_0-9A-Za-z]*`, repeats anywhere in the declaration tree, or equals one of the four
+  builtin keys.
+- A `Locale` or `withUser` map with an invalid key or a builtin collision; a malformed `Diag` template.
+- `Builder.append` with an empty or duplicate locale tag, an invalid locale, or a missing required key.
 - `Compose.shift` with an empty or malformed prefix.
 - `Compose.concat` with a non-mergeable same-named pair, a cross-input name collision, or duplicate branch names or tags
   inside a merged `Alt`.
 
 ---
 
-## 13. Semantics summary
+## 14. Semantics summary
 
-| Subject | Rule |
-| --- | --- |
-| Input | `args` is pure payload, no binary name, no skipped token. |
-| Names | Field names are wire names verbatim; dashes need `.long`; names cannot start with `_`. |
-| Required | Required iff no default. Booleans are always optional and default to `false`. |
-| Precedence | argv > environment > direct default > zero value. |
-| Defaults | Only the last argument may have one. |
-| Terminator | `--` makes the rest literal and stops command handoff. |
-| Commands | A command token hands the remaining payload to that level. `command(view)` dispatches; tags are field names. |
-| Flags across levels | A flag missing locally is retried on ancestors; names are globally unique. |
-| `Alt` | At most one branch active; all members of the active branch are required. |
-| Optional flags | `?T`, `null` when absent, no defaults, validation skipped when null. |
-| Help | `-h`/`--help` anywhere bypasses checks, renders the deepest merged page and exits 0. |
-| Failure | Diagnostics plus the deepest merged help page on stderr, exit 1. |
-| Ownership | `View` owns its data; release once with `CLI.deinit`. |
-| Composition | `shift` prefixes long names and drops shorts; `concat` appends fields, merging same-named groups and Alts. |
-| Compilation | All names, types, defaults and collisions are checked at compile time. |
+| Subject             | Rule                                                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Input               | `args` is pure payload, no binary name, no skipped token.                                                    |
+| Names               | Field names are wire names verbatim; dashes need `.long`; names cannot start with `_`.                       |
+| Required            | Required iff no default. Booleans are always optional and default to `false`.                                |
+| Precedence          | argv > environment > direct default > zero value.                                                            |
+| Defaults            | Only the last argument may have one.                                                                         |
+| Terminator          | `--` makes the rest literal and stops command handoff.                                                       |
+| Commands            | A command token hands the remaining payload to that level. `command(view)` dispatches; tags are field names. |
+| Flags across levels | A flag missing locally is retried on ancestors; names are globally unique.                                   |
+| `Alt`               | At most one branch active; all members of the active branch are required.                                    |
+| Optional flags      | `?T`, `null` when absent, no defaults, validation skipped when null.                                         |
+| Help                | `-h`/`--help` anywhere bypasses checks, renders the deepest merged page and exits 0.                         |
+| Localization        | `.i18n` keys resolve through the locale `parse` selected; `null` or no match uses the generated default.      |
+| Failure             | Diagnostics plus the deepest merged help page on stderr, exit 1.                                             |
+| Ownership           | `View` owns its data; release once with `CLI.deinit`.                                                        |
+| Composition         | `shift` prefixes long names and drops shorts; `concat` appends fields, merging same-named groups and Alts.   |
+| Compilation         | All names, types, defaults and collisions are checked at compile time.                                       |
 
 ---
 
-## 14. Verification
+## 15. Verification
 
 ```sh
 zig build                  # compile the module and the example executable
 zig build test             # unit tests for the core and composition
 zig test src/dap.zig       # single-root test run
+zig test src/compose.zig   # composition test run
+zig test src/i18n.zig      # i18n data and locale selection
 zig build completion-test  # opt-in shell integration tests
 zig build run -- --help
+LANG=ru_RU.UTF-8 zig build run -- --help   # localized example output
 ```
 
 The example binary can also render a completion script:

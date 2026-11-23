@@ -10,16 +10,20 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` (both test roots),
-`zig test src/dap.zig` (317 tests) and `zig test src/compose.zig` (338 tests,
-including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) pass.
-The milestone-tagged M1–M26 blocks are the plan of record; there is no
-`PLAN.md`.
+`zig test src/dap.zig` (346 tests), `zig test src/compose.zig` (368 tests,
+including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) and
+`zig test src/i18n.zig` (7 tests) pass. Runtime help and diagnostics are
+localizable: a declaration names translations by i18n key, `parse` selects a
+locale from the environment through a comptime builder, and the selected
+locale travels in the `View`. The milestone-tagged M1–M26 blocks are the plan
+of record; there is no `PLAN.md`.
 
 - `src/dap.zig` holds the DSL, spec normalization, `generate`,
   `Enumeration`, `Command`, `Alt`, runtime help (`HelpData` +
-  `renderHelpWithStyle`/`renderCompact`), typo suggestions (`SuggestValid`/
-  `Suggest` + the `suggest*` family), `DecodeError`/`ParseError`, `Diag`, the
-  `_completion_internal` bridge, the generated wiring, and the test suite.
+  `renderHelpWithStyle`/`renderCompact`, rendered in a selected locale),
+  `HelpError`, typo suggestions (`SuggestValid`/`Suggest` + the `suggest*`
+  family), `DecodeError`/`ParseError`, `Diag`, the `_completion_internal`
+  bridge, the generated wiring, and the test suite.
 - `src/completion.zig` owns the whole completion feature: the public
   `Completion` namespace, the `Level`/`Binding`/`Model` tables, script
   emitters, the hidden route, and the M19–M26 tests. It imports `dap.zig`
@@ -27,9 +31,16 @@ The milestone-tagged M1–M26 blocks are the plan of record; there is no
 - `src/checks.zig` owns the declaration checks that used to live in `dap.zig`
   (`checkNoUnderscoreFields`, `commandSpellings`, the command/duplicate/field/
   argument checks, `FlagOrigin`/`levelPath`/`collectFlagOrigins`/
-  `checkGlobalFlagNames`) plus `validLongName`/`validPrefix`/`checkPrefix` and
-  the cross-input planner `concatPlan` used by composition. `dap.zig` imports
-  it for `normalize`/`generate`; the cycle resolves lazily.
+  `checkGlobalFlagNames`) plus `I18nOrigin`/`collectI18n`/`checkI18nKeys`/
+  `validI18nKey`, `validLongName`/`validPrefix`/`checkPrefix` and the
+  cross-input planner `concatPlan` used by composition. `dap.zig` imports it
+  for `normalize`/`generate`; the cycle resolves lazily.
+- `src/i18n.zig` owns internationalization data and locale selection: the
+  public `I18n` namespace (`Error`, `Entry`, `Locale`, `Builder`,
+  `normalizeTag`, `tagFromEnviron`) plus the eight prefilled locale templates
+  (`ru`, `zh`, `es`, `it`, `fr`, `de`, `ko`, `ja`) and the private English
+  structural template. It never imports `dap.zig`; `dap.zig` imports it and
+  re-exports `I18n`.
 - `src/compose.zig` owns declaration composition: the public `Compose`
   namespace with `shift`/`concat` and its tests. It imports `dap.zig` and
   `checks.zig`; `dap.zig` never imports it.
@@ -44,7 +55,8 @@ The milestone-tagged M1–M26 blocks are the plan of record; there is no
   the public module and the fixture, and is compiled only by the
   `completion-test` step.
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
-  `usingnamespace`; exports are explicit).
+  `usingnamespace`; exports are explicit), including `HelpError`, plus
+  `I18n` from `i18n.zig`.
 - `build.zig` exposes a public `dap` module rooted at `src/root.zig`, builds a
   `dap-example` executable from `src/main.zig` with a `run` step, a `test` step
   compiling/running tests from `src/dap.zig` **and** `src/compose.zig` (two
@@ -56,8 +68,8 @@ The milestone-tagged M1–M26 blocks are the plan of record; there is no
 - `build.zig.zon` sets `.name = .dap` and `.minimum_zig_version = "0.17.0"`.
   Match that version.
 
-Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
-`zig build run -- --help`.
+Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
+`zig test src/i18n.zig`, `zig build completion-test`, `zig build run -- --help`.
 
 ## Layout
 
@@ -66,7 +78,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   `String`, `Default(T)`, `defaultValue`, `Flag(T)`, `Optional`, `Group`,
   `Argument(T)`, `Enumeration`, `Enum`, `CommandMeta`, `Command`,
   `VariantNamed`, `Alt`, `Validate`, `DecodeError`, `ParseError`,
-  `SuggestValid`, `Suggest`, `Diag`, `HelpData`) come first.
+  `SuggestValid`, `Suggest`, `Diag`, `HelpData`, `HelpError`, `I18n`) come
+  first.
 - The private compact-help scaffolding (`HelpStyle`, `HelpSegment`, `HelpRow`,
   `HelpSection`, `helpStyleCode`, `helpSegmentsWidth`, the `appendHelpStyled`/
   `appendHelpSegments`/`appendFlagUsage` family, `upperDup`), the file-private
@@ -75,7 +88,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   (`emptyHelpData`, `sameGroupName`, `absorbScope`, `isBuiltinHelp`,
   `dedupeBuiltinHelp`, `appendActiveScopes`, `contextHelpText`) and the
   builtin-help injection helpers (`builtin_help_field`, `BuiltinHelp`,
-  `MergedDecl`, `withBuiltinHelp`, `renderHelpWithStyle`) follow.
+  `MergedDecl`, `withBuiltinHelp`, `renderHelpWithStyle`) follow, along with
+  the locale-threading helpers (`resolve`, `buildErrorText`,
+  `printDiagnosticsStandalone`, `defaultEntries`/`defaultKeys`).
+- `src/i18n.zig` — the i18n module. Public `I18n` (`Error`, `Entry`, `Locale`
+  with its `Meta`/`Builtin`/`Diag` tables, `Builder`, `normalizeTag`,
+  `tagFromEnviron`) comes first, then the private `english` template, the
+  prefilled `ru`/`zh`/`es`/`it`/`fr`/`de`/`ko`/`ja` locales, then the
+  `normalizeTag`/`localeByTag`/`Builder` tests. It imports only `std`.
 - The private `suggest*` family follows. Then the completion bridge and alias:
   `const completion_mod = @import("completion.zig");`,
   `pub const _completion_internal = struct { pub const Spec = Spec; pub const
@@ -115,12 +135,17 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
 - `src/checks.zig` — shared checks and the composition planner. Moved checks
   keep their `dap.zig` message shapes. `concatPlan(left, right)` validates a
   pair and returns the per-result-field plan (`copy_left`, `copy_right`,
-  `merge_group`, `merge_alt`). Also defines `validLongName`/`validPrefix`
-  (used by `shift`) and exposes `Field`/`fieldsOf`/`typeOfField` to compose.
+  `merge_group`, `merge_alt`). `I18nOrigin`/`collectI18n` walk the declaration
+  tree once per key (builtin help skipped, a command meta key and its derived
+  child app key counted once); `checkI18nKeys` validates spelling, builtin
+  collisions and uniqueness; `validI18nKey` is the shared predicate. Also
+  defines `validLongName`/`validPrefix` (used by `shift`) and exposes
+  `Field`/`fieldsOf`/`typeOfField` to compose.
 - `src/compose.zig` — `pub const Compose` with `shift` and `concat`. Private
   helpers build the composed `@Struct` types (`Shifted`, `Concat`,
   `ShiftedAltDict`, `MergedDict`) and the value holders behind each field's
-  `default_value_ptr`. Tests cover shift, concat, merges and end-to-end
+  `default_value_ptr`. Keys are preserved across both combinators. Tests cover
+  shift, concat, merges, key preservation and end-to-end
   `generate`/`parse`/`helpText`.
 - `src/root.zig` — public module root; explicit re-exports from `dap.zig`
   (`Completion` is one of them) plus `pub const Compose =
@@ -310,18 +335,61 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
 - A `-h, --help` bool flag is injected as `.builtin_help` at index 0 of every
   declaration before normalization (`BuiltinHelp` / `withBuiltinHelp`), so it
   appears first in `View` and in the flags section. It carries
-  `.i18n = "builtin.help"` and a `false` direct default.
+  `.i18n = "builtin_help"` and a `false` direct default; the generated default
+  locale maps `builtin_help` to the injected flag's own help literal.
+- i18n keys are field-name-shaped (`[_A-Za-z][_0-9A-Za-z]*`, ASCII,
+  non-empty), unique across the whole declaration tree, and must not equal
+  `builtin_help`, `builtin_bash_shell`, `builtin_zsh_shell` or
+  `builtin_fish_shell`. `App.i18n` participates, so the app description key
+  cannot double as a flag key. `Group` display names have no i18n channel.
+  `generate` runs `checks.collectI18n` right after `normalizeRanked`, beside
+  `checkGlobalFlagNames`, then `checkI18nKeys`; a violation is a
+  `@compileError` naming the key and both paths. A command's
+  `CommandMeta.i18n` and the child `App.i18n` derived by `subApp` are one
+  origin.
+- The default locale is generated per declaration, never exported: `generate`
+  builds it from the collected origins (key -> `.help` literal, plus
+  `builtin_help`) and the private English structural template (`Locale.default`
+  takes the entries verbatim and seeds no shell keys). `generate` builds
+  `default_locale`/`i18n_keys` (via `defaultEntries`/`defaultKeys`) before the
+  `Base` namespace, so every level can reach them. There is no `I18n.en`,
+  no `Translations` type and no runtime `build` step, and it is not a fallback
+  for a configured locale. A declaration with nothing registered renders
+  byte-identically to the old English output.
+- `I18n.Locale` and `I18n.Builder` are immutable comptime values.
+  `Locale.withUser` replaces the user map with the four builtin pairs from
+  that template plus the anonymous struct's fields; every field name is
+  syntax-checked and a builtin name is rejected. `Builder.init` seeds `""` ->
+  default and copies the required keys; `Builder.append(lang, locale)` is
+  comptime and rejects an empty or duplicate tag, an invalid locale
+  (`Locale.validate`: non-empty `Meta`/`Builtin`, exact `Diag` placeholder
+  counts) and any missing required key, all at the call site. Lookups that
+  return a pointer use `StaticStringMap` indices, never a by-value copy.
+- Locale selection: `normalizeTag` strips an `@modifier`, keeps `UTF-8`/
+  `utf8` (any case) and returns `""` for another encoding, `C` or `POSIX`;
+  `tagFromEnviron` reads the first non-empty of `LC_ALL`, `LC_MESSAGES`,
+  `LANG` (POSIX only). `Builder.locale` tries the exact tag (`ru_RU`), then the
+  language before `_` (`ru`), then `""`; it cannot fail because `""` is always
+  seeded.
 - Help is runtime-filled, not comptime-rendered. `helpData(allocator)` walks
   the comptime-known `specs`/`commands` and duplicates everything into a
   caller-owned `HelpData` (released with `HelpData.deinit`); it also records
-  the app's `HelpRendererHighlight` scheme and fills `usage_alts` (one
-  `HelpData.Usage` per `Alt`, its branch flag slices aliasing entries owned by
-  `flag_groups`). `helpText` renders it via the file-private
-  `renderHelpWithStyle`, which dispatches on `App.help_renderer.style`
-  (`.compact` → `HelpData.renderCompact`, `.custom` → the user function), and
-  `renderCompact` renders a kong-style two-column layout inline, applying the
-  scheme after all column widths have been measured on the raw text. Nothing
-  help-related runs unless one of those is called.
+  the app's `HelpRendererHighlight` scheme, the i18n keys (`Flag.i18n`,
+  `Argument.i18n`, `CommandInfo.i18n`, `info_i18n`) and fills `usage_alts`
+  (one `HelpData.Usage` per `Alt`, its branch flag slices aliasing entries
+  owned by `flag_groups`). Keys are duplicated, so `deinit` frees them and
+  `absorbScope` moves `info_i18n` beside `info`. `helpText` renders via the
+  file-private `renderHelpWithStyle(style, locale, allocator, data)`, which
+  dispatches on `App.help_renderer.style` (`.compact` →
+  `HelpData.renderCompact(locale, allocator)`, `.custom` → the user function
+  `fn (*const HelpData, *const I18n.Locale, Allocator) HelpError!String`).
+  Renderers resolve every non-null key through the locale with `resolve`; a
+  missing key is `error.UnknownTranslationKey`, never the literal. Structural
+  headings/placeholders come from `locale.meta`; named `Group` headings stay
+  literal. `renderCompact` renders a kong-style two-column layout inline,
+  applying the scheme after all column widths have been measured on the raw
+  text. `HelpError` is `Allocator.Error || I18n.Error`. Nothing help-related
+  runs unless one of those is called.
 - Help is *context-sensitive*. A `-h`/`--help` anywhere in the active command
   chain is detected by `helpRequested` (a comptime walk of the View command
   fields); `parseInnerHelp` carries an `ancestor_help` flag through the handoff
@@ -332,11 +400,12 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   groups merge by name with move semantics, `usage_alts` append, and arg
   groups/commands/info/name come from the deepest scope so the usage header
   reads `app svc build`) and dedupes the repeated injected builtin via
-  `dedupeBuiltinHelp`; `contextHelpText` renders it once. Root-scope help is
-  byte-identical to the pre-merge path. Failure help is context-sensitive too:
-  `parseInnerHelp` takes an `out: *View` and its `errdefer` copies the partial
-  View there, the handoff stores the child's partial View in the parent's
-  command field before rethrowing, so `printFailureExit` receives a root View
+  `dedupeBuiltinHelp`; `contextHelpText(NS, allocator, view, locale)` renders
+  it once. Root-scope help is byte-identical to the pre-merge path. Failure
+  help is context-sensitive too: `parseInnerHelp` takes an `out: *View` and
+  its `errdefer` copies the partial View there, the handoff stores the child's
+  partial View in the parent's command field before rethrowing, so
+  `printFailureExit` receives a root View
   whose active command chain reaches the failing level and `failureHelpText`
   renders that level's merged page (plus the diagnostics).
   `usage(view)` prints that same text and is generic over the view type, like
@@ -344,7 +413,24 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   returns the namespace chain from the current namespace down to it, so
   `CLI.usage(cli)` and `CLI.usage(sub)` produce the same merged help when
   called on the root namespace (a call inside a subcommand branch can pass the
-  sub-view directly).
+  sub-view directly). It renders with `view.__i18n`.
+- Every generated `View`, at every level, carries a hidden `__i18n:
+  *const I18n.Locale` after the `__command<rank>` tag and before the `Alt`
+  and command fields; Phase 0 of `parseInnerHelp` sets it and every handoff
+  passes the locale down, so the whole active chain shares it. It is a
+  static pointer and `deinit` never frees it. `parse(allocator, environ,
+  i18n, args, diag)` takes `?*const I18n.Builder`: `null` selects
+  `Base.default_locale`, a builder selects `i18n.locale(environ)`. Selection
+  runs after the completion route and before scanning, so the `-h`/`--help`
+  intercept, the failure page and automatic output are localized.
+  `parseInner` keeps its old signature and supplies `default_locale`;
+  localized tests call `parseInnerHelp` directly. `Base.default_locale`,
+  `Base.i18n_keys` and root-only `Base.i18n()` (a non-root call is a
+  `@compileError`) expose the surface; the command shell forwards `i18n`.
+  `helpText` still renders the declaration default; `usage(view)` is the only
+  post-parse entry that renders with the selected locale. There is no
+  `helpTextFor`, no `locale(view)` accessor and no locale returned from
+  `parse`.
 - Typo suggestions ride on `Diag`. When a flag token matches no declaration
   (`consumeLongFlag`/`consumeShortFlag` fall-through) or a bare token overflows
   a level's argument slots (`assignPositional`), the failure site calls
@@ -363,13 +449,20 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   candidate. Tokens consumed after the `--` terminator pass `suggest = false`
   (the user declared them data, not typos).
 - `HelpData.error_text` (optional) leads `renderCompact`'s view, wrapped in
-  the new `HelpStyle.error_msg` category (scheme `usage.error_msg`).
+  the `HelpStyle.error_msg` category (scheme `usage.error_msg`).
   `printFailureExit` builds the diagnostic block once (`buildErrorText` from
-  `Diag.field`/`token`/`message`/`unknown`), passes it to `failureHelpText`
-  (the merged failure page plus the block) for the `.compact` renderer, and
-  otherwise prints the block standalone (`printDiagnosticsStandalone`); a
-  failed render or diagnostic build falls back to the standalone lines so
-  diagnostics are never lost.
+  `Diag.field`/`token`/`message`/`unknown` and the locale's four `Diag`
+  templates; the prefix lives inside each template, the validation message is
+  only wrapped by the `message` template, and suggestion spelling stays
+  structural), passes it to `failureHelpText` (the merged failure page plus
+  the block) for the `.compact` renderer, and otherwise prints the block
+  standalone (`printDiagnosticsStandalone`); a failed render or diagnostic
+  build falls back to the standalone lines so diagnostics are never lost.
+- Completion stays unlocalized. `dap.Enum` carries only `completion_help`
+  (renamed from `help`, no `i18n` field); shell emitters read that value from
+  each enumeration branch and never thread a locale. Completion's own shell
+  labels use the `builtin_bash_shell`/`builtin_zsh_shell`/
+  `builtin_fish_shell` keys only as inert data in the prefilled templates.
 - Completion is lazy, model-driven and split across two files.
   `CLI.completion(allocator, app_name, shell)` (beside
   `helpData`/`helpText`/`usage`) builds a `CLI.Completion` handle without
@@ -411,8 +504,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   (`--long` primary, `-short` alias) and one per command (primary wire name,
   synonym alias; empty and `-`-leading spellings are dropped), plus
   `completionArgumentEntries` for a positional slot (enumeration wire names,
-  deduplicated, carrying the help declared on each value's own `dap.Enum`
-  branch, not the argument's help). Ordering is family first
+  deduplicated, carrying the `completion_help` declared on each value's own
+  `dap.Enum` branch, not the argument's help). Ordering is family first
   (normal, version, help; family is classified from the primary spelling:
   `help`/`--help`/lone `-h`, `version`/`--version`/lone `-v`), then help
   presence (rows with help before rows with none), then ASCII spelling.
@@ -499,9 +592,12 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig build completion-test`,
   tests. `src/completion.zig` puts the public `Completion` namespace first,
   then private model/entry/emitter code, then the route, then its tests.
   `src/checks.zig` puts the shared types/bridge imports first, then the moved
-  checks, then the long-name predicates, then the `concat` planner and its
-  walkers, then tests. `src/compose.zig` puts `Compose` first, then the
-  shift/concat builders and merge helpers, then tests.
+  checks, then the long-name predicates, then the i18n walk/predicate, then
+  the `concat` planner and its walkers, then tests. `src/compose.zig` puts
+  `Compose` first, then the shift/concat builders and merge helpers, then
+  tests. `src/i18n.zig` puts the public `I18n` surface (`Error`, `Entry`,
+  `Locale`, `Builder`, `normalizeTag`, `tagFromEnviron`) first, then the
+  private English template and the prefilled locales, then tests.
 
 ## Notes
 
