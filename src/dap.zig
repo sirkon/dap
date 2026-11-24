@@ -187,6 +187,23 @@ pub const HelpHighlight = struct {
     }
 };
 
+/// The highlight scheme a destination actually uses: the configured one when
+/// the destination is a terminal that supports ANSI escape codes and
+/// `NO_COLOR` is unset, `.flat` otherwise, so a redirected page never carries
+/// escape codes. Pure, so the decision is testable without a terminal.
+fn staticHighlight(configured: HelpRendererHighlight, ansi: bool, no_color: bool) HelpRendererHighlight {
+    if (no_color or !ansi) return .{ .flat = {} };
+    return configured;
+}
+
+/// [`staticHighlight`] for a concrete destination. Detection is capability
+/// only (never mutating the console mode); any detection error counts as "no
+/// ANSI".
+fn effectiveHighlight(configured: HelpRendererHighlight, file: std.Io.File, no_color: bool) HelpRendererHighlight {
+    const ansi = file.supportsAnsiEscapeCodes(std.Options.debug_io) catch false;
+    return staticHighlight(configured, ansi, no_color);
+}
+
 /// String cause I'm bored of it.
 pub const String = []const u8;
 
@@ -1933,16 +1950,21 @@ fn contextHelpData(comptime NS: type, allocator: std.mem.Allocator, v: anytype) 
 
 /// Render [`contextHelpData`] once with the app's configured renderer. Called
 /// from `usage`, from `parse`'s help intercept, and from the failure path.
+/// `file` is the destination whose ANSI capability decides the effective
+/// highlight, or `null` for the authoritative (declared) one.
 fn contextHelpText(
     comptime NS: type,
     allocator: std.mem.Allocator,
     v: anytype,
     locale: *const I18n.Locale,
+    file: ?std.Io.File,
+    no_color: bool,
 ) HelpError!String {
     const chain = comptime (usageChain(NS, viewValueType(@TypeOf(v))) orelse
         @compileError("dap.usage: argument is not a command View of '" ++ NS.app_meta.name ++ "'"));
     var merged = try contextHelpData(NS, allocator, v);
     defer merged.deinit(allocator);
+    if (file) |f| merged.highlight = effectiveHighlight(merged.highlight, f, no_color);
     return renderHelpWithStyle(chain[0].app_meta.help_renderer.style, locale, allocator, &merged);
 }
 
@@ -1953,7 +1975,8 @@ fn contextHelpText(
 ///   declaration field (in declaration order, with the injected
 ///   `builtin_help: bool` first), a zero-sized `__commandN` tag after the
 ///   spec fields that keeps each level's type nominally distinct, a hidden
-///   `__i18n: *const I18n.Locale` carrying the locale `parse` selected, one
+///   `__i18n: *const I18n.Locale` carrying the locale `parse` selected, a
+///   hidden `__no_color: bool` recording that `NO_COLOR` was set, one
 ///   `?Union` per `Alt` field, and one `?View` per command field under a
 ///   `_`-prefixed name (`_stop`);
 /// - `pub fn parse(allocator, environ, i18n, args, diag) ParseError!View`,
@@ -2072,8 +2095,10 @@ fn contextHelpText(
 ///
 /// `View` is a plain struct (`cli.login`, `cli.path`, ...) whose strings are
 /// allocated with the passed allocator. It also carries a hidden
-/// `__i18n: *const I18n.Locale` pointer, the locale `parse` selected; `usage`
-/// reads it to render in that locale. No name transformation is applied:
+/// `__i18n: *const I18n.Locale` pointer, the locale `parse` selected, and a
+/// hidden `__no_color: bool`, whether `NO_COLOR` was set; `usage` reads both
+/// to render in that locale with the highlight the destination supports. No
+/// name transformation is applied:
 /// field names are wire names verbatim (`dry_run` → `--dry_run`), and a
 /// dash-spelled name requires an explicit `.long`. A declaration field name
 /// must not start with `_`: the leading underscore is reserved for the
@@ -2519,6 +2544,9 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         // The locale selected by `parse`, carried so `usage` renders with it.
         // A pointer into comptime-static storage, never freed by `deinit`.
         names = names ++ &[_]String{"__i18n"};
+        // Whether `NO_COLOR` was set in the parse environment, carried so
+        // `usage` and the help intercept can downgrade the highlight.
+        names = names ++ &[_]String{"__no_color"};
         for (alts) |a| names = names ++ &[_]String{a.field};
         for (cmd_entries) |c| names = names ++ &[_]String{c.view_field};
         break :blk names;
@@ -2528,6 +2556,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         for (all_specs) |s| ts = ts ++ &[_]type{specViewType(s)};
         ts = ts ++ &[_]type{u0};
         ts = ts ++ &[_]type{*const I18n.Locale};
+        ts = ts ++ &[_]type{bool};
         for (alts) |a| ts = ts ++ &[_]type{?a.AT.Union};
         for (cmd_entries) |c| ts = ts ++ &[_]type{?Sub(c.Cmd, subApp(app, c)).View};
         break :blk ts;
@@ -2832,10 +2861,25 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// caller owns it and frees it with the same allocator. The renderer
         /// follows `app.help_renderer.style`: `.compact` renders the kong-style
         /// two-column layout, `.custom` invokes the user-provided function.
-        /// Fails with [`HelpError`]: an allocation failure or a translation key
-        /// missing from the selected locale.
+        /// The configured highlight is a recommendation: it is honored only
+        /// when stdout is a terminal that supports ANSI escape codes and
+        /// `NO_COLOR` is unset, otherwise the page renders `.flat`. Fails with
+        /// [`HelpError`]: an allocation failure or a translation key missing
+        /// from the selected locale.
         pub fn helpText(allocator: std.mem.Allocator) HelpError!String {
-            return try helpTextWithStyle(allocator, null, &default_locale);
+            return try helpTextWithStyle(
+                allocator,
+                null,
+                &default_locale,
+                effectiveHighlight(app.help_renderer.highlight, std.Io.File.stdout(), false),
+            );
+        }
+
+        /// Render help with the configured highlight exactly as declared,
+        /// ignoring terminal capability. Used by byte-level snapshots that must
+        /// not depend on where the process writes.
+        fn helpTextDeclared(allocator: std.mem.Allocator) HelpError!String {
+            return try helpTextWithStyle(allocator, null, &default_locale, app.help_renderer.highlight);
         }
 
         /// Print the context-sensitive help of a parsed `View` to stdout: the
@@ -2849,7 +2893,9 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// before returning; only a write to stdout is ignored, matching the
         /// parse intercept. It renders with the locale carried by `view`
         /// (`view.__i18n`), so post-parse help matches the locale `parse`
-        /// selected. Fails with [`HelpError`] when rendering does.
+        /// selected, and honors the configured highlight only when stdout
+        /// supports ANSI escape codes and `NO_COLOR` was unset (`view.__no_color`).
+        /// Fails with [`HelpError`] when rendering does.
         ///
         /// ```
         /// const cli = try CLI.parse(allocator, environ, null, args, &diag);
@@ -2860,7 +2906,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// ```
         pub fn usage(view: anytype) HelpError!void {
             const allocator = std.heap.page_allocator;
-            const text = try contextHelpText(@This(), allocator, view, view.__i18n);
+            const text = try contextHelpText(
+                @This(),
+                allocator,
+                view,
+                view.__i18n,
+                std.Io.File.stdout(),
+                view.__no_color,
+            );
             defer allocator.free(text);
             var stdout_buffer: [0x1000]u8 = undefined;
             const stdout_file = std.Io.File.stdout();
@@ -3022,6 +3075,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             diag: ?*const Diag,
             view: anytype,
             locale: *const I18n.Locale,
+            no_color: bool,
         ) noreturn {
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
@@ -3038,9 +3092,9 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // other renderer (or a failed diagnostic build) prints them as
             // standalone lines so they are never lost.
             const standalone = !compact or error_text == null;
-            if (standalone) printDiagnosticsStandalone(allocator, diag, locale);
+            if (standalone) printDiagnosticsStandalone(allocator, diag, locale, no_color);
 
-            if (failureHelpText(allocator, view, if (compact) error_text else null, locale)) |text| {
+            if (failureHelpText(allocator, view, if (compact) error_text else null, locale, no_color)) |text| {
                 defer allocator.free(text);
                 std.debug.print("{s}\n", .{text});
             } else |_| {
@@ -3052,16 +3106,18 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
         /// Render the context-sensitive help of the partially parsed `view`,
         /// most specific command first, with `error_text` (when set) leading
-        /// the compact view.
+        /// the compact view. The highlight follows stderr's ANSI capability.
         fn failureHelpText(
             allocator: std.mem.Allocator,
             view: anytype,
             error_text: ?String,
             locale: *const I18n.Locale,
+            no_color: bool,
         ) HelpError!String {
             var data = try contextHelpData(@This(), allocator, view);
             defer data.deinit(allocator);
             data.error_text = error_text;
+            data.highlight = effectiveHighlight(data.highlight, std.Io.File.stderr(), no_color);
             return renderHelpWithStyle(app.help_renderer.style, locale, allocator, &data);
         }
 
@@ -3119,18 +3175,24 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// Print the failure diagnostics as standalone stderr lines. Used as
         /// the fallback when the renderer is not the compact one (which folds
         /// them into its view) or when rendering failed. The suggested
-        /// spelling is wrapped in the scheme's error color.
+        /// spelling is wrapped in the scheme's error color, downgraded to
+        /// `.flat` when stderr does not support ANSI escape codes.
         fn printDiagnosticsStandalone(
             allocator: std.mem.Allocator,
             diag: ?*const Diag,
             locale: *const I18n.Locale,
+            no_color: bool,
         ) void {
             const d = diag orelse return;
             if (d.field) |f| printDiagLine(allocator, locale.diag.field_invalid, &.{f});
             if (d.token) |t| printDiagLine(allocator, locale.diag.token_invalid, &.{t});
             if (d.message) |m| printDiagLine(allocator, locale.diag.message, &.{m});
             if (d.unknown) |u| {
-                const hl = HelpHighlight.resolve(app.help_renderer.highlight);
+                const hl = HelpHighlight.resolve(effectiveHighlight(
+                    app.help_renderer.highlight,
+                    std.Io.File.stderr(),
+                    no_color,
+                ));
                 const pre = hl.usage.error_msg;
                 const reset = if (pre.len > 0) hl.reset else "";
                 const sp = suggestSpelling(u);
@@ -3155,15 +3217,18 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// Fill the `HelpData` description of this declaration and render it with
         /// the app's configured renderer. The description is freed before
         /// returning; only the rendered string stays allocated. `error_text`,
-        /// when set, leads the compact view with the failure diagnostics.
+        /// when set, leads the compact view with the failure diagnostics, and
+        /// `highlight` is the scheme the destination actually supports.
         fn helpTextWithStyle(
             allocator: std.mem.Allocator,
             error_text: ?String,
             locale: *const I18n.Locale,
+            highlight: HelpRendererHighlight,
         ) HelpError!String {
             var data = try helpData(allocator);
             defer data.deinit(allocator);
             data.error_text = error_text;
+            data.highlight = highlight;
             return try renderHelpWithStyle(app.help_renderer.style, locale, allocator, &data);
         }
 
@@ -3175,8 +3240,12 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// `builder.locale(environ)` (`LC_ALL`, `LC_MESSAGES`, `LANG`). The
         /// selected locale is installed in `View.__i18n` at every active
         /// level, so the `-h`/`--help` intercept, the failure page and
-        /// `usage` render in it. The completion route hook runs first, before
-        /// locale selection and parsing.
+        /// `usage` render in it. `NO_COLOR` (set and non-empty in `environ`)
+        /// is recorded in `View.__no_color` and downgrades the configured
+        /// highlight to `.flat`; without it the highlight is honored only when
+        /// the destination is a terminal that supports ANSI escape codes. The
+        /// completion route hook runs first, before locale selection and
+        /// parsing.
         pub fn parse(
             allocator: std.mem.Allocator,
             environ: std.process.Environ,
@@ -3198,13 +3267,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // builder always seeds the default locale under the empty tag.
             // A `null` builder selects the declaration default.
             const locale = if (i18n_builder) |builder| builder.locale(environ) else &default_locale;
+            const no_color = environ.containsUnemptyConstant("NO_COLOR");
 
             // `failed` receives the partially built View on the error path, so
             // the failure page can describe the deepest command that was
             // actually entered instead of the root.
             var failed: View = undefined;
-            const result = parseInnerHelp(allocator, environ, locale, args, diag, false, null, &failed) catch {
-                printFailureExit(allocator, diag, &failed, locale);
+            const result = parseInnerHelp(allocator, environ, locale, no_color, args, diag, false, null, &failed) catch {
+                printFailureExit(allocator, diag, &failed, locale, no_color);
             };
 
             // HELP REQUESTED INTERCEPT: a requested help flag — at this level or
@@ -3213,7 +3283,14 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // context-sensitive help with the app's renderer, print it to
             // stdout, and exit cleanly.
             if (helpRequested(@This(), &result)) {
-                if (contextHelpText(@This(), allocator, &result, locale)) |text| {
+                if (contextHelpText(
+                    @This(),
+                    allocator,
+                    &result,
+                    locale,
+                    std.Io.File.stdout(),
+                    result.__no_color,
+                )) |text| {
                     defer allocator.free(text);
                     var stdout_buffer: [0x1000]u8 = undefined;
                     const stdout_file = std.Io.File.stdout();
@@ -3234,7 +3311,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// entry is for callers that handle errors themselves.
         fn parseInner(allocator: std.mem.Allocator, environ: std.process.Environ, args: []const []const u8, diag: ?*Diag) ParseError!View {
             var failed: View = undefined;
-            return parseInnerHelp(allocator, environ, &default_locale, args, diag, false, null, &failed);
+            return parseInnerHelp(allocator, environ, &default_locale, environ.containsUnemptyConstant("NO_COLOR"), args, diag, false, null, &failed);
         }
 
         /// The parse pipeline. `ancestor_help` records that a help flag was seen on
@@ -3249,8 +3326,10 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// every level that was entered remains reachable from its parent's
         /// command field and the failure page can merge the whole active chain.
         /// `locale` is the locale `parse` selected; it is installed into the
-        /// View and passed to every command handoff.
-        fn parseInnerHelp(allocator: std.mem.Allocator, environ: std.process.Environ, locale: *const I18n.Locale, args: []const []const u8, diag: ?*Diag, ancestor_help: bool, up: ?*const Ancestor, out: *View) ParseError!View {
+        /// View and passed to every command handoff. `no_color` records that
+        /// `NO_COLOR` was set in `environ`; it is installed likewise and
+        /// downgrades the highlight on every emission path.
+        fn parseInnerHelp(allocator: std.mem.Allocator, environ: std.process.Environ, locale: *const I18n.Locale, no_color: bool, args: []const []const u8, diag: ?*Diag, ancestor_help: bool, up: ?*const Ancestor, out: *View) ParseError!View {
             if (diag) |d| d.* = .{};
 
             var v: View = undefined;
@@ -3268,6 +3347,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // a branch is materialized only when one of its members is seen.
             v.builtin_help = false;
             v.__i18n = locale;
+            v.__no_color = no_color;
             inline for (alts) |a| @field(v, a.field) = null;
             inline for (cmd_entries) |c| @field(v, c.view_field) = null;
 
@@ -3314,7 +3394,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
                                     .assign_short = ancestorFns(@This()).assignShort,
                                 };
                                 var sub: S.View = undefined;
-                                @field(v, c.view_field) = S.parseInnerHelp(allocator, environ, locale, args[i + 1 ..], diag, help_seen, &chain, &sub) catch |err| {
+                                @field(v, c.view_field) = S.parseInnerHelp(allocator, environ, locale, no_color, args[i + 1 ..], diag, help_seen, &chain, &sub) catch |err| {
                                     // Link the partially built sub-View before
                                     // unwinding so the failure page of an
                                     // ancestor can descend into it.
@@ -3466,6 +3546,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         pub const parse = Base.parse;
         const parseInner = Base.parseInner;
         const parseInnerHelp = Base.parseInnerHelp;
+        const helpTextDeclared = Base.helpTextDeclared;
         pub const helpData = Base.helpData;
         pub const helpText = Base.helpText;
         pub const usage = Base.usage;
@@ -4792,8 +4873,8 @@ test "M2: View field order and types" {
     const fields = fieldsOf(V);
 
     // 7 specs (builtin_help injected first) + the rank tag + the locale
-    // pointer + 2 command fields.
-    try std.testing.expectEqual(@as(usize, 11), fields.len);
+    // pointer + the NO_COLOR bit + 2 command fields.
+    try std.testing.expectEqual(@as(usize, 12), fields.len);
 
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqual(@as(type, bool), fields[0].type);
@@ -4820,14 +4901,18 @@ test "M2: View field order and types" {
     try std.testing.expectEqualStrings("__i18n", fields[8].name);
     try std.testing.expectEqual(@as(type, *const I18n.Locale), fields[8].type);
 
+    // the parsed NO_COLOR bit follows the locale pointer.
+    try std.testing.expectEqualStrings("__no_color", fields[9].name);
+    try std.testing.expectEqual(@as(type, bool), fields[9].type);
+
     // trailing command fields are optional sub-Views, hidden behind a `_`
     // prefix.
-    try std.testing.expectEqualStrings("_start", fields[9].name);
-    try std.testing.expect(@typeInfo(fields[9].type) == .optional);
-    try std.testing.expect(@typeInfo(@typeInfo(fields[9].type).optional.child) == .@"struct");
-    try std.testing.expectEqualStrings("_stop", fields[10].name);
+    try std.testing.expectEqualStrings("_start", fields[10].name);
     try std.testing.expect(@typeInfo(fields[10].type) == .optional);
     try std.testing.expect(@typeInfo(@typeInfo(fields[10].type).optional.child) == .@"struct");
+    try std.testing.expectEqualStrings("_stop", fields[11].name);
+    try std.testing.expect(@typeInfo(fields[11].type) == .optional);
+    try std.testing.expect(@typeInfo(@typeInfo(fields[11].type).optional.child) == .@"struct");
 }
 
 test "M2: @FieldType matches specs" {
@@ -4850,7 +4935,7 @@ test "M2: View without commands carries spec fields and the tag" {
         .b = Argument([]const u8){},
     });
     const fields = fieldsOf(C.View);
-    try std.testing.expectEqual(@as(usize, 5), fields.len);
+    try std.testing.expectEqual(@as(usize, 6), fields.len);
     try std.testing.expectEqualStrings("builtin_help", fields[0].name);
     try std.testing.expectEqual(@as(type, bool), fields[0].type);
     try std.testing.expectEqualStrings("a", fields[1].name);
@@ -4861,6 +4946,8 @@ test "M2: View without commands carries spec fields and the tag" {
     try std.testing.expectEqual(@as(type, u0), fields[3].type);
     try std.testing.expectEqualStrings("__i18n", fields[4].name);
     try std.testing.expectEqual(@as(type, *const I18n.Locale), fields[4].type);
+    try std.testing.expectEqualStrings("__no_color", fields[5].name);
+    try std.testing.expectEqual(@as(type, bool), fields[5].type);
 }
 
 test "M2: command View fields are optional sub-views" {
@@ -4874,15 +4961,17 @@ test "M2: command View fields are optional sub-views" {
     // in the View.
     const StartSub = @typeInfo(@FieldType(C.View, "_start")).optional.child;
     const start_fields = fieldsOf(StartSub);
-    try std.testing.expectEqual(@as(usize, 4), start_fields.len);
+    try std.testing.expectEqual(@as(usize, 5), start_fields.len);
     try std.testing.expectEqualStrings("builtin_help", start_fields[0].name);
     try std.testing.expectEqualStrings("name", start_fields[1].name);
     try std.testing.expectEqualStrings("__command1", start_fields[2].name);
     try std.testing.expectEqualStrings("__i18n", start_fields[3].name);
     try std.testing.expectEqual(@as(type, *const I18n.Locale), start_fields[3].type);
+    try std.testing.expectEqualStrings("__no_color", start_fields[4].name);
+    try std.testing.expectEqual(@as(type, bool), start_fields[4].type);
 
     const HaltSub = @typeInfo(@FieldType(C.View, "_stop")).optional.child;
-    try std.testing.expectEqual(@as(usize, 3), @typeInfo(HaltSub).@"struct".field_names.len);
+    try std.testing.expectEqual(@as(usize, 4), @typeInfo(HaltSub).@"struct".field_names.len);
     try std.testing.expectEqualStrings("__i18n", fieldsOf(HaltSub)[2].name);
 
     // the sub level has no commands of its own.
@@ -5332,7 +5421,7 @@ test "M5: bool flag usage header is bracketed" {
         .opt = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "A defaulted bool." },
     };
     const CLI = generate(App{ .name = "b", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, def);
-    const h = try CLI.helpText(std.testing.allocator);
+    const h = try CLI.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     const usage_end = std.mem.indexOf(u8, h, "\n").?;
     const usage = h[0..usage_end];
@@ -5782,7 +5871,7 @@ test "M9: help text renders header, sections and arguments" {
         \\  --host=HOST    Host.
         \\
     ;
-    const h = try M9.helpText(std.testing.allocator);
+    const h = try M9.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings(expected, h);
 }
@@ -5802,7 +5891,7 @@ test "M9: help text renders the commands section" {
         \\  halt     Stop.
         \\
     ;
-    const h = try M9Cmd.helpText(std.testing.allocator);
+    const h = try M9Cmd.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings(expected, h);
 }
@@ -5856,7 +5945,7 @@ test "i18n: keyed rows resolve through the user map" {
     defer arena.deinit();
     var diag: Diag = .{};
     const v = try I18nResolve.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "serve", "-h" }, &diag);
-    const sh = try contextHelpText(I18nResolve, arena.allocator(), &v, &locale);
+    const sh = try contextHelpText(I18nResolve, arena.allocator(), &v, &locale, null, false);
     try std.testing.expect(std.mem.indexOf(u8, sh, "Цель.") != null);
 }
 
@@ -5875,7 +5964,7 @@ test "i18n: English output is identical with the default locale" {
     defer data.deinit(std.testing.allocator);
     const direct = try data.renderCompact(&M9.default_locale, std.testing.allocator);
     defer std.testing.allocator.free(direct);
-    const via_help = try M9.helpText(std.testing.allocator);
+    const via_help = try M9.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(via_help);
     try std.testing.expectEqualStrings(via_help, direct);
 }
@@ -5892,7 +5981,7 @@ test "i18n: a custom renderer receives the locale pointer" {
         App{ .name = "cap", .help = "", .help_renderer = .{ .style = .{ .custom = m10RenderCapture } } },
         M10Def,
     );
-    const h = try CLI.helpText(std.testing.allocator);
+    const h = try CLI.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings("captured", h);
     try std.testing.expect(m10CapturedLocale == &CLI.default_locale);
@@ -6088,10 +6177,10 @@ test "i18n: help intercept and failure page use the selected locale" {
 
     // The help intercept renders the merged page with the selected locale.
     var help_out: CLI.View = undefined;
-    const help_v = try CLI.parseInnerHelp(a, env, locale, &.{"-h"}, &diag, false, null, &help_out);
+    const help_v = try CLI.parseInnerHelp(a, env, locale, false, &.{"-h"}, &diag, false, null, &help_out);
     try std.testing.expect(help_v.__i18n == locale);
     s6CapturedLocale = null;
-    _ = try contextHelpText(CLI, a, &help_v, help_v.__i18n);
+    _ = try contextHelpText(CLI, a, &help_v, help_v.__i18n, null, false);
     try std.testing.expect(s6CapturedLocale == locale);
 
     // The failure page receives the locale explicitly.
@@ -6099,11 +6188,11 @@ test "i18n: help intercept and failure page use the selected locale" {
     var fail_diag: Diag = .{};
     try std.testing.expectError(
         error.UnknownFlag,
-        CLI.parseInnerHelp(a, env, locale, &.{"--nope"}, &fail_diag, false, null, &failed),
+        CLI.parseInnerHelp(a, env, locale, false, &.{"--nope"}, &fail_diag, false, null, &failed),
     );
     try std.testing.expect(failed.__i18n == locale);
     s6CapturedLocale = null;
-    _ = try CLI.failureHelpText(a, &failed, null, locale);
+    _ = try CLI.failureHelpText(a, &failed, null, locale, false);
     try std.testing.expect(s6CapturedLocale == locale);
 }
 
@@ -6114,7 +6203,7 @@ test "i18n: helpText still renders the declaration default locale" {
     const locale = S6Builder.locale(env);
     try std.testing.expect(locale != &I18nResolve.default_locale);
 
-    const h = try I18nResolve.helpText(std.testing.allocator);
+    const h = try I18nResolve.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, h, "Res app.") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "Приложение.") == null);
@@ -6258,7 +6347,7 @@ test "M9: help text with no help header, no commands and no arguments" {
         \\      --flag
         \\
     ;
-    const h = try CLI.helpText(std.testing.allocator);
+    const h = try CLI.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings(expected, h);
 }
@@ -6274,7 +6363,7 @@ test "M9: help text for an empty declaration has only the header" {
         \\  -h, --help    Show context-sensitive help.
         \\
     ;
-    const h = try CLI.helpText(std.testing.allocator);
+    const h = try CLI.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings(expected, h);
 }
@@ -6392,7 +6481,7 @@ test "M9: environment-only defaults render as $NAME" {
     try std.testing.expectEqualStrings("$NO_COLOR", data.flag_groups[0].flags[3].default.?);
     try std.testing.expectEqualStrings("$MODE", data.arg_groups[0].args[0].default.?);
 
-    const text = try CLI.helpText(std.testing.allocator);
+    const text = try CLI.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(text);
     // The env-only bool is defaulted, so it leaves the usage header.
     try std.testing.expect(std.mem.indexOf(u8, text, "[--no_color]") == null);
@@ -6729,7 +6818,7 @@ test "M10: a user-declared --help clashes with the injected builtin" {
 }
 
 test "M10: helpText follows the compact renderer by default" {
-    const h = try M10.helpText(std.testing.allocator);
+    const h = try M10.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     // The default highlight is `.bold`, so names carry the bold/reset codes;
     // the dashes are part of each name token.
@@ -6742,7 +6831,7 @@ test "M10: helpText follows a custom renderer function" {
         App{ .name = "m10c", .help = "M10 custom.", .help_renderer = .{ .style = .{ .custom = m10RenderMinimal } } },
         M10Def,
     );
-    const h = try Custom.helpText(std.testing.allocator);
+    const h = try Custom.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expectEqualStrings("custom renderer", h);
 }
@@ -7080,7 +7169,7 @@ test "M12: an Alt branch tag may equal a Group name and shares its help section"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const help = try C.helpText(a);
+    const help = try C.helpTextDeclared(a);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, help, "alt1"));
     try std.testing.expect(std.mem.indexOf(u8, help, "--p") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--q") != null);
@@ -7094,7 +7183,7 @@ test "M12: duplicate group names merge into one help section" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const help = try C.helpText(a);
+    const help = try C.helpTextDeclared(a);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, help, "shared"));
     try std.testing.expect(std.mem.indexOf(u8, help, "--a") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--b") != null);
@@ -7108,7 +7197,7 @@ test "M12: two Alt fields sharing a branch tag share one help section" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const help = try C.helpText(a);
+    const help = try C.helpTextDeclared(a);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, help, "fast"));
     try std.testing.expect(std.mem.indexOf(u8, help, "--a") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--b") != null);
@@ -7158,7 +7247,7 @@ test "M12: help groups one branch per heading" {
     }
     try std.testing.expect(found_alt1 and found_fancy);
 
-    const h = try M12.helpText(std.testing.allocator);
+    const h = try M12.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, h, "alt1") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "fancy-alt2") != null);
@@ -7182,7 +7271,7 @@ test "M12: usage clause renders Alt alternation with flat highlighting" {
         }),
     };
     const C = generate(App{ .name = "u", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, def);
-    const h = try C.helpText(std.testing.allocator);
+    const h = try C.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.startsWith(u8, h, "Usage: u (--x=X | --y=Y) [flags]"));
 }
@@ -7356,7 +7445,7 @@ test "M13: help marks optional flags and omits them from usage" {
     try std.testing.expect(found);
 
     const Flat = generate(App{ .name = "m13", .help = "m13", .help_renderer = .{ .highlight = .{ .flat = {} } } }, M13Def);
-    const h = try Flat.helpText(std.testing.allocator);
+    const h = try Flat.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, h, "--num") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "--maybe") != null);
@@ -7548,8 +7637,8 @@ test "M14: root help stays root-scoped and byte-identical" {
     var diag: Diag = .{};
 
     const vroot = try m14Parse(&arena, &.{"-h"}, &diag);
-    const ctx = try contextHelpText(M14, arena.allocator(), &vroot, &M14.default_locale);
-    const root = try M14.helpText(arena.allocator());
+    const ctx = try contextHelpText(M14, arena.allocator(), &vroot, &M14.default_locale, null, false);
+    const root = try M14.helpTextDeclared(arena.allocator());
     try std.testing.expectEqualStrings(root, ctx);
 }
 
@@ -7563,13 +7652,13 @@ test "M14: a parse failure keeps the deepest entered command scope" {
     var mid: M14.View = undefined;
     try std.testing.expectError(
         error.UnknownFlag,
-        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &M14.default_locale, &.{ "svc", "--nope" }, &diag, false, null, &mid),
+        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &M14.default_locale, false, &.{ "svc", "--nope" }, &diag, false, null, &mid),
     );
     try std.testing.expect(mid._svc != null);
     try std.testing.expect(mid._svc.?._build == null);
     try std.testing.expectEqualStrings(
         M14SvcGolden,
-        try contextHelpText(M14, arena.allocator(), &mid, &M14.default_locale),
+        try contextHelpText(M14, arena.allocator(), &mid, &M14.default_locale, null, false),
     );
 
     // `svc build` fails one level deeper (missing <target>): the chain must
@@ -7578,14 +7667,14 @@ test "M14: a parse failure keeps the deepest entered command scope" {
     var deep: M14.View = undefined;
     try std.testing.expectError(
         error.MissingRequired,
-        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &M14.default_locale, &.{ "svc", "build" }, &deep_diag, false, null, &deep),
+        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &M14.default_locale, false, &.{ "svc", "build" }, &deep_diag, false, null, &deep),
     );
     try std.testing.expect(deep._svc != null);
     try std.testing.expect(deep._svc.?._build != null);
     try std.testing.expectEqualStrings("target", deep_diag.field.?);
     try std.testing.expectEqualStrings(
         M14BuildGolden,
-        try contextHelpText(M14, arena.allocator(), &deep, &M14.default_locale),
+        try contextHelpText(M14, arena.allocator(), &deep, &M14.default_locale, null, false),
     );
 
     // The compact failure view leads with the diagnostics.
@@ -7610,13 +7699,13 @@ test "M14: a root-level parse failure keeps the root page" {
     var partial: M14.View = undefined;
     try std.testing.expectError(
         error.MissingRequired,
-        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &M14.default_locale, &.{}, &diag, false, null, &partial),
+        M14.parseInnerHelp(arena.allocator(), std.process.Environ.empty, &M14.default_locale, false, &.{}, &diag, false, null, &partial),
     );
     try std.testing.expect(partial._svc == null);
     try std.testing.expect(partial._one == null);
     try std.testing.expectEqualStrings(
-        try M14.helpText(arena.allocator()),
-        try contextHelpText(M14, arena.allocator(), &partial, &M14.default_locale),
+        try M14.helpTextDeclared(arena.allocator()),
+        try contextHelpText(M14, arena.allocator(), &partial, &M14.default_locale, null, false),
     );
 }
 
@@ -7626,7 +7715,7 @@ test "M14: usage header reconstructs the command path" {
     var diag: Diag = .{};
 
     const v = try m14Parse(&arena, &.{ "svc", "-h" }, &diag);
-    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale);
+    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale, null, false);
     const first_line = h[0..std.mem.indexOfScalar(u8, h, '\n').?];
     try std.testing.expectEqualStrings(
         "Usage: m14 svc --config=CONFIG --host=HOST --token=TOKEN (--fast) <command> [flags]",
@@ -7640,7 +7729,7 @@ test "M14: flags accumulate from every ancestor level" {
     var diag: Diag = .{};
 
     const v = try m14Parse(&arena, &.{ "svc", "-h" }, &diag);
-    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale);
+    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale, null, false);
     try std.testing.expectEqualStrings(M14SvcGolden, h);
 
     // The merged scope lists the injected builtin help exactly once.
@@ -7656,12 +7745,12 @@ test "M14: arguments and next commands come from the deepest scope only" {
     var diag: Diag = .{};
 
     const vbuild = try m14Parse(&arena, &.{ "svc", "build", "-h" }, &diag);
-    const hbuild = try contextHelpText(M14, arena.allocator(), &vbuild, &M14.default_locale);
+    const hbuild = try contextHelpText(M14, arena.allocator(), &vbuild, &M14.default_locale, null, false);
     try std.testing.expectEqualStrings(M14BuildGolden, hbuild);
 
     // The `svc` scope lists `build` but neither sibling `one` nor `two`.
     const vsvc = try m14Parse(&arena, &.{ "svc", "-h" }, &diag);
-    const hsvc = try contextHelpText(M14, arena.allocator(), &vsvc, &M14.default_locale);
+    const hsvc = try contextHelpText(M14, arena.allocator(), &vsvc, &M14.default_locale, null, false);
     try std.testing.expect(std.mem.indexOf(u8, hsvc, "  build    ") != null);
     try std.testing.expect(std.mem.indexOf(u8, hsvc, "  one    ") == null);
     try std.testing.expect(std.mem.indexOf(u8, hsvc, "  two    ") == null);
@@ -7673,7 +7762,7 @@ test "M14: info shows the deepest command help" {
     var diag: Diag = .{};
 
     const v = try m14Parse(&arena, &.{ "svc", "build", "-h" }, &diag);
-    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale);
+    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale, null, false);
     try std.testing.expect(std.mem.indexOf(u8, h, "Build.") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "M14 root.") == null);
     try std.testing.expect(std.mem.indexOf(u8, h, "Service command.") == null);
@@ -7685,7 +7774,7 @@ test "M14: help token before the commands scopes to the deepest active command" 
     var diag: Diag = .{};
 
     const v = try m14Parse(&arena, &.{ "-h", "svc", "build" }, &diag);
-    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale);
+    const h = try contextHelpText(M14, arena.allocator(), &v, &M14.default_locale, null, false);
     try std.testing.expectEqualStrings(M14BuildGolden, h);
 }
 
@@ -7698,7 +7787,7 @@ test "M14: merged help frees everything when an allocation fails" {
     const FailingAllocator = std.testing.FailingAllocator;
     const total = blk: {
         var probe = FailingAllocator.init(std.testing.allocator, .{});
-        const text = try contextHelpText(M14, probe.allocator(), &v, &M14.default_locale);
+        const text = try contextHelpText(M14, probe.allocator(), &v, &M14.default_locale, null, false);
         probe.allocator().free(text);
         break :blk probe.allocations;
     };
@@ -7706,7 +7795,7 @@ test "M14: merged help frees everything when an allocation fails" {
     var fi: usize = 0;
     while (fi <= total) : (fi += 1) {
         var fa = FailingAllocator.init(std.testing.allocator, .{ .fail_index = fi });
-        if (contextHelpText(M14, fa.allocator(), &v, &M14.default_locale)) |text| {
+        if (contextHelpText(M14, fa.allocator(), &v, &M14.default_locale, null, false)) |text| {
             fa.allocator().free(text);
         } else |e| {
             try std.testing.expectEqual(std.mem.Allocator.Error.OutOfMemory, e);
@@ -7732,15 +7821,15 @@ test "M14: usage of a sub-view merges the same scopes as the root view" {
 
     const vbuild = try m14Parse(&arena, &.{ "--config", "c", "--host", "h", "svc", "--token", "t", "build", "x" }, &diag);
     const build = vbuild._svc.?._build.?;
-    const from_sub = try contextHelpText(M14, arena.allocator(), &build, &M14.default_locale);
-    const from_root = try contextHelpText(M14, arena.allocator(), &vbuild, &M14.default_locale);
+    const from_sub = try contextHelpText(M14, arena.allocator(), &build, &M14.default_locale, null, false);
+    const from_root = try contextHelpText(M14, arena.allocator(), &vbuild, &M14.default_locale, null, false);
     try std.testing.expectEqualStrings(M14BuildGolden, from_sub);
     try std.testing.expectEqualStrings(from_root, from_sub);
 
     // A mid-level sub-view stops at its own level's scope.
     const vsvc = try m14Parse(&arena, &.{ "--config", "c", "--host", "h", "svc", "--token", "t" }, &diag);
     const svc = vsvc._svc.?;
-    const mid = try contextHelpText(M14, arena.allocator(), &svc, &M14.default_locale);
+    const mid = try contextHelpText(M14, arena.allocator(), &svc, &M14.default_locale, null, false);
     try std.testing.expectEqualStrings(M14SvcGolden, mid);
 }
 
@@ -7756,8 +7845,8 @@ test "M14: usage of a commandless view keeps its own scope" {
     defer arena.deinit();
     var diag: Diag = .{};
     const v = try C.parseInner(arena.allocator(), std.process.Environ.empty, &.{"p"}, &diag);
-    const ctx = try contextHelpText(C, arena.allocator(), &v, &C.default_locale);
-    const plain = try C.helpText(arena.allocator());
+    const ctx = try contextHelpText(C, arena.allocator(), &v, &C.default_locale, null, false);
+    const plain = try C.helpTextDeclared(arena.allocator());
     try std.testing.expectEqualStrings(plain, ctx);
 }
 
@@ -8812,7 +8901,7 @@ const M27ArgEnv = generate(M27Flat, .{
 });
 
 fn expectM27Help(comptime C: type, expected: []const u8) !void {
-    const text = try C.helpText(std.testing.allocator);
+    const text = try C.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(expected, text);
 }
@@ -8838,7 +8927,7 @@ test "M27: four help-less values render one inline clause" {
     try expectM27Help(M27Inline, expected);
 
     // Declaration order, never alphabetical: `blue` precedes `alpha`.
-    const text = try M27Inline.helpText(std.testing.allocator);
+    const text = try M27Inline.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(text);
     const red = std.mem.indexOf(u8, text, "red").?;
     const green = std.mem.indexOf(u8, text, "green").?;
@@ -9104,7 +9193,7 @@ test "M27: environment-only defaults render as $NAME" {
     ;
     try expectM27Help(M27ArgEnv, expected);
 
-    const text = try M27ArgEnv.helpText(std.testing.allocator);
+    const text = try M27ArgEnv.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(text);
     // The defaulted bool leaves the usage header; the defaulted argument is
     // bracketed there.
@@ -9112,14 +9201,14 @@ test "M27: environment-only defaults render as $NAME" {
     try std.testing.expect(std.mem.indexOf(u8, text, "[<mode>]") != null);
 
     // A direct default wins over the environment one in the clause.
-    const both = try M27ArgBoth.helpText(std.testing.allocator);
+    const both = try M27ArgBoth.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(both);
     try std.testing.expect(std.mem.indexOf(u8, both, "Default value: json.") != null);
     try std.testing.expect(std.mem.indexOf(u8, both, "$M27_MODE") == null);
 }
 
 test "M27: branch names and default values carry the flag-value highlight" {
-    const text = try M27Highlight.helpText(std.testing.allocator);
+    const text = try M27Highlight.helpTextDeclared(std.testing.allocator);
     defer std.testing.allocator.free(text);
     // Branch names and the default value are `flags_value`; the label,
     // separators and branch help stay plain.
@@ -9127,4 +9216,124 @@ test "M27: branch names and default values carry the flag-value highlight" {
     try std.testing.expect(std.mem.indexOf(u8, text, "<v>slow</v>") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Default value: <v>json</v>.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Possible values: <v>json</v>, <v>yaml</v>.") != null);
+}
+
+// M29: the configured highlight is a recommendation, applied only when the
+// destination is an ANSI terminal and `NO_COLOR` is unset.
+
+const M29Custom = HelpHighlight{ .groups = "\x1b[1m", .reset = "\x1b[0m" };
+
+const M29Schemes = [_]HelpRendererHighlight{
+    .{ .flat = {} },
+    .{ .bold = {} },
+    .{ .color = {} },
+    .{ .custom = M29Custom },
+};
+
+fn expectFlat(h: HelpRendererHighlight) !void {
+    try std.testing.expectEqual(@as(std.meta.Tag(HelpRendererHighlight), .flat), std.meta.activeTag(h));
+}
+
+fn expectScheme(configured: HelpRendererHighlight, got: HelpRendererHighlight) !void {
+    try std.testing.expectEqual(std.meta.activeTag(configured), std.meta.activeTag(got));
+    if (std.meta.activeTag(configured) == .custom) {
+        const want = configured.custom;
+        const have = got.custom;
+        try std.testing.expectEqualStrings(want.groups, have.groups);
+        try std.testing.expectEqualStrings(want.reset, have.reset);
+    }
+}
+
+test "M29: staticHighlight downgrades every scheme without an ANSI terminal" {
+    for (M29Schemes) |configured| {
+        // No ANSI capability: plain, whatever was declared.
+        try expectFlat(staticHighlight(configured, false, false));
+        // ANSI capability, but `NO_COLOR` set: plain.
+        try expectFlat(staticHighlight(configured, true, true));
+        try expectFlat(staticHighlight(configured, false, true));
+        // ANSI terminal without `NO_COLOR`: the declaration wins.
+        try expectScheme(configured, staticHighlight(configured, true, false));
+    }
+}
+
+test "M29: effectiveHighlight reads a regular file as a non-ANSI destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "usage.txt", .{});
+    defer file.close(std.testing.io);
+
+    for (M29Schemes) |configured| {
+        try expectFlat(effectiveHighlight(configured, file, false));
+        try expectFlat(effectiveHighlight(configured, file, true));
+    }
+}
+
+const M29Def = .{
+    .verbose = Flag(bool){ .default = Default(bool){ .direct = false }, .help = "Verbose." },
+    .run = Command(.{ .help = "Run." }, .{}),
+};
+
+const M29 = generate(
+    App{ .name = "m29", .help = "M29.", .help_renderer = .{ .highlight = .{ .color = {} } } },
+    M29Def,
+);
+
+test "M29: parse records NO_COLOR on the View and every sub-view" {
+    if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const envp = [_][*:0]const u8{ "NO_COLOR=1", "LANG=C" };
+    const env = makeEnviron(&envp);
+    var diag: Diag = .{};
+    const v = try M29.parseInner(arena.allocator(), env, &.{"run"}, &diag);
+    try std.testing.expect(v.__no_color);
+    try std.testing.expect(v._run.?.__no_color);
+
+    var empty_diag: Diag = .{};
+    const plain = try M29.parseInner(arena.allocator(), std.process.Environ.empty, &.{"run"}, &empty_diag);
+    try std.testing.expect(!plain.__no_color);
+    try std.testing.expect(!plain._run.?.__no_color);
+}
+
+test "M29: an empty NO_COLOR does not downgrade" {
+    if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const envp = [_][*:0]const u8{"NO_COLOR="};
+    const env = makeEnviron(&envp);
+    var diag: Diag = .{};
+    const v = try M29.parseInner(arena.allocator(), env, &.{"run"}, &diag);
+    try std.testing.expect(!v.__no_color);
+}
+
+test "M29: a non-ANSI destination renders the merged page plain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "usage.txt", .{});
+    defer file.close(std.testing.io);
+
+    var diag: Diag = .{};
+    const v = try M29.parseInner(arena.allocator(), std.process.Environ.empty, &.{}, &diag);
+
+    // `null` is the authoritative destination: the declared scheme renders.
+    const styled = try contextHelpText(M29, arena.allocator(), &v, &M29.default_locale, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[") != null);
+
+    // A regular file is not an ANSI terminal, so the page renders plain.
+    const piped = try contextHelpText(M29, arena.allocator(), &v, &M29.default_locale, file, false);
+    try std.testing.expect(std.mem.indexOf(u8, piped, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, piped, "Usage: m29") != null);
+    // Plain is not a different layout: it is byte-identical to the page a
+    // declaration configured `.flat` renders.
+    const Flat = generate(App{ .name = "m29", .help = "M29.", .help_renderer = .{ .highlight = .{ .flat = {} } } }, M29Def);
+    var flat_diag: Diag = .{};
+    const flat_view = try Flat.parseInner(arena.allocator(), std.process.Environ.empty, &.{}, &flat_diag);
+    try std.testing.expectEqualStrings(
+        try contextHelpText(Flat, arena.allocator(), &flat_view, &Flat.default_locale, null, false),
+        piped,
+    );
 }

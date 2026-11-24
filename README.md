@@ -203,7 +203,9 @@ var cli = try CLI.parse(arena, init.minimal.environ, &i18n, argv[1..], &diag);
 `parse` reads `LC_ALL`, `LC_MESSAGES` and `LANG` in that order and matches the full tag (`ru_RU`), then the language
 (`ru`), then the declaration default for anything else. The selection is stored in the `View` and threaded through the
 command handoff, so `-h`/`--help`, the failure page and `CLI.usage(view)` all render with it, while `CLI.helpText` keeps
-the declaration default. Passing `null` as the builder selects that same generated default, whose text is the `.help`
+the declaration default. The configured highlight is a recommendation: it is used only when the destination (stdout for
+help and `usage`, stderr for the failure page) is a terminal that supports ANSI escape codes and `NO_COLOR` is unset and
+non-empty; otherwise the page renders `.flat`. Passing `null` as the builder selects that same generated default, whose text is the `.help`
 literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`, `ko` and `ja`;
 `withUser` replaces the user map and seeds the `builtin_help` string. A key the selected locale lacks is
 `error.UnknownTranslationKey`, never an English fallback. Shell completion is localized at generation time: the
@@ -226,7 +228,7 @@ Everything below is specified in detail in [AGENTS-SDK.md](./AGENTS-SDK.md).
 | Enumerations        | fixed wire-name sets via `Enumeration`, per-value help, completion candidates                             | [§4.3](./AGENTS-SDK.md#43-enumerationt-and-enum)           |
 | Validation          | `Validate.stringNotEmpty`, `Validate.intNotZero`, custom validators over wire, env and default values     | [§11](./AGENTS-SDK.md#11-validation)                       |
 | Diagnostics         | `Diag` messages, offending token and field, Levenshtein typo suggestions, failure exit behavior           | [§7](./AGENTS-SDK.md#7-errors-and-diagnostics)             |
-| Help rendering      | compact two-column page, `HelpData` model, custom renderers, highlight schemes, context-sensitive `usage` | [§8](./AGENTS-SDK.md#8-help)                               |
+| Help rendering      | compact two-column page, `HelpData` model, custom renderers, terminal-aware highlight schemes, context-sensitive `usage` | [§8](./AGENTS-SDK.md#8-help)                               |
 | Localization        | `.i18n` keys on the app, flags, arguments and commands, environment-selected locales, prefilled templates | [§9](./AGENTS-SDK.md#9-internationalization)               |
 | Shell completion    | bash/zsh/fish scripts, install targets, static candidates, argument values                                | [§10](./AGENTS-SDK.md#10-completion)                       |
 | Predictors          | native file fallback, `fs`, `disabled`, `launch`, `call`, `custom` callbacks through the hidden route     | [§10.2](./AGENTS-SDK.md#102-predictors)                    |

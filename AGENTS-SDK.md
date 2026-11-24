@@ -49,7 +49,7 @@ of the public contract:
 | `View`           | type                                                          | Result struct for one successful parse.                                           |
 | `parse`          | `fn (alloc, environ, i18n, args, diag) ParseError!View`       | Parse the payload. Exits on help and usage failure (§6).                          |
 | `deinit`         | `fn (*View, alloc) void`                                      | Release every owned field. Namespace function, not a method.                      |
-| `helpText`       | `fn (alloc) HelpError!String`                                 | Render help with `app.help_renderer.style` and the declaration default locale.    |
+| `helpText`       | `fn (alloc) HelpError!String`                                 | Render help with `app.help_renderer.style`, the declaration default locale, and a highlight the destination supports. |
 | `helpData`       | `fn (alloc) Allocator.Error!HelpData`                         | Build the plain-data help model. Caller releases it.                              |
 | `usage`          | `fn (anytype) HelpError!void`                                 | Print the context-sensitive page for a `View`, in the locale it carries.          |
 | `completion`     | `fn (alloc, app_name, shell, locale) Completion`              | Build a lazy completion-script handle. Root level only.                           |
@@ -400,8 +400,9 @@ Use it like any other value type:
 2. one field per declared flag or argument, in declaration order, with group members flattened; optional flags are `?T`;
 3. a zero-sized `__command<rank>` tag that makes every level's `View` nominally distinct;
 4. a hidden `__i18n: *const dap.I18n.Locale`, the locale `parse` selected;
-5. one `?Union` field per `Alt`, in declaration order (tags are branch tags per §3.7);
-6. one `?Sub.View` field per command, in declaration order, named `_<field>`.
+5. a hidden `__no_color: bool`, whether `NO_COLOR` was set in the parse environment (§8.1);
+6. one `?Union` field per `Alt`, in declaration order (tags are branch tags per §3.7);
+7. one `?Sub.View` field per command, in declaration order, named `_<field>`.
 
 `View` types of different command levels are distinct even when their layouts match. A `View` contains only fields;
 methods are exposed on the namespace, not on the value.
@@ -512,6 +513,26 @@ documentation and takes the locale at render time. Nothing help-related runs unl
 
 `CLI.usage(view)` prints the context-sensitive help page for a `View` of any level, using the same renderer and the locale
 carried by that `View`. It is the usual response when a command level was entered but no subcommand was selected.
+
+`helpText` and `CLI.usage(view)` return and print the *rendered* page, so the configured highlight is applied only when it
+can be seen. The decision is per destination and capability-only:
+
+| Path                            | Destination        | Capability source                        |
+| ------------------------------- | ------------------ | ---------------------------------------- |
+| `-h`/`--help` intercept         | stdout             | `std.Io.File.supportsAnsiEscapeCodes`    |
+| `CLI.usage(view)`               | stdout             | same, plus `view.__no_color`             |
+| failure page                    | stderr             | same, plus `NO_COLOR`                    |
+| standalone diagnostics          | stderr             | same, for the suggested spelling         |
+| `helpText`                      | none (returns it)  | stdout                                   |
+
+A destination that is not a terminal, a terminal without ANSI support (`TERM=dumb` included), or an environment with a
+set, non-empty `NO_COLOR` downgrades every scheme, custom ones included, to `.flat`; `NO_COLOR=` (empty) does nothing. The
+fallback is byte-identical to a declaration configured `.flat`: column widths are measured before escapes are added, so
+only the codes disappear. `NO_COLOR` is read from the `Environ` passed to `parse` and stored in the `View`
+(`__no_color`), so `usage` and the help intercept agree with it after the parse; the force-color variables
+(`FORCE_COLOR`, `CLICOLOR_FORCE`) and `CLICOLOR` are ignored. dap never calls `enableAnsiEscapeCodes`, so it never mutates
+console mode; an old Windows console without virtual terminal processing therefore stays plain. A custom *renderer*
+receives the downgraded `HelpData` but may emit its own escapes, which are outside dap's control.
 
 ### 8.2 `App` renderer configuration
 
@@ -708,6 +729,10 @@ shallow copies `Flag`, its `values` slices stay owned by `flag_groups` and are n
 `HelpHighlight` provides codes for the usage header (`error_msg`, `app_name`, `required_flags`, `optionals`,
 `arguments`) and for section rendered text (`groups`, `args`, `flags` name and value). Column widths are measured before
 escape codes are emitted, so highlighting never disturbs alignment.
+
+The selection is a recommendation, not an order: §8.1's capability rule downgrades it to `flat` whenever the destination
+cannot display it, and `NO_COLOR` downgrades it unconditionally. `helpData` always carries the declared scheme; only the
+emission paths substitute the effective one.
 
 ---
 
@@ -1005,7 +1030,8 @@ the members of an active `Alt` branch. A failed validation reports `InvalidValue
 - `Diag.deinit` frees only `message`; `field`, `token` and `unknown` are borrowed.
 - `helpText`, `HelpData.renderCompact`, `HelpData.deinit`, `Completion.text` and `Completion.install` return or release
   caller-owned memory.
-- `View.__i18n` is a pointer into comptime-static locale storage. It is never freed.
+- `View.__i18n` is a pointer into comptime-static locale storage. It is never freed. `View.__no_color` is a plain
+  `bool`.
 - `HelpData` duplicates the i18n keys (`Flag.i18n`, `Argument.i18n`, `CommandInfo.i18n`, `info_i18n`) and frees them in
   `deinit`; `error_text` stays borrowed.
 

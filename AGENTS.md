@@ -10,7 +10,7 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` (both test roots),
-`zig test src/dap.zig` (381 tests), `zig test src/compose.zig` (403 tests,
+`zig test src/dap.zig` (386 tests), `zig test src/compose.zig` (403 tests,
 including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) and
 `zig test src/i18n.zig` (8 tests) pass. Runtime help and diagnostics are
 localizable: a declaration names translations by i18n key, `parse` selects a
@@ -411,7 +411,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   lines bracket such arguments and omit defaulted flags. Keys, value
   strings and the slices are duplicated, so `deinit` frees them and
   `absorbScope` moves `info_i18n` beside `info`; `usage_alts` never frees
-  `values`. `helpText` renders via the
+  `values`. Rendering goes through the
   file-private `renderHelpWithStyle(style, locale, allocator, data)`, which
   dispatches on `App.help_renderer.style` (`.compact` →
   `HelpData.renderCompact(locale, allocator)`, `.custom` → the user function
@@ -440,8 +440,11 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   groups merge by name with move semantics, `usage_alts` append, and arg
   groups/commands/info/name come from the deepest scope so the usage header
   reads `app svc build`) and dedupes the repeated injected builtin via
-  `dedupeBuiltinHelp`; `contextHelpText(NS, allocator, view, locale)` renders
-  it once. Root-scope help is byte-identical to the pre-merge path. Failure
+  `dedupeBuiltinHelp`; `contextHelpText(NS, allocator, view, locale, file,
+  no_color)` renders it once, replacing the merged `highlight` with
+  `effectiveHighlight(...)` when `file` names a destination (`null` keeps the
+  declared scheme: that is the authoritative path tests use). Root-scope help
+  is byte-identical to the pre-merge path. Failure
   help is context-sensitive too: `parseInnerHelp` takes an `out: *View` and
   its `errdefer` copies the partial View there, the handoff stores the child's
   partial View in the parent's command field before rethrowing, so
@@ -455,22 +458,41 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   called on the root namespace (a call inside a subcommand branch can pass the
   sub-view directly). It renders with `view.__i18n`.
 - Every generated `View`, at every level, carries a hidden `__i18n:
-  *const I18n.Locale` after the `__command<rank>` tag and before the `Alt`
-  and command fields; Phase 0 of `parseInnerHelp` sets it and every handoff
-  passes the locale down, so the whole active chain shares it. It is a
-  static pointer and `deinit` never frees it. `parse(allocator, environ,
-  i18n, args, diag)` takes `?*const I18n.Builder`: `null` selects
-  `Base.default_locale`, a builder selects `i18n.locale(environ)`. Selection
-  runs after the completion route and before scanning, so the `-h`/`--help`
-  intercept, the failure page and automatic output are localized.
-  `parseInner` keeps its old signature and supplies `default_locale`;
-  localized tests call `parseInnerHelp` directly. `Base.default_locale`,
-  `Base.i18n_keys` and root-only `Base.i18n()` (a non-root call is a
-  `@compileError`) expose the surface; the command shell forwards `i18n`.
-  `helpText` still renders the declaration default; `usage(view)` is the only
-  post-parse entry that renders with the selected locale. There is no
-  `helpTextFor`, no `locale(view)` accessor and no locale returned from
-  `parse`.
+  *const I18n.Locale` and a hidden `__no_color: bool` after the
+  `__command<rank>` tag and before the `Alt` and command fields; Phase 0 of
+  `parseInnerHelp` sets both and every handoff passes them down, so the whole
+  active chain shares them. The locale is a static pointer and `deinit` never
+  frees either. `parse(allocator, environ, i18n, args, diag)` takes `?*const
+  I18n.Builder`: `null` selects `Base.default_locale`, a builder selects
+  `i18n.locale(environ)`; `NO_COLOR` comes from the same `environ`
+  (`containsUnemptyConstant`). Selection runs after the completion route and
+  before scanning, so the `-h`/`--help` intercept, the failure page and
+  automatic output are localized and downgraded. `parseInner` keeps its old
+  signature and supplies `default_locale` plus `NO_COLOR`; localized tests
+  call `parseInnerHelp` directly. `Base.default_locale`, `Base.i18n_keys` and
+  root-only `Base.i18n()` (a non-root call is a `@compileError`) expose the
+  surface; the command shell forwards `i18n`. `helpText` renders the
+  declaration default with the highlight stdout supports; `usage(view)` is the
+  only post-parse entry that renders with the selected locale and
+  `view.__no_color`. There is no `helpTextFor`, no `locale(view)` accessor and
+  no locale returned from `parse`.
+- The configured highlight is a recommendation, not an order. The pure
+  `staticHighlight(configured, ansi, no_color)` returns `.flat` unless `ansi`
+  is true and `no_color` is false; `effectiveHighlight(configured, file,
+  no_color)` feeds it `file.supportsAnsiEscapeCodes(std.Options.debug_io)
+  catch false`, which on POSIX implies a tty and rejects `TERM=dumb`, and on
+  Windows reads the virtual-terminal bit without ever enabling it (dap does
+  not mutate console mode, so an old console stays plain). Each emission
+  path decides for its own destination: the help intercept and `usage` use
+  stdout, the failure page and the standalone diagnostics use stderr, and
+  `helpText` uses stdout because it has no destination. `NO_COLOR` (set and
+  non-empty in `parse`'s `environ`) downgrades unconditionally and travels in
+  `View.__no_color`; `FORCE_COLOR`, `CLICOLOR_FORCE` and `CLICOLOR` are
+  ignored. `.custom` schemes downgrade like the builtin ones; a custom
+  *renderer* receives the downgraded `HelpData` but may emit its own escapes.
+  A downgraded page is byte-identical to one from a `.flat` declaration,
+  because widths are measured before codes are added. `helpTextDeclared` is
+  the non-pub authoritative entry the byte-level snapshots call.
 - Typo suggestions ride on `Diag`. When a flag token matches no declaration
   (`consumeLongFlag`/`consumeShortFlag` fall-through) or a bare token overflows
   a level's argument slots (`assignPositional`), the failure site calls
