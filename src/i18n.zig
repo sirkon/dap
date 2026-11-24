@@ -61,12 +61,11 @@ const english: I18n.Locale = .{
         .args = "Arguments:",
         .cmds_placeholder = "<command>",
         .flags_placeholder = "[flags]",
+        .possible_values = "Possible values: ",
+        .default_value = "Default value: ",
     },
     .builtin = .{
         .help = "Show context-sensitive help.",
-        .bash_shell = "Bash shell.",
-        .zsh_shell = "Zsh shell.",
-        .fish_shell = "Fish shell.",
     },
     .diag = .{
         .field_invalid = "error: field '{s}' is invalid or missing",
@@ -97,6 +96,9 @@ pub const I18n = struct {
 
             cmds_placeholder: String,
             flags_placeholder: String,
+
+            possible_values: String, // includes its own trailing space
+            default_value: String, // includes its own trailing space
         };
 
         /// This struct is for static guarantees only. It is only used
@@ -104,9 +106,6 @@ pub const I18n = struct {
         /// map as "builtin_<field name>".
         pub const Builtin = struct {
             help: String,
-            bash_shell: String,
-            zsh_shell: String,
-            fish_shell: String,
         };
 
         /// Diagnostic templates. Each contains its own prefix so a
@@ -150,9 +149,6 @@ pub const I18n = struct {
             const field_names = @typeInfo(@TypeOf(user_map)).@"struct".field_names;
             const builtin_pairs = [_]struct { String, String }{
                 .{ "builtin_help", self.builtin.help },
-                .{ "builtin_bash_shell", self.builtin.bash_shell },
-                .{ "builtin_zsh_shell", self.builtin.zsh_shell },
-                .{ "builtin_fish_shell", self.builtin.fish_shell },
             };
             const pairs = comptime blk: {
                 @setEvalBranchQuota(100_000);
@@ -337,12 +333,11 @@ pub const I18n = struct {
             .args = "Аргументы:",
             .cmds_placeholder = "<команда>",
             .flags_placeholder = "[флаги]",
+            .possible_values = "Возможные значения: ",
+            .default_value = "Значение по умолчанию: ",
         },
         .builtin = .{
             .help = "Показать справку по контексту.",
-            .bash_shell = "Оболочка Bash.",
-            .zsh_shell = "Оболочка Zsh.",
-            .fish_shell = "Оболочка Fish.",
         },
         .diag = .{
             .field_invalid = "неверное поле '{s}' или оно отсутствует",
@@ -361,12 +356,11 @@ pub const I18n = struct {
             .args = "参数：",
             .cmds_placeholder = "<命令>",
             .flags_placeholder = "[选项]",
+            .possible_values = "可能的值： ",
+            .default_value = "默认值： ",
         },
         .builtin = .{
             .help = "显示上下文相关帮助。",
-            .bash_shell = "Bash shell。",
-            .zsh_shell = "Zsh shell。",
-            .fish_shell = "Fish shell。",
         },
         .diag = .{
             .field_invalid = "错误：字段 '{s}' 无效或缺失",
@@ -385,12 +379,11 @@ pub const I18n = struct {
             .args = "Argumentos:",
             .cmds_placeholder = "<comando>",
             .flags_placeholder = "[opciones]",
+            .possible_values = "Valores posibles: ",
+            .default_value = "Valor predeterminado: ",
         },
         .builtin = .{
             .help = "Mostrar ayuda contextual.",
-            .bash_shell = "Intérprete Bash.",
-            .zsh_shell = "Intérprete Zsh.",
-            .fish_shell = "Intérprete Fish.",
         },
         .diag = .{
             .field_invalid = "error: el campo '{s}' no es válido o falta",
@@ -409,12 +402,11 @@ pub const I18n = struct {
             .args = "Argomenti:",
             .cmds_placeholder = "<comando>",
             .flags_placeholder = "[opzioni]",
+            .possible_values = "Valori possibili: ",
+            .default_value = "Valore predefinito: ",
         },
         .builtin = .{
             .help = "Mostra la guida contestuale.",
-            .bash_shell = "Shell Bash.",
-            .zsh_shell = "Shell Zsh.",
-            .fish_shell = "Shell Fish.",
         },
         .diag = .{
             .field_invalid = "errore: il campo '{s}' non è valido o manca",
@@ -433,12 +425,11 @@ pub const I18n = struct {
             .args = "Arguments :",
             .cmds_placeholder = "<commande>",
             .flags_placeholder = "[options]",
+            .possible_values = "Valeurs possibles : ",
+            .default_value = "Valeur par défaut : ",
         },
         .builtin = .{
             .help = "Afficher l'aide contextuelle.",
-            .bash_shell = "Shell Bash.",
-            .zsh_shell = "Shell Zsh.",
-            .fish_shell = "Shell Fish.",
         },
         .diag = .{
             .field_invalid = "erreur : le champ '{s}' est invalide ou manquant",
@@ -457,12 +448,11 @@ pub const I18n = struct {
             .args = "Argumente:",
             .cmds_placeholder = "<Befehl>",
             .flags_placeholder = "[Optionen]",
+            .possible_values = "Mögliche Werte: ",
+            .default_value = "Standardwert: ",
         },
         .builtin = .{
             .help = "Kontextbezogene Hilfe anzeigen.",
-            .bash_shell = "Bash-Shell.",
-            .zsh_shell = "Zsh-Shell.",
-            .fish_shell = "Fish-Shell.",
         },
         .diag = .{
             .field_invalid = "Fehler: Feld '{s}' ist ungültig oder fehlt",
@@ -481,12 +471,11 @@ pub const I18n = struct {
             .args = "인자:",
             .cmds_placeholder = "<명령어>",
             .flags_placeholder = "[플래그]",
+            .possible_values = "가능한 값: ",
+            .default_value = "기본값: ",
         },
         .builtin = .{
             .help = "상황에 맞는 도움말을 표시합니다.",
-            .bash_shell = "Bash 셸.",
-            .zsh_shell = "Zsh 셸.",
-            .fish_shell = "Fish 셸.",
         },
         .diag = .{
             .field_invalid = "오류: '{s}' 필드가 올바르지 않거나 없습니다",
@@ -505,12 +494,11 @@ pub const I18n = struct {
             .args = "引数:",
             .cmds_placeholder = "<コマンド>",
             .flags_placeholder = "[フラグ]",
+            .possible_values = "可能な値: ",
+            .default_value = "デフォルト値: ",
         },
         .builtin = .{
             .help = "状況に応じたヘルプを表示します。",
-            .bash_shell = "Bash シェル。",
-            .zsh_shell = "Zsh シェル。",
-            .fish_shell = "Fish シェル。",
         },
         .diag = .{
             .field_invalid = "エラー: フィールド '{s}' が無効または欠落しています",
@@ -535,7 +523,7 @@ test "normalizeTag strips modifier and encoding" {
     try std.testing.expectEqualStrings("ru", I18n.normalizeTag("ru"));
 }
 
-test "Locale.default installs entries verbatim and seeds no shell keys" {
+test "Locale.default installs entries verbatim and seeds no builtin keys" {
     const loc = comptime I18n.Locale.default(&.{
         .{ .key = "greeting", .value = "hello" },
     });
@@ -556,9 +544,9 @@ test "withUser replaces inherited user entries and seeds builtin pairs" {
     });
     try std.testing.expectEqualStrings("Привет", base.get("greeting").?);
     try std.testing.expectEqualStrings(I18n.ru.builtin.help, base.get("builtin_help").?);
-    try std.testing.expectEqualStrings(I18n.ru.builtin.bash_shell, base.get("builtin_bash_shell").?);
-    try std.testing.expectEqualStrings(I18n.ru.builtin.zsh_shell, base.get("builtin_zsh_shell").?);
-    try std.testing.expectEqualStrings(I18n.ru.builtin.fish_shell, base.get("builtin_fish_shell").?);
+    try std.testing.expect(!base.has("builtin_bash_shell"));
+    try std.testing.expect(!base.has("builtin_zsh_shell"));
+    try std.testing.expect(!base.has("builtin_fish_shell"));
 
     const next = comptime base.withUser(.{
         .farewell = "До свидания",
@@ -696,6 +684,16 @@ test "every prefilled locale is complete" {
             try std.testing.expect(@field(loc.diag, name).len != 0);
         }
     }
+}
+
+test "every prefilled locale carries the value clauses" {
+    const locales = .{ I18n.ru, I18n.zh, I18n.es, I18n.it, I18n.fr, I18n.de, I18n.ko, I18n.ja };
+    inline for (locales) |loc| {
+        try std.testing.expect(loc.meta.possible_values.len != 0);
+        try std.testing.expect(loc.meta.default_value.len != 0);
+    }
+    try std.testing.expectEqualStrings("Possible values: ", english.meta.possible_values);
+    try std.testing.expectEqualStrings("Default value: ", english.meta.default_value);
 }
 
 // Malformed `Diag` templates are compile errors, verified by enabling them

@@ -35,18 +35,9 @@ pub const Completion = struct {
 
     /// A type for CLI flags/commands/arguments to generate completion stuff.
     pub const ShellType = Enumeration(.{
-        .bash = dap.Enum{
-            .name = "bash",
-            .completion_help = "Bash shell.",
-        },
-        .zsh = dap.Enum{
-            .name = "zsh",
-            .completion_help = "Zsh shell.",
-        },
-        .fish = dap.Enum{
-            .name = "fish",
-            .completion_help = "Fish shell.",
-        },
+        .bash = dap.Enum{ .name = "bash" },
+        .zsh = dap.Enum{ .name = "zsh" },
+        .fish = dap.Enum{ .name = "fish" },
     });
 
     /// Errors a completion-script render can produce.
@@ -395,7 +386,7 @@ fn enumWireHelp(comptime T: type, comptime name: String) String {
         if (!@hasDecl(T, "names") or !@hasDecl(T, "helps")) return "";
         if (T.names.len != T.helps.len) return "";
         for (T.names, T.helps) |nm, help| {
-            if (std.mem.eql(u8, nm, name)) return help;
+            if (std.mem.eql(u8, nm, name)) return help orelse "";
         }
         return "";
     }
@@ -3995,6 +3986,23 @@ test "M19: enum wire names" {
     }
 }
 
+test "M19: enum wire help" {
+    comptime {
+        m19Expect(enumWireHelp(M19Mode, "fast").len == 0, "missing help");
+        m19Expect(enumWireHelp(M19Mode, "glacial").len == 0, "named branch without help");
+        m19Expect(enumWireHelp(M19Mode, "absent").len == 0, "unknown branch");
+        m19Expect(enumWireHelp(u8, "fast").len == 0, "scalar type");
+        m19Expect(enumWireHelp(Enumeration(.{}), "fast").len == 0, "empty enumeration");
+
+        const Helpful = Enumeration(.{
+            .plain = Enum{},
+            .named = Enum{ .name = "spelled", .help = .{ .text = "Helpful value." } },
+        });
+        m19Expect(enumWireHelp(Helpful, "plain").len == 0, "branch without help");
+        m19Expect(std.mem.eql(u8, enumWireHelp(Helpful, "spelled"), "Helpful value."), "branch literal help");
+    }
+}
+
 test "M19: invalid app name allocates nothing" {
     const invalid = [_]String{
         "",        "-app",        "a/b",     "my app",
@@ -5975,8 +5983,8 @@ test "M19: fish golden" {
 // ---------------------------------------------------------------------------
 
 const M20Kind = Enumeration(.{
-    .beta = Enum{ .completion_help = "Beta value." },
-    .alpha = Enum{ .completion_help = "Alpha value." },
+    .beta = Enum{ .help = .{ .text = "Beta value." } },
+    .alpha = Enum{ .help = .{ .text = "Alpha value." } },
 });
 
 const M20Def = .{

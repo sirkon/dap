@@ -87,6 +87,10 @@ already decoded and validated. A bad value prints a diagnostic plus the relevant
 `-h`/`--help` prints help and exits cleanly. A successful parse returns a `View` you own, and an arena frees it in one
 go.
 
+Help texts read as sentences, so each `.help` literal ends with a period. Leave the existing punctuation alone when the
+text already ends with `!`, `?`, `...`, a Unicode ellipsis (`…`), or a Unicode/full-width period (`。`, `．`). Simplified
+Chinese should use `。` rather than an ASCII `.`.
+
 ## A commanded CLI
 
 A workspace tool with global flags, two verbs, a nested command, and a hidden `completion` command that prints a shell
@@ -199,7 +203,7 @@ var cli = try CLI.parse(arena, init.minimal.environ, &i18n, argv[1..], &diag);
 command handoff, so `-h`/`--help`, the failure page and `CLI.usage(view)` all render with it, while `CLI.helpText` keeps
 the declaration default. Passing `null` as the builder selects that same generated default, whose text is the `.help`
 literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`, `ko` and `ja`;
-`withUser` replaces the user map and seeds the four builtin strings. A key the selected locale lacks is
+`withUser` replaces the user map and seeds the `builtin_help` string. A key the selected locale lacks is
 `error.UnknownTranslationKey`, never an English fallback. Shell completion is never localized.
 
 ## Capabilities

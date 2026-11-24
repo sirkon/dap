@@ -270,7 +270,9 @@ pub fn validI18nKey(comptime s: String) bool {
 /// for the root call: a child `App.i18n` is derived from its command meta's
 /// key, which the parent already recorded, so passing `null` in recursion
 /// keeps one origin per command rather than a duplicate. The injected builtin
-/// help spec is skipped structurally; its key is a builtin constant.
+/// help spec is skipped structurally; its key is a builtin constant. An
+/// enumeration-typed spec also contributes one origin per branch that declares
+/// both a translation key and help text; an empty key means "no translation".
 pub fn collectI18n(
     comptime norm: NormResult,
     comptime app_help: String,
@@ -290,14 +292,32 @@ pub fn collectI18n(
             }};
         }
         for (norm.specs) |s| {
-            const key = s.i18n orelse continue;
-            if (std.mem.eql(u8, s.name, builtin_help_field)) continue;
-            out = out ++ &[_]I18nOrigin{.{
-                .key = key,
-                .literal = s.help,
-                .field = s.name,
-                .path = path,
-            }};
+            if (!std.mem.eql(u8, s.name, builtin_help_field)) {
+                if (s.i18n) |key| {
+                    out = out ++ &[_]I18nOrigin{.{
+                        .key = key,
+                        .literal = s.help,
+                        .field = s.name,
+                        .path = path,
+                    }};
+                }
+            }
+            const T = s.vtype;
+            if (@typeInfo(T) == .@"struct" and
+                @hasDecl(T, "names") and @hasDecl(T, "helps") and @hasDecl(T, "help_i18n"))
+            {
+                for (T.names, T.helps, T.help_i18n) |name, help, key| {
+                    const k = key orelse continue;
+                    if (k.len == 0) continue;
+                    const literal = help orelse continue;
+                    out = out ++ &[_]I18nOrigin{.{
+                        .key = k,
+                        .literal = literal,
+                        .field = s.name ++ "." ++ name,
+                        .path = path,
+                    }};
+                }
+            }
         }
         for (norm.commands) |c| {
             if (c.Cmd.cmd_meta.i18n) |key| {
@@ -325,7 +345,7 @@ pub fn checkI18nKeys(comptime origins: []const I18nOrigin) void {
                     "' is not a valid field name ([_A-Za-z][_0-9A-Za-z]*)");
             }
         }
-        const builtin_keys = [_]String{ "builtin_help", "builtin_bash_shell", "builtin_zsh_shell", "builtin_fish_shell" };
+        const builtin_keys = [_]String{"builtin_help"};
         for (origins) |o| {
             for (builtin_keys) |b| {
                 if (std.mem.eql(u8, o.key, b)) {
@@ -821,6 +841,101 @@ test "checks: checkI18nKeys rejects a builtin collision" {
     if (false) {
         const norm = normalize(withBuiltinHelp(.{
             .a = dap.Flag(u8){ .i18n = "builtin_help" },
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+const I18nModeEnum = .{
+    .json = dap.Enum{ .help = .{ .text = "Machine-readable JSON output.", .i18n = "mode_json" } },
+    .yaml = dap.Enum{ .help = .{ .text = "Human-readable YAML config." } },
+    .toml = dap.Enum{},
+    .plain = dap.Enum{ .help = .{ .text = "Plain text.", .i18n = "" } },
+};
+
+test "checks: collectI18n records enumeration branch origins" {
+    const norm = comptime normalize(withBuiltinHelp(.{
+        .mode = dap.Flag(dap.Enumeration(I18nModeEnum)){},
+    }));
+    const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
+
+    // Only `json` declares both a key and help; `yaml` has no key, `toml` has
+    // no help, and `plain`'s empty key means "no translation".
+    try std.testing.expectEqual(@as(usize, 1), origins.len);
+    try std.testing.expectEqualStrings("mode_json", origins[0].key);
+    try std.testing.expectEqualStrings("Machine-readable JSON output.", origins[0].literal);
+    try std.testing.expectEqualStrings("mode.json", origins[0].field);
+
+    comptime checkI18nKeys(origins);
+}
+
+test "checks: a keyless enumeration is reusable in two fields" {
+    const Mode = dap.Enumeration(.{
+        .json = dap.Enum{ .help = .{ .text = "JSON." } },
+        .yaml = dap.Enum{},
+    });
+    const norm = comptime normalize(withBuiltinHelp(.{
+        .a = dap.Flag(Mode){},
+        .b = dap.Flag(Mode){},
+    }));
+    const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), origins.len);
+    comptime checkI18nKeys(origins);
+}
+
+test "checks: the removed shell builtin keys are ordinary user keys" {
+    const norm = comptime normalize(withBuiltinHelp(.{
+        .a = dap.Flag(u8){ .i18n = "builtin_bash_shell" },
+        .b = dap.Flag(u8){ .i18n = "builtin_zsh_shell" },
+        .c = dap.Flag(u8){ .i18n = "builtin_fish_shell" },
+    }));
+    const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
+    try std.testing.expectEqual(@as(usize, 3), origins.len);
+    comptime checkI18nKeys(origins);
+}
+
+test "checks: checkI18nKeys rejects duplicate branch keys in one enumeration" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .mode = dap.Flag(dap.Enumeration(.{
+                .json = dap.Enum{ .help = .{ .text = "JSON.", .i18n = "same_key" } },
+                .yaml = dap.Enum{ .help = .{ .text = "YAML.", .i18n = "same_key" } },
+            })){},
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+test "checks: checkI18nKeys rejects a keyed enumeration reused in two fields" {
+    if (false) {
+        const Mode = dap.Enumeration(.{
+            .json = dap.Enum{ .help = .{ .text = "JSON.", .i18n = "mode_json" } },
+        });
+        const norm = normalize(withBuiltinHelp(.{
+            .a = dap.Flag(Mode){},
+            .b = dap.Flag(Mode){},
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+test "checks: checkI18nKeys rejects an invalid branch key" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .mode = dap.Flag(dap.Enumeration(.{
+                .json = dap.Enum{ .help = .{ .text = "JSON.", .i18n = "bad-key" } },
+            })){},
+        }));
+        comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+test "checks: checkI18nKeys rejects a branch key colliding with builtin_help" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .mode = dap.Flag(dap.Enumeration(.{
+                .json = dap.Enum{ .help = .{ .text = "JSON.", .i18n = "builtin_help" } },
+            })){},
         }));
         comptime checkI18nKeys(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
     }

@@ -94,9 +94,9 @@ optional flag. Declaration order determines `View` field order and positional ar
   `false`, and a direct default of `true` is a compile error. Use a negative long name defaulting to `false` to express
   "on by default".
 - `.i18n` names a translation for `.help`: a field-name-shaped identifier (`[_A-Za-z][_0-9A-Za-z]*`, ASCII, non-empty)
-  that is unique across the whole declaration tree and never one of `builtin_help`, `builtin_bash_shell`,
-  `builtin_zsh_shell` or `builtin_fish_shell`. `App.i18n` and `CommandMeta.i18n` participate. Without a registered
-  locale the declaration's generated English locale resolves the key to the same `.help` literal.
+  that is unique across the whole declaration tree and never `builtin_help`. `App.i18n`, `CommandMeta.i18n` and
+  enumeration branch keys participate. Without a registered locale the declaration's generated English locale resolves
+  the key to the same `.help` literal.
 
 Long flags accept `--name value` and `--name=value`. Short flags are always explicit through `.short` and accept
 `-s value` and `-s=value`.
@@ -119,6 +119,9 @@ pub fn Flag(comptime T: type) type
 
 A non-boolean flag consumes one value. A boolean flag consumes no value.
 
+Write `help` as a sentence ending with a period. Keep the existing punctuation when the text already ends with `!`, `?`,
+`...`, a Unicode ellipsis (`…`), or a Unicode/full-width period (`。`, `．`); Simplified Chinese uses `。`.
+
 ### 3.3 `Argument(T)`
 
 ```zig
@@ -135,7 +138,7 @@ pub fn Argument(comptime T: type) type
 | `completion` | `?Completion.Predictor`                      | `null`              | Completion value source.                   |
 
 Arguments fill positional slots in declaration order. Only the last declared argument may carry a default. An argument
-without a default is required. Optional arguments are not supported.
+without a default is required. Optional arguments are not supported. The `help` punctuation rule from §3.2 applies.
 
 ### 3.4 `Default(T)` and `defaultValue`
 
@@ -339,8 +342,11 @@ A missing method, or an unsupported type, is a compile error.
 
 ```zig
 pub const Enum = struct {
-    name: ?String = null,        // wire name; defaults to the field name
-    completion_help: String = "", // shell completion description; never localized
+    name: ?String = null, // wire name; defaults to the field name
+    help: ?struct {
+        text: String,         // default-locale literal
+        i18n: ?String = null, // optional translation key
+    } = null,
 };
 
 pub fn Enumeration(comptime branches: anytype) type
@@ -350,6 +356,7 @@ pub fn Enumeration(comptime branches: anytype) type
 const Mode = dap.Enumeration(.{
     .fast = dap.Enum{},
     .slow = dap.Enum{ .name = "glacial" },
+    .json = dap.Enum{ .help = .{ .text = "Machine-readable JSON output.", .i18n = "mode_json" } },
 });
 ```
 
@@ -358,10 +365,20 @@ The result is a value type with:
 - `view`: a Zig enum with one tag per branch, defaulting to the first branch;
 - `EnumView`: the enum type;
 - `names`: the wire names in declaration order;
-- `helps`: the branch `completion_help` strings in declaration order;
+- `helps`: the declared branch texts in declaration order, as `[n]?String`;
+- `help_i18n`: the declared branch translation keys in declaration order, as `[n]?String`;
 - `decode`, `encode`, `deinit` satisfying §4.2.
 
-`Enum` has no i18n field: completion never localizes. Its `completion_help` is used only by the shell emitters.
+`helps[i]` is `null` only when the branch declares no help; an explicitly empty text stays a non-null empty slice.
+`help_i18n[i]` is `null` when the branch has no help or its help has no key, and an empty key means "no translation".
+A key cannot exist without the `help` pair that owns it. Help rendering resolves a keyed branch through the selected
+locale (`error.UnknownTranslationKey` when missing) and interpolates the possible values into the page as §8.3
+describes. Completion reads `helps[i]` only (`orelse ""`), never `help_i18n`, and never localizes.
+
+A branch must be a struct with `name` and `help` fields, and a non-null `help` must carry a `text` field; otherwise it
+is `@compileError("enumeration branch '...' must be a dap.Enum")`. Duplicate wire names are a compile error. An empty
+`Enumeration` is degenerate: it has `decode`/`encode`/`deinit` only, no `names`/`helps`/`help_i18n`, and rejects every
+token; consumers detect the arrays with `@hasDecl`. Completion predictors are not allowed on `Enumeration` targets.
 
 Use it like any other value type:
 
@@ -371,9 +388,6 @@ Use it like any other value type:
 },
 // --mode glacial -> cli.mode.view == Mode.EnumView.slow
 ```
-
-Duplicate wire names are a compile error. An empty `Enumeration` is degenerate: it has `decode`/`encode`/`deinit` only
-and rejects every token. Completion predictors are not allowed on `Enumeration` targets.
 
 ---
 
@@ -542,13 +556,56 @@ Group
 ```
 
 - Short and long names occupy aligned sub-columns. A value placeholder is `=DEFAULT` when a direct default exists,
-  otherwise `=NAME` in upper case.
+  `=$NAME` when only an environment default exists, and `=NAME` in upper case otherwise.
 - Flag groups are ordered by name, with the ungrouped bucket first.
 - Required flags render as `--name` or `--name=VALUE`; optional booleans render as `[--flag]`; positional arguments
-  render as `<arg>` or `[<arg>]` when defaulted.
+  render as `<arg>` or `[<arg>]` when they have any default, including an environment-only one.
 - Optional (`?T`) flags are listed in the flags section but omitted from the usage header.
+- In the usage header, a value-taking flag with a default is omitted from the required list, a bool flag with any
+  default is omitted entirely, and `[flags]` appears when at least one flag has a default.
 - `Alt` flags are not listed individually in the usage line. Each `Alt` renders one alternation clause, for example
   `(--file=FILE | --url=URL)`.
+
+An enumeration's branches are rendered after the help text. Let `left_size` be the widest left column in the section
+among rows narrower than 30; the right column starts at `H = 2 + left_size + 4` and is constant within a section. The
+value block never participates in `left_size`, and all widths are measured before highlight codes are inserted. A row
+with a left column of 30 or more moves its right content to a continuation line at the same `H`.
+
+Single-line form: at most four branches, none declaring help.
+
+```text
+  -f, --format=json      Output format. Possible values: json, yaml, toml.
+```
+
+- The clause starts after the help text, or directly at `H` with no leading space when the help text is empty. A row
+  whose left column overflowed starts the clause on the continuation line.
+- The label is `meta.possible_values`, the names follow in declaration order joined by `, `, and the clause ends with
+  exactly one ASCII `.`. Zero branches print no clause.
+
+Column form: more than four branches, or at least one declaring help (the declaration decides, never a translation).
+
+```text
+  -f, --format=json      Output format.
+                           Possible values:
+                             json  - Machine-readable JSON output.
+                             yaml  - Human-readable YAML config.
+```
+
+- The label line is `meta.possible_values` with trailing whitespace trimmed, at `H + 2`; each branch is a line at
+  `H + 4`. The names column is as wide as the longest name in the block, including branches that print no help.
+- A branch whose declared help resolves to empty, whether unkeyed or translated, prints only its name, with no `- ` and
+  no trailing spaces. There is no trailing period anywhere in the block.
+- When the row's help text is empty and it has no default clause, the row ends at the left column and the block
+  follows.
+- `Group` members and `Alt` branch flags take the same path. An empty `Enumeration` prints nothing.
+
+An argument adds a default clause in either form: the `meta.default_value` label, the value highlighted `flags_value`,
+and one ASCII `.`. For an enumeration argument the order is default then values, separated by one space, for example
+`Output mode. Default value: json. Possible values: json, yaml.` A non-enumeration argument prints only the default
+clause; an argument without a default prints only its values. An environment-only default renders as `$NAME`.
+
+Branch names in the values clause and the value in the default clause are highlighted `flags_value`; labels,
+separators, padding and branch help stay `plain`.
 
 ### 8.4 Context-sensitive help
 
@@ -581,6 +638,11 @@ Flags:
 
 ```zig
 pub const HelpData = struct {
+    pub const Value = struct {
+        name: String,  // wire name
+        help: ?String, // declared literal, or null
+        i18n: ?String, // declared key, or null
+    };
     pub const Flag = struct {
         name: String,
         short: ?String,
@@ -591,12 +653,14 @@ pub const HelpData = struct {
         alt_branch: ?String = null,
         optional: bool = false,
         i18n: ?String = null, // translation key for `help`
+        values: []Value = &.{},
     };
     pub const Argument = struct {
         name: String,
         help: String,
         default: ?String,
         i18n: ?String = null, // translation key for `help`
+        values: []Value = &.{},
     };
     pub const FlagGroup = struct { name: ?String, flags: []Flag };
     pub const ArgGroup = struct { name: ?String, args: []Argument };
@@ -631,6 +695,12 @@ the outer arrays for those slices. `error_text` is borrowed and is used by the f
 `info_i18n` are duplicated by `helpData`, owned by `HelpData` and freed by `deinit`; `renderCompact` resolves them
 through the passed locale.
 
+`values` holds an enumeration's branches in declaration order. It is empty for non-enumeration types and for an empty
+`Enumeration`. `Value.help == null` means the branch declared no help, while `help = ""` means help was declared with
+an empty literal; the renderer keeps that distinction to pick the layout before consulting a locale. The slice, its
+names, and its non-null `help`/`i18n` strings are duplicated by `helpData` and freed by `deinit`. Because `usage_alts`
+shallow copies `Flag`, its `values` slices stay owned by `flag_groups` and are never freed through `usage_alts`.
+
 ### 8.6 Highlighting
 
 `App.help_renderer.highlight` selects `flat`, `bold` (default), `color`, or `custom` with a `HelpHighlight` scheme.
@@ -656,9 +726,10 @@ pub const I18n = struct {
         pub const Meta = struct {
             usage: String, flags: String, cmds: String, args: String,
             cmds_placeholder: String, flags_placeholder: String,
+            possible_values: String, default_value: String, // both end with a space
         };
         pub const Builtin = struct {
-            help: String, bash_shell: String, zsh_shell: String, fish_shell: String,
+            help: String,
         };
         pub const Diag = struct {
             field_invalid: String, token_invalid: String, message: String, did_you_mean: String,
@@ -702,9 +773,9 @@ pub const I18n = struct {
 - The default locale is generated per declaration from the `.help` literals plus the private English structural
   template. There is no `I18n.en`, no `I18n.Translations` type, no `build` step and no fallback locale. `helpText`
   always renders this default; `usage(view)` uses the selected locale carried by the view.
-- `Locale.withUser(user_map)` replaces the user map with `builtin_help`, `builtin_bash_shell`, `builtin_zsh_shell`,
-  `builtin_fish_shell` (seeded from the template) plus the struct's fields. Field names are validated as keys; a
-  builtin collision is a compile error. Extra fields are allowed, so one template can serve several declarations.
+- `Locale.withUser(user_map)` replaces the user map with `builtin_help` (seeded from the template) plus the struct's
+  fields. Field names are validated as keys; a builtin collision is a compile error. Extra fields are allowed, so one
+  template can serve several declarations.
 - `Builder.init(default, required)` seeds `""` with the default locale and copies the required keys.
   `Builder.append(lang, locale)` is comptime and rejects an empty or duplicate tag, an invalid locale (`Locale.validate`
   checks non-empty `Meta`/`Builtin` and the exact `Diag` placeholder counts) and any missing required key, all at the
@@ -713,9 +784,11 @@ pub const I18n = struct {
   another encoding, `C` or `POSIX`. `tagFromEnviron` reads the first non-empty of `LC_ALL`, `LC_MESSAGES`, `LANG`;
   non-POSIX targets return `null`. Lookup tries the exact tag (`ru_RU`), the language (`ru`), then `""`.
 - The prefilled set is `ru`, `zh`, `es`, `it`, `fr`, `de`, `ko`, `ja`. Tags are the caller's choice: the Japanese
-  template is `ja` but is normally appended as `ja_JP` (and optionally also `ja`). `Meta` supplies headings and
-  placeholders, `Builtin` the four builtin pairs, and `Diag` the four diagnostic templates (one `{s}` for `field_invalid`,
-  `token_invalid` and `message`; two for `did_you_mean`).
+  template is `ja` but is normally appended as `ja_JP` (and optionally also `ja`). `Meta` supplies headings,
+  placeholders and the `possible_values`/`default_value` labels (each includes its own trailing space), `Builtin` only
+  the `builtin_help` pair, and `Diag` the four diagnostic templates (one `{s}` for `field_invalid`, `token_invalid`
+  and `message`; two for `did_you_mean`). `Locale.validate` requires every `Meta` and `Builtin` field to be non-empty,
+  so a user-written locale literal must supply the two new `Meta` fields.
 - `CLI.i18n()` seeds the builder with `CLI.default_locale` under `""` and `CLI.i18n_keys`; it is a compile error on a
   non-root namespace. `CLI.default_locale` remains available for callers that intentionally render the declaration
   default.
@@ -733,8 +806,8 @@ var cli = try CLI.parse(allocator, environ, &i18n, args, &diag);
 
 ## 10. Completion
 
-Completion is never localized. It reads each `dap.Enum`'s `completion_help` only; no locale is threaded through the
-handle, the emitters or the route. The three shell labels exist only as inert data in the prefilled templates.
+Completion is never localized. It reads each `dap.Enumeration` result's `helps[i]` (the branch `help.text`,
+`orelse ""`) and ignores `help_i18n`; no locale is threaded through the handle, the emitters or the route.
 
 ### 10.1 Handle
 
@@ -949,8 +1022,10 @@ The following are compile errors:
 - An `Alt` with zero branches, duplicate tags, a non-flag member, a defaulted member, or an optional member.
 - Declaring a field named `help` with `.long = "help"` (the builtin already owns it).
 - A completion predictor on a `bool` or `Enumeration` target.
-- An i18n key that is not `[_A-Za-z][_0-9A-Za-z]*`, repeats anywhere in the declaration tree, or equals one of the four
-  builtin keys.
+- An enumeration branch that is not `dap.Enum`-shaped (missing `name`/`help`, or a non-null `help` without `text`), or a
+  duplicate enumeration wire name.
+- An i18n key that is not `[_A-Za-z][_0-9A-Za-z]*`, repeats anywhere in the declaration tree (enumeration branch keys
+  included), or equals `builtin_help`.
 - A `Locale` or `withUser` map with an invalid key or a builtin collision; a malformed `Diag` template.
 - `Builder.append` with an empty or duplicate locale tag, an invalid locale, or a missing required key.
 - `Compose.shift` with an empty or malformed prefix.

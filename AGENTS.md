@@ -10,12 +10,12 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` (both test roots),
-`zig test src/dap.zig` (346 tests), `zig test src/compose.zig` (368 tests,
+`zig test src/dap.zig` (374 tests), `zig test src/compose.zig` (396 tests,
 including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) and
-`zig test src/i18n.zig` (7 tests) pass. Runtime help and diagnostics are
+`zig test src/i18n.zig` (8 tests) pass. Runtime help and diagnostics are
 localizable: a declaration names translations by i18n key, `parse` selects a
 locale from the environment through a comptime builder, and the selected
-locale travels in the `View`. The milestone-tagged M1–M26 blocks are the plan
+locale travels in the `View`. The milestone-tagged M1–M27 blocks are the plan
 of record; there is no `PLAN.md`.
 
 - `src/dap.zig` holds the DSL, spec normalization, `generate`,
@@ -81,10 +81,12 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   `SuggestValid`, `Suggest`, `Diag`, `HelpData`, `HelpError`, `I18n`) come
   first.
 - The private compact-help scaffolding (`HelpStyle`, `HelpSegment`, `HelpRow`,
-  `HelpSection`, `helpStyleCode`, `helpSegmentsWidth`, the `appendHelpStyled`/
-  `appendHelpSegments`/`appendFlagUsage` family, `upperDup`), the file-private
+  `HelpSection`, `HelpValue`, `helpStyleCode`, `helpSegmentsWidth`, the
+  `appendHelpStyled`/`appendHelpSegments`/`appendFlagUsage`/`appendDefaultClause`/
+  `appendValuesClause`/`appendValuesBlock`/`appendSpaces` family,
+  `fillRowsValues`, `hasDeclaredHelp`, `upperDup`), the file-private
   `HelpData` free helpers (`freeFlag`/`freeFlags`/`freeFlagGroups`/
-  `freeArguments`/`freeArgGroups`/`freeCommands`), the scope-merge family
+  `freeArguments`/`freeArgGroups`/`freeCommands`/`freeValues`), the scope-merge family
   (`emptyHelpData`, `sameGroupName`, `absorbScope`, `isBuiltinHelp`,
   `dedupeBuiltinHelp`, `appendActiveScopes`, `contextHelpText`) and the
   builtin-help injection helpers (`builtin_help_field`, `BuiltinHelp`,
@@ -158,6 +160,11 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   operates on types, not runtime values.
 - Public doc comments (`///`) carry usage examples written as fenced Zig code
   inside the comments — keep this pattern when adding API surface.
+- Help literals in examples are sentences ending with a period, except when
+  they already end with `!`, `?`, `...`, a Unicode ellipsis (`…`), or a
+  Unicode/full-width period (`。`, `．`). Simplified Chinese uses `。` rather
+  than an ASCII dot. README states the same rule; tests and fixtures keep
+  their existing punctuation.
 - Custom value types must provide three public methods to be usable:
   `pub fn decode(allocator: std.mem.Allocator, data: []const u8) DecodeError!Self`
   (a static constructor returning a fully built value, so types with internal
@@ -170,6 +177,20 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   encode-only struct is a `@compileError` via `isDecodable`. Builtin numeric
   types and `[]const u8` (aliased as `dap.String`) work out of the box, as do
   `Enumeration` results (both `Enumeration` shapes carry a no-op `deinit`).
+- `Enumeration(.{...})` builds a value type from `dap.Enum` branches. `Enum`
+  holds a `name` override (wire name, defaulting to the declaration field) and
+  an optional `help` pair: `help.text` is the default-locale literal and
+  `help.i18n` an optional translation key; a key cannot exist without its
+  pair. A branch must be struct-shaped with `name` and `help` (and `text` on a
+  non-null `help`), otherwise
+  `@compileError("enumeration branch '...' must be a dap.Enum")`; duplicate
+  wire names are rejected. A non-empty result exposes `names`, `helps`
+  (`[n]?String`) and `help_i18n` (`[n]?String`) in declaration order.
+  `helps[i]` is null only when help was not declared; an empty literal stays
+  non-null, an empty key means "no translation", and a missing key is
+  `error.UnknownTranslationKey` at render time. The empty `Enumeration`
+  exposes none of the arrays (consumers use `@hasDecl`). Help renders branch
+  values inline or as a block; completion reads `helps` only.
 - The generated `View` owns every field it stores: a `deinit` method on the
   generated namespace (`CLI.deinit(&view, allocator)`) frees string slices,
   calls a custom type's `deinit`, recurses into optionals, releases only the
@@ -339,9 +360,9 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   locale maps `builtin_help` to the injected flag's own help literal.
 - i18n keys are field-name-shaped (`[_A-Za-z][_0-9A-Za-z]*`, ASCII,
   non-empty), unique across the whole declaration tree, and must not equal
-  `builtin_help`, `builtin_bash_shell`, `builtin_zsh_shell` or
-  `builtin_fish_shell`. `App.i18n` participates, so the app description key
-  cannot double as a flag key. `Group` display names have no i18n channel.
+  `builtin_help`. `App.i18n` participates, so the app description key
+  cannot double as a flag key; enumeration branch keys participate too, with
+  origins read as `app:mode.fast`. `Group` display names have no i18n channel.
   `generate` runs `checks.collectI18n` right after `normalizeRanked`, beside
   `checkGlobalFlagNames`, then `checkI18nKeys`; a violation is a
   `@compileError` naming the key and both paths. A command's
@@ -357,7 +378,9 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   for a configured locale. A declaration with nothing registered renders
   byte-identically to the old English output.
 - `I18n.Locale` and `I18n.Builder` are immutable comptime values.
-  `Locale.withUser` replaces the user map with the four builtin pairs from
+  `Meta` requires `possible_values` and `default_value` (each including its
+  trailing space) and `Builtin` holds only `help`, so `Locale.withUser`
+  replaces the user map with the single `builtin_help` pair from
   that template plus the anonymous struct's fields; every field name is
   syntax-checked and a builtin name is rejected. `Builder.init` seeds `""` ->
   default and copies the required keys; `Builder.append(lang, locale)` is
@@ -377,8 +400,15 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   the app's `HelpRendererHighlight` scheme, the i18n keys (`Flag.i18n`,
   `Argument.i18n`, `CommandInfo.i18n`, `info_i18n`) and fills `usage_alts`
   (one `HelpData.Usage` per `Alt`, its branch flag slices aliasing entries
-  owned by `flag_groups`). Keys are duplicated, so `deinit` frees them and
-  `absorbScope` moves `info_i18n` beside `info`. `helpText` renders via the
+  owned by `flag_groups`). An enumeration's branches are duplicated into a
+  `values: []HelpData.Value` slice (wire name, nullable literal, nullable
+  key) on its `Flag` or `Argument`; non-enumerations and the empty
+  `Enumeration` get `&.{}`. `renderDefault` renders the direct default,
+  `$NAME` for an environment-only default, and `null` otherwise, so usage
+  lines bracket such arguments and omit defaulted flags. Keys, value
+  strings and the slices are duplicated, so `deinit` frees them and
+  `absorbScope` moves `info_i18n` beside `info`; `usage_alts` never frees
+  `values`. `helpText` renders via the
   file-private `renderHelpWithStyle(style, locale, allocator, data)`, which
   dispatches on `App.help_renderer.style` (`.compact` →
   `HelpData.renderCompact(locale, allocator)`, `.custom` → the user function
@@ -388,7 +418,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   headings/placeholders come from `locale.meta`; named `Group` headings stay
   literal. `renderCompact` renders a kong-style two-column layout inline,
   applying the scheme after all column widths have been measured on the raw
-  text. `HelpError` is `Allocator.Error || I18n.Error`. Nothing help-related
+  text. Enumeration values print as a single "Possible values: a, b." clause
+  when a row has at most four branches and none declares help, otherwise as
+  a block at `H + 2`/`H + 4` with names padded to the longest branch, no
+  trailing dot, and branch help resolved per locale; `H` is
+  `2 + left_size + 4` and the block never widens the left column. Arguments
+  also print a `Default value: <value>.` clause in both forms. Branch names
+  and default values are highlighted `flags_value`. `HelpError` is
+  `Allocator.Error || I18n.Error`. Nothing help-related
   runs unless one of those is called.
 - Help is *context-sensitive*. A `-h`/`--help` anywhere in the active command
   chain is detected by `helpRequested` (a comptime walk of the View command
@@ -458,11 +495,9 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   the block) for the `.compact` renderer, and otherwise prints the block
   standalone (`printDiagnosticsStandalone`); a failed render or diagnostic
   build falls back to the standalone lines so diagnostics are never lost.
-- Completion stays unlocalized. `dap.Enum` carries only `completion_help`
-  (renamed from `help`, no `i18n` field); shell emitters read that value from
-  each enumeration branch and never thread a locale. Completion's own shell
-  labels use the `builtin_bash_shell`/`builtin_zsh_shell`/
-  `builtin_fish_shell` keys only as inert data in the prefilled templates.
+- Completion stays unlocalized. Shell emitters read each enumeration branch's
+  literal `help.text` (`Enumeration.helps[i] orelse ""`) and never touch
+  `help_i18n` or thread a locale.
 - Completion is lazy, model-driven and split across two files.
   `CLI.completion(allocator, app_name, shell)` (beside
   `helpData`/`helpText`/`usage`) builds a `CLI.Completion` handle without
@@ -504,7 +539,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   (`--long` primary, `-short` alias) and one per command (primary wire name,
   synonym alias; empty and `-`-leading spellings are dropped), plus
   `completionArgumentEntries` for a positional slot (enumeration wire names,
-  deduplicated, carrying the `completion_help` declared on each value's own
+  deduplicated, carrying the literal `help.text` declared on each value's own
   `dap.Enum` branch, not the argument's help). Ordering is family first
   (normal, version, help; family is classified from the primary spelling:
   `help`/`--help`/lone `-h`, `version`/`--version`/lone `-v`), then help

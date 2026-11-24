@@ -24,8 +24,8 @@ const PREDICTOR_SCRIPT_ZSH = "../predictor.zsh";
 const PREDICTOR_SCRIPT_FISH = "../predictor.fish";
 
 const Mode = dap.Enumeration(.{
-    .red = dap.Enum{ .completion_help = "Red." },
-    .green = dap.Enum{ .completion_help = "Green." },
+    .red = dap.Enum{ .help = .{ .text = "Red." } },
+    .green = dap.Enum{ .help = .{ .text = "Green." } },
 });
 
 const CLI = dap.generate(dap.App{
