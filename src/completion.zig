@@ -25,6 +25,7 @@ const Group = dap.Group;
 const Alt = dap.Alt;
 const Command = dap.Command;
 const CommandMeta = dap.CommandMeta;
+const I18n = dap.I18n;
 const generate = dap.generate;
 
 /// Public completion surface: shell selection, render errors, and the lazy
@@ -124,26 +125,28 @@ pub const Completion = struct {
     /// Lazily rendered shell completion script for the declaration `NS`.
     ///
     /// `generate` specializes this type as `CLI.Completion`, and `CLI.completion`
-    /// builds one from an allocator, the registered app name, and a shell.
-    /// Construction is cheap and infallible; `text`, `show`, and `install` render
-    /// the script on demand, so a bad app name surfaces as `error.InvalidAppName`
-    /// from those methods rather than from the constructor.
+    /// builds one from an allocator, the registered app name, a shell, and the
+    /// locale whose translations supply the static descriptions. Construction is
+    /// cheap and infallible; `text`, `show`, and `install` render the script on
+    /// demand, so a bad app name surfaces as `error.InvalidAppName` from those
+    /// methods rather than from the constructor.
     pub fn Of(comptime NS: type) type {
         return struct {
             allocator: std.mem.Allocator,
             app_name: String,
             shell: Completion.Shell,
+            locale: *const I18n.Locale,
 
             /// Render the script. The caller owns the returned string and frees
             /// it with the same allocator.
             ///
             /// ```
-            /// var completion = CLI.completion(arena.allocator(), "app", .zsh);
+            /// var completion = CLI.completion(arena.allocator(), "app", .zsh, &CLI.default_locale);
             /// const script = try completion.text();
             /// defer arena.allocator().free(script);
             /// ```
             pub fn text(self: @This()) Completion.Error!String {
-                return completionScript(self.allocator, NS, self.app_name, self.shell);
+                return completionScript(self.allocator, NS, self.app_name, self.shell, self.locale);
             }
 
             /// Render the script and write it to stdout.
@@ -171,7 +174,7 @@ pub const Completion = struct {
             /// found.
             ///
             /// ```
-            /// var completion = CLI.completion(arena.allocator(), "app", .bash);
+            /// var completion = CLI.completion(arena.allocator(), "app", .bash, &CLI.default_locale);
             /// try completion.install(init.io, init.minimal.environ);
             /// ```
             pub fn install(self: @This(), io: std.Io, environ: std.process.Environ) !void {
@@ -390,6 +393,35 @@ fn enumWireHelp(comptime T: type, comptime name: String) String {
         }
         return "";
     }
+}
+
+/// Translation key declared on the enumeration value spelled `name`, or `null`
+/// when the type carries no matching key. An empty key is reported as `null`:
+/// it means "no translation", matching the declaration rule.
+fn enumWireHelpKey(comptime T: type, comptime name: String) ?String {
+    comptime {
+        if (@typeInfo(T) != .@"struct") return null;
+        if (!@hasDecl(T, "names") or !@hasDecl(T, "help_i18n")) return null;
+        if (T.names.len != T.help_i18n.len) return null;
+        for (T.names, T.help_i18n) |nm, key| {
+            if (!std.mem.eql(u8, nm, name)) continue;
+            const k = key orelse return null;
+            return if (k.len == 0) null else k;
+        }
+        return null;
+    }
+}
+
+/// Display text of a help entry in `locale`: a non-empty key resolves through
+/// the locale, everything else uses the literal. The result is borrowed from
+/// the locale or from the declaration. A missing key cannot happen because
+/// `I18n.Builder.append` rejects a locale that omits a required key at
+/// comptime.
+fn completionHelp(locale: *const I18n.Locale, key: ?String, literal: String) String {
+    if (key) |k| {
+        if (k.len != 0) return locale.require(k) catch unreachable;
+    }
+    return literal;
 }
 
 /// Whether `app_name` is a safe registered command name: non-empty ASCII from
@@ -669,10 +701,13 @@ const CompletionEntryFamily = enum { normal, version, help };
 /// One row of the completion model: a flag, a command, or one argument value.
 /// `spelling` is the primary spelling (`--long`, command name, or value name);
 /// `alias` is the short flag or command synonym when the declaration has one.
+/// `help` is the default-locale literal and `help_i18n` its optional
+/// translation key; ordering always reads the literal.
 const CompletionEntry = struct {
     spelling: String,
     alias: ?String,
     help: String,
+    help_i18n: ?String = null,
     kind: CompletionEntryKind,
     family: CompletionEntryFamily,
 };
@@ -764,6 +799,7 @@ fn completionFlagEntries(comptime level: Level) []const CompletionEntry {
                 .spelling = spelling,
                 .alias = alias,
                 .help = s.help,
+                .help_i18n = s.i18n,
                 .kind = .flag,
                 .family = completionFamily(spelling),
             }};
@@ -783,6 +819,7 @@ fn completionCommandEntries(comptime level: Level) []const CompletionEntry {
                 .spelling = spellings[0],
                 .alias = if (spellings.len == 2) spellings[1] else null,
                 .help = c.Cmd.cmd_meta.help,
+                .help_i18n = c.Cmd.cmd_meta.i18n,
                 .kind = .command,
                 .family = completionFamily(spellings[0]),
             }};
@@ -815,6 +852,7 @@ fn completionArgumentEntries(comptime level: Level, comptime slot: usize) []cons
                 .spelling = name,
                 .alias = null,
                 .help = enumWireHelp(spec.vtype, name),
+                .help_i18n = enumWireHelpKey(spec.vtype, name),
                 .kind = .argument,
                 .family = .normal,
             }};
@@ -861,6 +899,7 @@ fn completionSpellingEntries(comptime entries: []const CompletionEntry) []const 
                 .spelling = entry.spelling,
                 .alias = null,
                 .help = entry.help,
+                .help_i18n = entry.help_i18n,
                 .kind = entry.kind,
                 .family = entry.family,
             };
@@ -870,6 +909,7 @@ fn completionSpellingEntries(comptime entries: []const CompletionEntry) []const 
                     .spelling = alias,
                     .alias = null,
                     .help = entry.help,
+                    .help_i18n = entry.help_i18n,
                     .kind = entry.kind,
                     .family = entry.family,
                 }};
@@ -988,10 +1028,12 @@ fn enumSpellings(comptime T: type, comptime prefix: String) []const String {
     }
 }
 
-/// One completion candidate with its display description.
+/// One completion candidate with its display description. `help` is the
+/// default-locale literal, `help_i18n` its optional translation key.
 const CompletionCandidate = struct {
     spelling: String,
     help: String,
+    help_i18n: ?String = null,
 };
 
 /// Enumeration values of `T` prefixed by `prefix`, in ASCII order, each
@@ -1004,6 +1046,7 @@ fn enumCandidates(comptime T: type, comptime prefix: String) []const CompletionC
             cands = cands ++ &[_]CompletionCandidate{.{
                 .spelling = prefix ++ name,
                 .help = enumWireHelp(T, name),
+                .help_i18n = enumWireHelpKey(T, name),
             }};
         }
         return cands;
@@ -1023,16 +1066,18 @@ fn appendZshFnName(
 }
 
 /// Append the `cands`/`displays` pair for `cands` and the `compadd` call that
-/// consumes them. Candidates carrying help are aligned to the widest spelling,
-/// separated from it by `  -- ` and listed one per line (`-V '' -l`), so the
-/// descriptions form a column instead of packing into the terminal width. A
-/// candidate with empty help displays as itself; when no candidate carries help
-/// (enumeration values) the list stays packed in columns.
+/// consumes them. Descriptions are resolved through `locale`. Candidates
+/// carrying help are aligned to the widest spelling, separated from it by
+/// `  -- ` and listed one per line (`-V '' -l`), so the descriptions form a
+/// column instead of packing into the terminal width. A candidate with empty
+/// help displays as itself; when no candidate carries help (enumeration
+/// values) the list stays packed in columns.
 fn appendZshCandidates(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     indent: String,
     cands: []const CompletionCandidate,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!void {
     if (cands.len == 0) {
         try out.appendSlice(allocator, indent);
@@ -1044,7 +1089,7 @@ fn appendZshCandidates(
     var any_help = false;
     for (cands) |c| {
         if (c.spelling.len > width) width = c.spelling.len;
-        if (c.help.len != 0) any_help = true;
+        if (completionHelp(locale, c.help_i18n, c.help).len != 0) any_help = true;
     }
 
     try out.appendSlice(allocator, indent);
@@ -1059,7 +1104,8 @@ fn appendZshCandidates(
     try out.appendSlice(allocator, "displays=(");
     for (cands, 0..) |c, i| {
         if (i != 0) try out.append(allocator, ' ');
-        if (c.help.len == 0) {
+        const help = completionHelp(locale, c.help_i18n, c.help);
+        if (help.len == 0) {
             try appendQuoted(out, allocator, c.spelling, .posix);
         } else {
             var display: std.ArrayList(u8) = .empty;
@@ -1068,7 +1114,7 @@ fn appendZshCandidates(
             var pad = width - c.spelling.len;
             while (pad > 0) : (pad -= 1) try display.append(allocator, ' ');
             try display.appendSlice(allocator, "  -- ");
-            try appendSanitized(&display, allocator, c.help);
+            try appendSanitized(&display, allocator, help);
             try appendQuoted(out, allocator, display.items, .posix);
         }
     }
@@ -1107,6 +1153,7 @@ fn appendZshRowsHelper(
     allocator: std.mem.Allocator,
     ident: String,
     comptime levels: []const Level,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!void {
     try appendZshFnName(out, allocator, ident, "_rows() {\n");
     try out.appendSlice(allocator,
@@ -1140,7 +1187,12 @@ fn appendZshRowsHelper(
         try out.appendSlice(allocator, ")\n        help=(");
         for (rows, 0..) |row, i| {
             if (i != 0) try out.append(allocator, ' ');
-            try appendQuotedSanitized(out, allocator, row.entry.help, .posix);
+            try appendQuotedSanitized(
+                out,
+                allocator,
+                completionHelp(locale, row.entry.help_i18n, row.entry.help),
+                .posix,
+            );
         }
         try out.appendSlice(allocator, ")\n        kind=(");
         for (rows) |row| try out.print(allocator, " {}", .{@backingInt(row.entry.kind)});
@@ -1835,6 +1887,7 @@ fn completionScript(
     comptime NS: type,
     app_name: String,
     shell: Completion.Shell,
+    locale: *const I18n.Locale,
 ) Completion.Error!String {
     if (!isValidCompletionAppName(app_name)) return error.InvalidAppName;
     const ident = try completionIdent(allocator, app_name);
@@ -1844,9 +1897,9 @@ fn completionScript(
     const levels = comptime model_value.levels;
     const bindings = comptime model_value.bindings;
     return switch (shell) {
-        .bash => emitBash(allocator, levels, bindings, ident, app_name),
-        .zsh => emitZsh(allocator, levels, bindings, ident, app_name),
-        .fish => emitFish(allocator, levels, bindings, ident, app_name),
+        .bash => emitBash(allocator, levels, bindings, ident, app_name, locale),
+        .zsh => emitZsh(allocator, levels, bindings, ident, app_name, locale),
+        .fish => emitFish(allocator, levels, bindings, ident, app_name, locale),
     };
 }
 
@@ -2023,7 +2076,9 @@ fn emitBash(
     comptime bindings: []const Binding,
     ident: String,
     app_name: String,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!String {
+    _ = locale;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -2414,6 +2469,7 @@ fn emitZsh(
     comptime bindings: []const Binding,
     ident: String,
     app_name: String,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!String {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2431,7 +2487,7 @@ fn emitZsh(
     }
     try out.appendSlice(allocator, "    esac\n    return 1\n}\n\n");
 
-    try appendZshRowsHelper(&out, allocator, ident, levels);
+    try appendZshRowsHelper(&out, allocator, ident, levels, locale);
 
     if (bindings.len != 0) {
         try appendZshDynamicHelper(&out, allocator, ident);
@@ -2552,16 +2608,16 @@ fn emitZsh(
                     try out.appendSlice(allocator, "            case \"$vform\" in\n");
 
                     try out.appendSlice(allocator, "            eq)\n");
-                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, "="));
+                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, "="), locale);
                     try out.appendSlice(allocator, "                ;;\n");
 
                     const full_prefix = comptime std.fmt.comptimePrint("{s}=", .{arm.spelling});
                     try out.appendSlice(allocator, "            full)\n");
-                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, full_prefix));
+                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, full_prefix), locale);
                     try out.appendSlice(allocator, "                ;;\n");
 
                     try out.appendSlice(allocator, "            *)\n");
-                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, ""));
+                    try appendZshCandidates(&out, allocator, "                ", comptime enumCandidates(arm.vtype, ""), locale);
                     try out.appendSlice(allocator, "                ;;\n");
 
                     try out.appendSlice(allocator, "            esac\n            return\n");
@@ -2710,16 +2766,18 @@ fn appendFishWords(
 }
 
 /// Append `cands` as fish candidate lines, `candidate<TAB>description` when a
-/// value carries help and bare words otherwise.
+/// value carries help and bare words otherwise. Descriptions are resolved
+/// through `locale`.
 fn appendFishCandidates(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     indent: String,
     cands: []const CompletionCandidate,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!void {
     var any_help = false;
     for (cands) |c| {
-        if (c.help.len != 0) any_help = true;
+        if (completionHelp(locale, c.help_i18n, c.help).len != 0) any_help = true;
     }
     if (!any_help) {
         var words: std.ArrayList(String) = .empty;
@@ -2730,8 +2788,9 @@ fn appendFishCandidates(
 
     for (cands) |c| {
         if (!fishWordIsRepresentable(c.spelling)) continue;
+        const help = completionHelp(locale, c.help_i18n, c.help);
         try out.appendSlice(allocator, indent);
-        if (c.help.len == 0) {
+        if (help.len == 0) {
             try out.appendSlice(allocator, "printf '%s\\n' ");
             try appendQuoted(out, allocator, c.spelling, .fish);
         } else {
@@ -2741,7 +2800,7 @@ fn appendFishCandidates(
             var desc: std.ArrayList(u8) = .empty;
             defer desc.deinit(allocator);
             try desc.appendSlice(allocator, "-- ");
-            try appendSanitized(&desc, allocator, c.help);
+            try appendSanitized(&desc, allocator, help);
             try appendQuoted(out, allocator, desc.items, .fish);
         }
         try out.append(allocator, '\n');
@@ -2766,6 +2825,7 @@ fn fishRows(comptime level: Level) []const CompletionRow {
                             .spelling = row.entry.spelling,
                             .alias = null,
                             .help = row.entry.help,
+                            .help_i18n = row.entry.help_i18n,
                             .kind = row.entry.kind,
                             .family = row.entry.family,
                         },
@@ -2779,6 +2839,7 @@ fn fishRows(comptime level: Level) []const CompletionRow {
                             .spelling = alias,
                             .alias = null,
                             .help = row.entry.help,
+                            .help_i18n = row.entry.help_i18n,
                             .kind = row.entry.kind,
                             .family = row.entry.family,
                         },
@@ -2814,6 +2875,7 @@ fn appendFishRowsHelper(
     allocator: std.mem.Allocator,
     ident: String,
     comptime levels: []const Level,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!void {
     try out.appendSlice(allocator, "function ");
     try appendFishFnName(out, allocator, ident, "_rows\n");
@@ -2852,7 +2914,12 @@ fn appendFishRowsHelper(
         try out.appendSlice(allocator, "\n        set help");
         for (rows) |row| {
             try out.append(allocator, ' ');
-            try appendQuotedSanitized(out, allocator, row.entry.help, .fish);
+            try appendQuotedSanitized(
+                out,
+                allocator,
+                completionHelp(locale, row.entry.help_i18n, row.entry.help),
+                .fish,
+            );
         }
         try out.appendSlice(allocator, "\n        set kind");
         for (rows) |row| try out.print(allocator, " {}", .{@backingInt(row.entry.kind)});
@@ -3117,6 +3184,7 @@ fn emitFish(
     comptime bindings: []const Binding,
     ident: String,
     app_name: String,
+    locale: *const I18n.Locale,
 ) std.mem.Allocator.Error!String {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3146,7 +3214,7 @@ fn emitFish(
         \\
     );
 
-    try appendFishRowsHelper(&out, allocator, ident, levels);
+    try appendFishRowsHelper(&out, allocator, ident, levels, locale);
 
     if (bindings.len != 0) {
         try appendFishDynamicHelper(&out, allocator, ident);
@@ -3273,12 +3341,12 @@ fn emitFish(
                         \\                case full
                         \\
                     );
-                    try appendFishCandidates(&out, allocator, "                    ", full);
+                    try appendFishCandidates(&out, allocator, "                    ", full, locale);
                     try out.appendSlice(allocator,
                         \\                case '*'
                         \\
                     );
-                    try appendFishCandidates(&out, allocator, "                    ", bare);
+                    try appendFishCandidates(&out, allocator, "                    ", bare, locale);
                     try out.appendSlice(allocator,
                         \\                end
                         \\                return
@@ -4011,7 +4079,7 @@ test "M19: invalid app name allocates nothing" {
     };
     for (invalid) |name| {
         var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-        try std.testing.expectError(error.InvalidAppName, M19.completion(fa.allocator(), name, .bash).text());
+        try std.testing.expectError(error.InvalidAppName, M19.completion(fa.allocator(), name, .bash, &M19.default_locale).text());
         try std.testing.expectEqual(@as(usize, 0), fa.allocations);
     }
 }
@@ -4019,7 +4087,7 @@ test "M19: invalid app name allocates nothing" {
 test "M19: valid app names are accepted" {
     const valid = [_]String{ "app", "my-app", "a.b_c+d", "A9" };
     for (valid) |name| {
-        const script = try M19.completion(std.testing.allocator, name, .bash).text();
+        const script = try M19.completion(std.testing.allocator, name, .bash, &M19.default_locale).text();
         defer std.testing.allocator.free(script);
         try std.testing.expect(script.len > 0);
     }
@@ -4049,11 +4117,11 @@ test "M19: install writes completion scripts under XDG homes" {
     defer block.deinit(std.testing.allocator);
     const environ: std.process.Environ = .{ .block = block };
 
-    var completion = M19.completion(std.testing.allocator, "my-app", .bash);
+    var completion = M19.completion(std.testing.allocator, "my-app", .bash, &M19.default_locale);
     try completion.install(std.testing.io, environ);
-    completion = M19.completion(std.testing.allocator, "my-app", .zsh);
+    completion = M19.completion(std.testing.allocator, "my-app", .zsh, &M19.default_locale);
     try completion.install(std.testing.io, environ);
-    completion = M19.completion(std.testing.allocator, "my-app", .fish);
+    completion = M19.completion(std.testing.allocator, "my-app", .fish, &M19.default_locale);
     try completion.install(std.testing.io, environ);
 
     const cases = [_]struct { shell: Completion.Shell, path: []const u8 }{
@@ -4070,7 +4138,7 @@ test "M19: install writes completion scripts under XDG homes" {
         );
         defer std.testing.allocator.free(installed);
 
-        const expected = try M19.completion(std.testing.allocator, "my-app", case.shell).text();
+        const expected = try M19.completion(std.testing.allocator, "my-app", case.shell, &M19.default_locale).text();
         defer std.testing.allocator.free(expected);
         try std.testing.expectEqualStrings(expected, installed);
     }
@@ -4095,7 +4163,7 @@ test "M19: install falls back to HOME" {
     defer block.deinit(std.testing.allocator);
     const environ: std.process.Environ = .{ .block = block };
 
-    try M19.completion(std.testing.allocator, "tool", .fish).install(std.testing.io, environ);
+    try M19.completion(std.testing.allocator, "tool", .fish, &M19.default_locale).install(std.testing.io, environ);
 
     const installed = try tmp.dir.readFileAlloc(
         std.testing.io,
@@ -4114,15 +4182,15 @@ test "M19: install needs a home directory" {
     const environ: std.process.Environ = .{ .block = .empty };
     try std.testing.expectError(
         error.InstallUnsupported,
-        M19.completion(std.testing.allocator, "tool", .zsh).install(std.testing.io, environ),
+        M19.completion(std.testing.allocator, "tool", .zsh, &M19.default_locale).install(std.testing.io, environ),
     );
 }
 
 test "M19: determinism and one trailing newline" {
     inline for (.{ Completion.Shell.bash, Completion.Shell.zsh, Completion.Shell.fish }) |shell| {
-        const a = try M19.completion(std.testing.allocator, "my-app", shell).text();
+        const a = try M19.completion(std.testing.allocator, "my-app", shell, &M19.default_locale).text();
         defer std.testing.allocator.free(a);
-        const b = try M19.completion(std.testing.allocator, "my-app", shell).text();
+        const b = try M19.completion(std.testing.allocator, "my-app", shell, &M19.default_locale).text();
         defer std.testing.allocator.free(b);
 
         try std.testing.expectEqualStrings(a, b);
@@ -4134,7 +4202,7 @@ test "M19: determinism and one trailing newline" {
 
 test "M19: shell dispatch picks the matching registration" {
     inline for (.{ Completion.Shell.bash, Completion.Shell.zsh, Completion.Shell.fish }) |shell| {
-        const script = try M19.completion(std.testing.allocator, "tool", shell).text();
+        const script = try M19.completion(std.testing.allocator, "tool", shell, &M19.default_locale).text();
         defer std.testing.allocator.free(script);
 
         switch (shell) {
@@ -4155,19 +4223,19 @@ test "M19: shell dispatch picks the matching registration" {
 }
 
 test "M19: identifier and registration use app_name, not App.name" {
-    const bash = try M19.completion(std.testing.allocator, "my-app", .bash).text();
+    const bash = try M19.completion(std.testing.allocator, "my-app", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(bash);
     try std.testing.expect(std.mem.indexOf(u8, bash, "_dap_my_app() {\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, bash, "complete -o default -F _dap_my_app 'my-app'\n"));
     try std.testing.expect(std.mem.indexOf(u8, bash, "'m19'") == null);
 
-    const zsh_script = try M19.completion(std.testing.allocator, "my.app", .zsh).text();
+    const zsh_script = try M19.completion(std.testing.allocator, "my.app", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(zsh_script);
     try std.testing.expect(std.mem.startsWith(u8, zsh_script, "#compdef my.app\n"));
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "_my_app() {\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdef _my_app 'my.app'\n") != null);
 
-    const fish_script = try M19.completion(std.testing.allocator, "my-app", .fish).text();
+    const fish_script = try M19.completion(std.testing.allocator, "my-app", .fish, &M19.default_locale).text();
     defer std.testing.allocator.free(fish_script);
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "function __dap_my_app_complete\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, fish_script, "complete -c 'my-app' -f -a '(__dap_my_app_complete)' -k\n"));
@@ -4181,7 +4249,7 @@ test "M19: every generated namespace exposes completion" {
             m19Expect(@hasDecl(NS, "completion"), "completion missing");
             m19Expect(@hasDecl(NS, "Completion"), "Completion missing");
             m19Expect(@TypeOf(NS.completion) ==
-                fn (std.mem.Allocator, String, Completion.Shell) NS.Completion, "completion signature");
+                fn (std.mem.Allocator, String, Completion.Shell, *const I18n.Locale) NS.Completion, "completion signature");
             m19Expect(@TypeOf(NS.Completion.text) ==
                 fn (NS.Completion) Completion.Error!String, "text signature");
         }
@@ -4200,13 +4268,13 @@ test "M19: completion is root-only" {
     // rejects the call in its body, not in the forwarded alias.
     // comptime {
     //     const run_level = commandNodes(M19)[1];
-    //     _ = run_level.completion(std.testing.allocator, "m19", .bash);
+    //     _ = run_level.completion(std.testing.allocator, "m19", .bash, &M19.default_locale);
     // }
     // error: dap.completion: call it on the root namespace, got 'm19 run'
 }
 
 test "M19: skeletons carry one level marker per level" {
-    const script = try M19.completion(std.testing.allocator, "app", .bash).text();
+    const script = try M19.completion(std.testing.allocator, "app", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const markers = [_]String{
@@ -4271,7 +4339,7 @@ test "M19: value flag spellings" {
 }
 
 test "M19: bash candidates by level" {
-    const script = try M19.completion(std.testing.allocator, "tool", .bash).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4316,7 +4384,7 @@ test "M19: bash candidates by level" {
 }
 
 test "M19: bash enumeration value positions" {
-    const script = try M19.completion(std.testing.allocator, "tool", .bash).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4337,7 +4405,7 @@ test "M19: bash enumeration value positions" {
 }
 
 test "M19: bash non-enum and empty enumeration value positions" {
-    const big_script = try M19Big.completion(std.testing.allocator, "tool", .bash).text();
+    const big_script = try M19Big.completion(std.testing.allocator, "tool", .bash, &M19Big.default_locale).text();
     defer std.testing.allocator.free(big_script);
 
     const root = m19LevelBlock(big_script, 0);
@@ -4375,14 +4443,14 @@ test "M19: bash non-enum and empty enumeration value positions" {
         .arguments = &.{},
         .commands = &.{},
     }};
-    const empty_script = try emitBash(std.testing.allocator, &empty_levels, &.{}, "x", "app");
+    const empty_script = try emitBash(std.testing.allocator, &empty_levels, &.{}, "x", "app", &M19.default_locale);
     defer std.testing.allocator.free(empty_script);
     try std.testing.expect(std.mem.indexOf(u8, empty_script, "        '--e')\n            return\n            ;;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, empty_script, "case \"$vform\"") == null);
 }
 
 test "M19: bash value flag table" {
-    const script = try M19Big.completion(std.testing.allocator, "tool", .bash).text();
+    const script = try M19Big.completion(std.testing.allocator, "tool", .bash, &M19Big.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const start = std.mem.indexOf(u8, script, "_dap_tool_value_flag() {\n") orelse return error.TestUnexpectedResult;
@@ -4408,7 +4476,7 @@ test "M19: bash value flag table" {
 }
 
 test "M19: bash literal terminator" {
-    const script = try M19.completion(std.testing.allocator, "tool", .bash).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "        if [[ $tok == '--' ]]; then\n            literal=1\n") != null);
@@ -4450,7 +4518,7 @@ test "M19: bash quotes candidates as shell literals" {
         .commands = &weird_commands,
     }};
 
-    const script = try emitBash(std.testing.allocator, &weird_levels, &.{}, "weird", "app");
+    const script = try emitBash(std.testing.allocator, &weird_levels, &.{}, "weird", "app", &M19.default_locale);
     defer std.testing.allocator.free(script);
 
     const want =
@@ -4466,7 +4534,7 @@ test "M19: bash quotes candidates as shell literals" {
 }
 
 test "M19: zsh candidates by level" {
-    const script = try M19.completion(std.testing.allocator, "tool", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4509,7 +4577,7 @@ test "M19: zsh candidates by level" {
 }
 
 test "M19: zsh registers merged aliases as hidden matches" {
-    const script = try M19.completion(std.testing.allocator, "tool", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(
@@ -4531,7 +4599,7 @@ test "M19: zsh registers merged aliases as hidden matches" {
 }
 
 test "M19: zsh enumeration value positions" {
-    const script = try M19.completion(std.testing.allocator, "tool", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4564,7 +4632,7 @@ test "M19: zsh enumeration value positions" {
 }
 
 test "M19: zsh non-enum value positions return non-zero" {
-    const script = try M19Big.completion(std.testing.allocator, "tool", .zsh).text();
+    const script = try M19Big.completion(std.testing.allocator, "tool", .zsh, &M19Big.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4582,7 +4650,7 @@ test "M19: zsh non-enum value positions return non-zero" {
 }
 
 test "M19: zsh value flag table" {
-    const script = try M19Big.completion(std.testing.allocator, "tool", .zsh).text();
+    const script = try M19Big.completion(std.testing.allocator, "tool", .zsh, &M19Big.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const start = std.mem.indexOf(u8, script, "_tool_value_flag() {\n") orelse return error.TestUnexpectedResult;
@@ -4608,7 +4676,7 @@ test "M19: zsh value flag table" {
 }
 
 test "M19: zsh literal terminator returns before dispatch" {
-    const script = try M19.completion(std.testing.allocator, "tool", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "        if [[ $tok == '--' ]]; then\n            literal=1\n") != null);
@@ -4620,7 +4688,7 @@ test "M19: zsh literal terminator returns before dispatch" {
 }
 
 test "M19: zsh header, locals, and guard" {
-    const script = try M19.completion(std.testing.allocator, "my-app", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "my-app", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.startsWith(u8, script, "#compdef my-app\n"));
@@ -4630,7 +4698,7 @@ test "M19: zsh header, locals, and guard" {
 }
 
 test "M19: zsh level markers" {
-    const script = try M19.completion(std.testing.allocator, "app", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "app", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const markers = [_]String{
@@ -4678,7 +4746,7 @@ test "M19: zsh quotes candidates and sanitizes descriptions" {
         .commands = &weird_commands,
     }};
 
-    const script = try emitZsh(std.testing.allocator, &weird_levels, &.{}, "weird", "app");
+    const script = try emitZsh(std.testing.allocator, &weird_levels, &.{}, "weird", "app", &M19.default_locale);
     defer std.testing.allocator.free(script);
 
     const want =
@@ -4716,7 +4784,7 @@ test "M19: command synonyms are completion candidates" {
 }
 
 test "M19: bash descends through command synonyms" {
-    const script = try M19Synonym.completion(std.testing.allocator, "tool", .bash).text();
+    const script = try M19Synonym.completion(std.testing.allocator, "tool", .bash, &M19Synonym.default_locale).text();
     defer std.testing.allocator.free(script);
 
     for ([_]String{
@@ -4731,7 +4799,7 @@ test "M19: bash descends through command synonyms" {
 }
 
 test "M19: zsh and fish offer command synonyms" {
-    const zsh = try M19Synonym.completion(std.testing.allocator, "tool", .zsh).text();
+    const zsh = try M19Synonym.completion(std.testing.allocator, "tool", .zsh, &M19Synonym.default_locale).text();
     defer std.testing.allocator.free(zsh);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -4753,7 +4821,7 @@ test "M19: zsh and fish offer command synonyms" {
         try std.testing.expect(std.mem.indexOf(u8, zsh, arm) != null);
     }
 
-    const fish = try M19Synonym.completion(std.testing.allocator, "tool", .fish).text();
+    const fish = try M19Synonym.completion(std.testing.allocator, "tool", .fish, &M19Synonym.default_locale).text();
     defer std.testing.allocator.free(fish);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -4775,7 +4843,7 @@ test "M19: zsh and fish offer command synonyms" {
 }
 
 test "M19: fish candidates by level" {
-    const script = try M19.completion(std.testing.allocator, "tool", .fish).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .fish, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4840,7 +4908,7 @@ test "M19: fish candidates by level" {
 }
 
 test "M19: fish enumeration value positions" {
-    const script = try M19.completion(std.testing.allocator, "tool", .fish).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .fish, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4864,7 +4932,7 @@ test "M19: fish enumeration value positions" {
 }
 
 test "M19: fish non-enum value positions fall back to paths" {
-    const script = try M19Big.completion(std.testing.allocator, "tool", .fish).text();
+    const script = try M19Big.completion(std.testing.allocator, "tool", .fish, &M19Big.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
@@ -4882,7 +4950,7 @@ test "M19: fish non-enum value positions fall back to paths" {
 }
 
 test "M19: fish value flag table" {
-    const script = try M19Big.completion(std.testing.allocator, "tool", .fish).text();
+    const script = try M19Big.completion(std.testing.allocator, "tool", .fish, &M19Big.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const start = std.mem.indexOf(u8, script, "function __dap_tool_value_flag\n") orelse
@@ -4902,7 +4970,7 @@ test "M19: fish value flag table" {
 }
 
 test "M19: fish literal terminator and file fallback" {
-    const script = try M19.completion(std.testing.allocator, "tool", .fish).text();
+    const script = try M19.completion(std.testing.allocator, "tool", .fish, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "        if test \"$tok\" = '--'\n            set literal 1\n") != null);
@@ -4965,7 +5033,7 @@ test "M19: fish quotes candidates and skips unrepresentable names" {
         .commands = &weird_commands,
     }};
 
-    const script = try emitFish(std.testing.allocator, &weird_levels, &.{}, "weird", "app");
+    const script = try emitFish(std.testing.allocator, &weird_levels, &.{}, "weird", "app", &M19.default_locale);
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(
@@ -4988,7 +5056,7 @@ test "M19: fish quotes candidates and skips unrepresentable names" {
 }
 
 test "M19: short enum spelling" {
-    const bash = try M19Short.completion(std.testing.allocator, "tool", .bash).text();
+    const bash = try M19Short.completion(std.testing.allocator, "tool", .bash, &M19Short.default_locale).text();
     defer std.testing.allocator.free(bash);
     const bash_root = m19LevelBlock(bash, 0);
     const bash_want =
@@ -5020,7 +5088,7 @@ test "M19: short enum spelling" {
     const bash_helper = bash[bash_helper_at..];
     try std.testing.expect(std.mem.indexOf(u8, bash_helper, "    '--level') return 0 ;;\n    '-l') return 0 ;;\n") != null);
 
-    const zsh = try M19Short.completion(std.testing.allocator, "tool", .zsh).text();
+    const zsh = try M19Short.completion(std.testing.allocator, "tool", .zsh, &M19Short.default_locale).text();
     defer std.testing.allocator.free(zsh);
     const zsh_root = m19LevelBlock(zsh, 0);
     const zsh_want =
@@ -5081,7 +5149,7 @@ test "M19: short enum spelling" {
             "        ka=( 3 18 )\n",
     ) != null);
 
-    const fish = try M19Short.completion(std.testing.allocator, "tool", .fish).text();
+    const fish = try M19Short.completion(std.testing.allocator, "tool", .fish, &M19Short.default_locale).text();
     defer std.testing.allocator.free(fish);
     const fish_root = m19LevelBlock(fish, 0);
     const fish_want =
@@ -5131,17 +5199,17 @@ test "M19: empty enumeration value positions" {
         .commands = &.{},
     }};
 
-    const bash = try emitBash(std.testing.allocator, &empty_levels, &.{}, "x", "app");
+    const bash = try emitBash(std.testing.allocator, &empty_levels, &.{}, "x", "app", &M19.default_locale);
     defer std.testing.allocator.free(bash);
     try std.testing.expect(std.mem.indexOf(u8, bash, "        '--e')\n            return\n            ;;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, bash, "case \"$vform\"") == null);
 
-    const zsh = try emitZsh(std.testing.allocator, &empty_levels, &.{}, "x", "app");
+    const zsh = try emitZsh(std.testing.allocator, &empty_levels, &.{}, "x", "app", &M19.default_locale);
     defer std.testing.allocator.free(zsh);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "        '--e')\n            return 1\n            ;;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "case \"$vform\"") == null);
 
-    const fish = try emitFish(std.testing.allocator, &empty_levels, &.{}, "x", "app");
+    const fish = try emitFish(std.testing.allocator, &empty_levels, &.{}, "x", "app", &M19.default_locale);
     defer std.testing.allocator.free(fish);
     try std.testing.expect(std.mem.indexOf(u8, fish, "            case '--e'\n                __fish_complete_path\n                return\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish, "switch $vform") == null);
@@ -5151,9 +5219,9 @@ test "M19: identifier sanitization collisions" {
     // Every byte outside `[A-Za-z0-9_]` maps to `_`, so distinct names can
     // share one function stem. Registration still differs, but sourcing both
     // scripts at once is unsupported; this test pins that documented limit.
-    const a = try M19.completion(std.testing.allocator, "a-b", .bash).text();
+    const a = try M19.completion(std.testing.allocator, "a-b", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(a);
-    const b = try M19.completion(std.testing.allocator, "a_b", .bash).text();
+    const b = try M19.completion(std.testing.allocator, "a_b", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(b);
 
     try std.testing.expect(std.mem.indexOf(u8, a, "_dap_a_b() {\n") != null);
@@ -5161,13 +5229,13 @@ test "M19: identifier sanitization collisions" {
     try std.testing.expect(std.mem.endsWith(u8, a, "complete -o default -F _dap_a_b 'a-b'\n"));
     try std.testing.expect(std.mem.endsWith(u8, b, "complete -o default -F _dap_a_b 'a_b'\n"));
 
-    const zsh = try M19.completion(std.testing.allocator, "a.b", .zsh).text();
+    const zsh = try M19.completion(std.testing.allocator, "a.b", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(zsh);
     try std.testing.expect(std.mem.startsWith(u8, zsh, "#compdef a.b\n"));
     try std.testing.expect(std.mem.indexOf(u8, zsh, "_a_b() {\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, zsh, "compdef _a_b 'a.b'\nfi\n"));
 
-    const fish = try M19.completion(std.testing.allocator, "a+b", .fish).text();
+    const fish = try M19.completion(std.testing.allocator, "a+b", .fish, &M19.default_locale).text();
     defer std.testing.allocator.free(fish);
     try std.testing.expect(std.mem.indexOf(u8, fish, "function __dap_a_b_complete\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, fish, "complete -c 'a+b' -f -a '(__dap_a_b_complete)' -k\n"));
@@ -5179,7 +5247,7 @@ test "M19: out of memory sweep" {
     inline for (.{ Completion.Shell.bash, Completion.Shell.zsh, Completion.Shell.fish }) |shell| {
         const total = blk: {
             var probe = FailingAllocator.init(std.testing.allocator, .{});
-            const script = try M19.completion(probe.allocator(), "m19", shell).text();
+            const script = try M19.completion(probe.allocator(), "m19", shell, &M19.default_locale).text();
             probe.allocator().free(script);
             break :blk probe.allocations;
         };
@@ -5188,7 +5256,7 @@ test "M19: out of memory sweep" {
         var fi: usize = 0;
         while (fi <= total) : (fi += 1) {
             var fa = FailingAllocator.init(std.testing.allocator, .{ .fail_index = fi });
-            if (M19.completion(fa.allocator(), "m19", shell).text()) |script| {
+            if (M19.completion(fa.allocator(), "m19", shell, &M19.default_locale).text()) |script| {
                 fa.allocator().free(script);
             } else |e| {
                 try std.testing.expectEqual(std.mem.Allocator.Error.OutOfMemory, e);
@@ -5199,7 +5267,7 @@ test "M19: out of memory sweep" {
 }
 
 test "M19: bash golden" {
-    const script = try M19.completion(std.testing.allocator, "m19", .bash).text();
+    const script = try M19.completion(std.testing.allocator, "m19", .bash, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
     const want =
         \\_dap_m19_filter() {
@@ -5360,7 +5428,7 @@ test "M19: bash golden" {
 }
 
 test "M19: zsh golden" {
-    const script = try M19.completion(std.testing.allocator, "m19", .zsh).text();
+    const script = try M19.completion(std.testing.allocator, "m19", .zsh, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
     const want =
         \\#compdef m19
@@ -5693,7 +5761,7 @@ test "M19: zsh golden" {
 }
 
 test "M19: fish golden" {
-    const script = try M19.completion(std.testing.allocator, "m19", .fish).text();
+    const script = try M19.completion(std.testing.allocator, "m19", .fish, &M19.default_locale).text();
     defer std.testing.allocator.free(script);
     const want =
         \\function __dap_m19_value_flag
@@ -6198,14 +6266,14 @@ test "M20: value positions stay ASCII sorted and unpartitioned" {
 test "M20: value help reaches zsh and fish candidates" {
     const allocator = std.testing.allocator;
 
-    const zsh = try M20.completion(allocator, "m20", .zsh).text();
+    const zsh = try M20.completion(allocator, "m20", .zsh, &M20.default_locale).text();
     defer allocator.free(zsh);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "--mode=beta") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "-- Beta value.") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "-- Alpha value.") != null);
 
-    const fish = try M20.completion(allocator, "m20", .fish).text();
+    const fish = try M20.completion(allocator, "m20", .fish, &M20.default_locale).text();
     defer allocator.free(fish);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -6967,20 +7035,20 @@ test "M24: route resolves a non-native fs binding" {
 test "M24: native fs arms render shell path completion" {
     const allocator = std.testing.allocator;
 
-    const bash_handle = M24Native.completion(allocator, "m24native", .bash);
+    const bash_handle = M24Native.completion(allocator, "m24native", .bash, &M24Native.default_locale);
     const bash = try bash_handle.text();
     defer allocator.free(bash);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bash, "compopt -o filenames\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bash, "compgen -f -- \"$cur\""));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bash, "compgen -d -- \"$cur\""));
 
-    const zsh_handle = M24Native.completion(allocator, "m24native", .zsh);
+    const zsh_handle = M24Native.completion(allocator, "m24native", .zsh, &M24Native.default_locale);
     const zsh = try zsh_handle.text();
     defer allocator.free(zsh);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, zsh, "            _files\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, zsh, "            _files -/\n"));
 
-    const fish_handle = M24Native.completion(allocator, "m24native", .fish);
+    const fish_handle = M24Native.completion(allocator, "m24native", .fish, &M24Native.default_locale);
     const fish = try fish_handle.text();
     defer allocator.free(fish);
     // One native `.all` arm plus the plain null target, which keeps the
@@ -7275,7 +7343,7 @@ const M26Def = .{
 const M26 = generate(App{ .name = "m26", .help = "M26." }, M26Def);
 
 fn m26Script(allocator: std.mem.Allocator, shell: Completion.Shell) !String {
-    return M26.completion(allocator, "m26", shell).text();
+    return M26.completion(allocator, "m26", shell, &M26.default_locale).text();
 }
 
 test "M26: route-backed flags carry their aligned indices" {
@@ -7432,4 +7500,106 @@ test "M26: launch and call stay inline in every shell" {
         try std.testing.expect(std.mem.indexOf(u8, body, Completion.route_marker) == null);
         try std.testing.expect(std.mem.indexOf(u8, body, "_dynamic") == null);
     }
+}
+const M28Mode = Enumeration(.{
+    .fast = Enum{ .help = .{ .text = "Fast mode.", .i18n = "m28_fast" } },
+    .slow = Enum{ .help = .{ .text = "Slow mode." } },
+    .empty = Enum{ .help = .{ .text = "Empty mode.", .i18n = "" } },
+});
+
+const M28Def = .{
+    .verbose = Flag(bool){ .help = "Verbose.", .i18n = "m28_verbose" },
+    .plain = Flag(bool){ .help = "Plain." },
+    .mode = Flag(M28Mode){ .long = "mode", .help = "Mode.", .i18n = "m28_mode" },
+    .run = Command(.{ .help = "Run.", .i18n = "m28_run" }, .{}),
+};
+
+const M28 = generate(App{ .name = "m28", .help = "M28." }, M28Def);
+
+const m28_ru: I18n.Locale = I18n.ru.withUser(.{
+    .m28_verbose = "Подробный вывод.",
+    .m28_mode = "Режим.",
+    .m28_run = "Запуск.",
+    .m28_fast = "Быстрый режим.",
+});
+
+test "M28: enumeration branch keys are read through help_i18n" {
+    try std.testing.expectEqualStrings("m28_fast", comptime enumWireHelpKey(M28Mode, "fast").?);
+    try std.testing.expectEqual(@as(?String, null), comptime enumWireHelpKey(M28Mode, "slow"));
+    try std.testing.expectEqual(@as(?String, null), comptime enumWireHelpKey(M28Mode, "empty"));
+    try std.testing.expectEqual(@as(?String, null), comptime enumWireHelpKey(M28Mode, "absent"));
+    try std.testing.expectEqual(@as(?String, null), comptime enumWireHelpKey(u8, "fast"));
+    try std.testing.expectEqual(@as(?String, null), comptime enumWireHelpKey(Enumeration(.{}), "fast"));
+}
+
+test "M28: completionHelp prefers a key and treats an empty key as absent" {
+    try std.testing.expectEqualStrings("Режим.", completionHelp(&m28_ru, "m28_mode", "Mode."));
+    try std.testing.expectEqualStrings("Plain.", completionHelp(&m28_ru, null, "Plain."));
+    try std.testing.expectEqualStrings("Plain.", completionHelp(&m28_ru, "", "Plain."));
+}
+
+test "M28: zsh static rows render translated help" {
+    const script = try M28.completion(std.testing.allocator, "m28", .zsh, &m28_ru).text();
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "        help=('Режим.' 'Plain.' 'Подробный вывод.' 'Запуск.' 'Показать справку по контексту.')\n",
+    ) != null);
+    // The translated enumeration value keeps its description; keyless and
+    // empty-keyed branches keep their literals.
+    try std.testing.expect(std.mem.indexOf(u8, script, "Быстрый режим.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Slow mode.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Empty mode.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Fast mode.") == null);
+}
+
+test "M28: fish static rows render translated help" {
+    const script = try M28.completion(std.testing.allocator, "m28", .fish, &m28_ru).text();
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "        set help 'Режим.' 'Plain.' 'Подробный вывод.' 'Запуск.' 'Показать справку по контексту.'\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Быстрый режим.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Slow mode.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Empty mode.") != null);
+}
+
+test "M28: bash output ignores the locale" {
+    const allocator = std.testing.allocator;
+    const localized = try M28.completion(allocator, "m28", .bash, &m28_ru).text();
+    defer allocator.free(localized);
+    const default = try M28.completion(allocator, "m28", .bash, &M28.default_locale).text();
+    defer allocator.free(default);
+
+    try std.testing.expectEqualStrings(default, localized);
+    try std.testing.expect(std.mem.indexOf(u8, localized, "Режим.") == null);
+}
+
+test "M28: the default locale keeps the declaration literals" {
+    const script = try M28.completion(std.testing.allocator, "m28", .zsh, &M28.default_locale).text();
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "        help=('Mode.' 'Plain.' 'Verbose.' 'Run.' 'Show context-sensitive help.')\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Fast mode.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "Режим.") == null);
+}
+
+test "M28: the handle captures the locale for repeatable renders" {
+    const handle = M28.completion(std.testing.allocator, "m28", .zsh, &m28_ru);
+    const a = try handle.text();
+    defer std.testing.allocator.free(a);
+    const b = try handle.text();
+    defer std.testing.allocator.free(b);
+
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(std.mem.indexOf(u8, b, "Режим.") != null);
 }

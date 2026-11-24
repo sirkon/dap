@@ -136,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
                 .bash => .bash,
                 .zsh => .zsh,
                 .fish => .fish,
-            }).show(init.io);
+            }, &CLI.default_locale).show(init.io);
             return;
         },
         .build => |b| std.debug.print("build jobs={d} release={}\n", .{ b.jobs, b.release }),
@@ -163,9 +163,11 @@ from any level, so dispatch can go as deep as the declaration does.
 
 Help follows the entered path: `workspace serve --help` describes `serve` with the root flags merged in, and a failure
 deep in the tree renders that level's page. `CLI.usage(cli)` prints the same page, which is useful when no command was
-given. Completion is generated from the declaration; `CLI.completion(allocator, app_name, shell)` is lazy, and
-`app_name` is the name the script registers, not `App.name`. The route it serves for dynamic values runs at the very
-start of `CLI.parse`, so do file, socket or network work only after parsing.
+given. Completion is generated from the declaration; `CLI.completion(allocator, app_name, shell, locale)` is lazy,
+`app_name` is the name the script registers, not `App.name`, and `locale` selects the language of the static
+descriptions (`i18n.locale(environ)` for the machine's locale, `&CLI.default_locale` for the declaration default).
+The route it serves for dynamic values runs at the very start of `CLI.parse`, so do file, socket or network work only
+after parsing.
 
 ## Internationalization
 
@@ -204,7 +206,8 @@ command handoff, so `-h`/`--help`, the failure page and `CLI.usage(view)` all re
 the declaration default. Passing `null` as the builder selects that same generated default, whose text is the `.help`
 literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`, `ko` and `ja`;
 `withUser` replaces the user map and seeds the `builtin_help` string. A key the selected locale lacks is
-`error.UnknownTranslationKey`, never an English fallback. Shell completion is never localized.
+`error.UnknownTranslationKey`, never an English fallback. Shell completion is localized at generation time: the
+static descriptions of keyed flags, commands, and enumeration values render in the locale handed to `CLI.completion`.
 
 ## Capabilities
 

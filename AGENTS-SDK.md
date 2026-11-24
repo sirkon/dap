@@ -52,7 +52,7 @@ of the public contract:
 | `helpText`       | `fn (alloc) HelpError!String`                                 | Render help with `app.help_renderer.style` and the declaration default locale.    |
 | `helpData`       | `fn (alloc) Allocator.Error!HelpData`                         | Build the plain-data help model. Caller releases it.                              |
 | `usage`          | `fn (anytype) HelpError!void`                                 | Print the context-sensitive page for a `View`, in the locale it carries.          |
-| `completion`     | `fn (alloc, app_name, shell) Completion`                      | Build a lazy completion-script handle. Root level only.                           |
+| `completion`     | `fn (alloc, app_name, shell, locale) Completion`              | Build a lazy completion-script handle. Root level only.                           |
 | `i18n`           | `fn () I18n.Builder`                                          | Root-only builder seeded with the default locale and required keys.               |
 | `default_locale` | `I18n.Locale`                                                 | The generated, complete default locale for this declaration.                      |
 | `i18n_keys`      | `[]const dap.String`                                          | Every key translation must supply, including `builtin_help`.                      |
@@ -373,7 +373,8 @@ The result is a value type with:
 `help_i18n[i]` is `null` when the branch has no help or its help has no key, and an empty key means "no translation".
 A key cannot exist without the `help` pair that owns it. Help rendering resolves a keyed branch through the selected
 locale (`error.UnknownTranslationKey` when missing) and interpolates the possible values into the page as §8.3
-describes. Completion reads `helps[i]` only (`orelse ""`), never `help_i18n`, and never localizes.
+describes. Completion renders a keyed branch through the generation-time locale, with `helps[i] orelse ""` as the
+literal fallback; an empty key means no translation.
 
 A branch must be a struct with `name` and `help` fields, and a non-null `help` must carry a `text` field; otherwise it
 is `@compileError("enumeration branch '...' must be a dap.Enum")`. Duplicate wire names are a compile error. An empty
@@ -806,17 +807,22 @@ var cli = try CLI.parse(allocator, environ, &i18n, args, &diag);
 
 ## 10. Completion
 
-Completion is never localized. It reads each `dap.Enumeration` result's `helps[i]` (the branch `help.text`,
-`orelse ""`) and ignores `help_i18n`; no locale is threaded through the handle, the emitters or the route.
+Static descriptions are localized at generation time. Every entry with an `i18n` key renders through the locale passed
+to `CLI.completion`: flag help (`Spec.i18n`), command help including the injected `--help` (`CommandMeta.i18n`), and
+enumeration value help (`Enumeration.help_i18n`). Entries without a key, and branches whose key is empty, keep their
+declared literal. Bash prints no descriptions, so its script never changes; the hidden route and predictor output stay
+untouched because their text arrives at runtime.
 
 ### 10.1 Handle
 
-`CLI.completion(allocator, app_name, shell)` builds a `CLI.Completion` handle for the whole command tree. Construction
-is infallible and does no work: it takes no `View`, does not parse, does not read the environment, performs no I/O and
-performs no validation.
+`CLI.completion(allocator, app_name, shell, locale)` builds a `CLI.Completion` handle for the whole command tree.
+`locale` is `*const dap.I18n.Locale`, normally `i18n.locale(environ)` from the same builder handed to `parse`, or
+`&CLI.default_locale`. Construction is infallible and does no work: it takes no `View`, does not parse, does not read
+the environment, performs no I/O and performs no validation. The pointer is stored, so every render uses the same
+locale.
 
 ```zig
-var completion = CLI.completion(allocator, "my-app", .zsh);
+var completion = CLI.completion(allocator, "my-app", .zsh, i18n.locale(environ));
 const script = try completion.text();
 defer allocator.free(script);
 ```
@@ -959,7 +965,7 @@ if (CLI.command(cli)) |cmd| switch (cmd) {
             .bash => .bash,
             .zsh => .zsh,
             .fish => .fish,
-        }).show(init.io);
+        }, &CLI.default_locale).show(init.io);
         return;
     },
     else => {},

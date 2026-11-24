@@ -54,7 +54,7 @@ fn writeScripts(tmp: *std.testing.TmpDir) !void {
     };
 
     for (scripts) |entry| {
-        const script = try CLI.completion(std.testing.allocator, APP_NAME, entry.shell).text();
+        const script = try CLI.completion(std.testing.allocator, APP_NAME, entry.shell, &CLI.default_locale).text();
         defer std.testing.allocator.free(script);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
     }
@@ -71,7 +71,7 @@ fn writePredictorFixture(tmp: *std.testing.TmpDir, work: std.Io.Dir) !void {
     };
 
     for (scripts) |entry| {
-        const script = try fixture.CLI.completion(std.testing.allocator, PREDICTOR_APP_NAME, entry.shell).text();
+        const script = try fixture.CLI.completion(std.testing.allocator, PREDICTOR_APP_NAME, entry.shell, &fixture.CLI.default_locale).text();
         defer std.testing.allocator.free(script);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
     }
@@ -461,7 +461,7 @@ fn fishExpectLines(
 test "completion integration: registration uses app_name" {
     const shells = [_]dap.Completion.Shell{ .bash, .zsh, .fish };
     inline for (shells) |shell| {
-        const script = try CLI.completion(std.testing.allocator, APP_NAME, shell).text();
+        const script = try CLI.completion(std.testing.allocator, APP_NAME, shell, &CLI.default_locale).text();
         defer std.testing.allocator.free(script);
 
         switch (shell) {
@@ -493,9 +493,9 @@ test "completion integration: registration uses app_name" {
         }
     }
 
-    const mine = try CLI.completion(std.testing.allocator, APP_NAME, .bash).text();
+    const mine = try CLI.completion(std.testing.allocator, APP_NAME, .bash, &CLI.default_locale).text();
     defer std.testing.allocator.free(mine);
-    const other = try CLI.completion(std.testing.allocator, "other-app", .bash).text();
+    const other = try CLI.completion(std.testing.allocator, "other-app", .bash, &CLI.default_locale).text();
     defer std.testing.allocator.free(other);
 
     try std.testing.expect(std.mem.indexOf(u8, other, "_dap_other_app") != null);

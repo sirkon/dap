@@ -221,11 +221,16 @@ pub fn main(init: std.process.Init) !void {
 
     if (CLI.command(cli)) |cmd| switch (cmd) {
         .completion => |c| {
-            const completion = CLI.completion(arena, "dap-example", switch (c.shell.view) {
-                .bash => .bash,
-                .zsh => .zsh,
-                .fish => .fish,
-            });
+            const completion = CLI.completion(
+                arena,
+                "dap-example",
+                switch (c.shell.view) {
+                    .bash => .bash,
+                    .zsh => .zsh,
+                    .fish => .fish,
+                },
+                translations.locale(init.minimal.environ),
+            );
             try completion.show(init.io);
             return;
         },

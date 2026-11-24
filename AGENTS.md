@@ -10,12 +10,12 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` (both test roots),
-`zig test src/dap.zig` (374 tests), `zig test src/compose.zig` (396 tests,
+`zig test src/dap.zig` (381 tests), `zig test src/compose.zig` (403 tests,
 including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) and
 `zig test src/i18n.zig` (8 tests) pass. Runtime help and diagnostics are
 localizable: a declaration names translations by i18n key, `parse` selects a
 locale from the environment through a comptime builder, and the selected
-locale travels in the `View`. The milestone-tagged M1–M27 blocks are the plan
+locale travels in the `View`. The milestone-tagged M1–M28 blocks are the plan
 of record; there is no `PLAN.md`.
 
 - `src/dap.zig` holds the DSL, spec normalization, `generate`,
@@ -123,11 +123,13 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   `disabled`/`fs`/`launch`/`call`/`custom`, and the lazy `Of(NS)` handle)
   comes first, then the private `Level`/`Binding`/`Model` tables and
   `model`/`modelWalk`/`isNativeFs`/`routeBinding`; entry, row, quoting,
-  install-target and argument-candidate builders; the emitters
+  install-target and argument-candidate builders (`enumWireHelp`,
+  `enumWireHelpKey`, `completionHelp`); the emitters
   (`emitBash`/`emitZsh`/`emitFish` with their native-fs, inline, dynamic and
   slot-predictor helpers); the route (`freeSuggestions`, `renderSuggestions`,
   `fsSuggestions`, `routeSuggestions`, `route`, `routeDiagnose`); then the
-  M19–M26 tests. All completion code lives here.
+  M19–M26 tests and the M28 localization block. All completion code lives
+  here.
 - `src/completion_fixture.zig` — predictor fixture application and its
   declaration; built as an executable by `completion-test`.
 - `src/completion_test.zig` — opt-in shell integration tests (syntax checks,
@@ -190,7 +192,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   non-null, an empty key means "no translation", and a missing key is
   `error.UnknownTranslationKey` at render time. The empty `Enumeration`
   exposes none of the arrays (consumers use `@hasDecl`). Help renders branch
-  values inline or as a block; completion reads `helps` only.
+  values inline or as a block; completion renders each branch's resolved
+  `help_i18n` text with `helps` as the fallback.
 - The generated `View` owns every field it stores: a `deinit` method on the
   generated namespace (`CLI.deinit(&view, allocator)`) frees string slices,
   calls a custom type's `deinit`, recurses into optionals, releases only the
@@ -495,19 +498,32 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   the block) for the `.compact` renderer, and otherwise prints the block
   standalone (`printDiagnosticsStandalone`); a failed render or diagnostic
   build falls back to the standalone lines so diagnostics are never lost.
-- Completion stays unlocalized. Shell emitters read each enumeration branch's
-  literal `help.text` (`Enumeration.helps[i] orelse ""`) and never touch
-  `help_i18n` or thread a locale.
+- Completion is localized at generation time. A fourth mandatory
+  `locale: *const I18n.Locale` argument captures the locale in the handle
+  (alongside allocator, `app_name`, and shell), and every static description
+  with a key resolves through it: `Spec.i18n` on flags, `CommandMeta.i18n` on
+  commands (including the injected `builtin_help`), and `Enumeration.help_i18n`
+  on enumeration branches, read with `enumWireHelpKey`. Entries without a key,
+  and branches whose key is `""`, keep their declared literal. Bash prints no
+  descriptions, so its bytes never change; zsh/fish render the resolved text in
+  their row tables and candidate lists. The caller passes
+  `i18n.locale(environ)` or `&CLI.default_locale`; the handle stores the
+  pointer, so construction still does no work and repeated renders match. A
+  keyed entry whose key is missing from the locale cannot occur (the
+  `I18n.Builder` rejects incomplete locales at comptime), so
+  `Completion.Error` does not grow and resolution treats `require`'s error as
+  `unreachable`. Sorting, phase selection, and the model remain structural and
+  read the literals.
 - Completion is lazy, model-driven and split across two files.
-  `CLI.completion(allocator, app_name, shell)` (beside
+  `CLI.completion(allocator, app_name, shell, locale)` (beside
   `helpData`/`helpText`/`usage`) builds a `CLI.Completion` handle without
-  rendering, validating, or allocating; `app_name` is the only runtime input
-  besides the allocator and shell. The `Completion` public type lives in
-  `completion.zig`; `generate` aliases `Completion.Of(NS)` per namespace and
-  the command shell re-aliases it. Its `text()` validates `app_name` and
-  renders the script (the caller owns and frees the string); `show(io)`
-  renders and writes it to stdout; `install(io, environ)` renders and drops it
-  into the shell's discovery directory (bash under
+  rendering, validating, or allocating; `app_name` and `locale` are the only
+  runtime inputs besides the allocator and shell. The `Completion` public type
+  lives in `completion.zig`; `generate` aliases `Completion.Of(NS)` per
+  namespace and the command shell re-aliases it. Its `text()` validates
+  `app_name` and renders the script (the caller owns and frees the string);
+  `show(io)` renders and writes it to stdout; `install(io, environ)` renders and
+  drops it into the shell's discovery directory (bash under
   `$XDG_DATA_HOME/bash-completion/completions/<app>`, zsh under
   `$XDG_DATA_HOME/zsh/site-functions/_<app>`, fish under
   `$XDG_CONFIG_HOME/fish/completions/<app>.fish`, falling back to
@@ -540,7 +556,9 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   synonym alias; empty and `-`-leading spellings are dropped), plus
   `completionArgumentEntries` for a positional slot (enumeration wire names,
   deduplicated, carrying the literal `help.text` declared on each value's own
-  `dap.Enum` branch, not the argument's help). Ordering is family first
+  `dap.Enum` branch, not the argument's help). Each row also carries the
+  entry's `help_i18n` key; `completionSpellingEntries` and `fishRows` copy it
+  alongside the literal. Ordering is family first
   (normal, version, help; family is classified from the primary spelling:
   `help`/`--help`/lone `-h`, `version`/`--version`/lone `-v`), then help
   presence (rows with help before rows with none), then ASCII spelling.
