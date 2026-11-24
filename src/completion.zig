@@ -2496,6 +2496,7 @@ fn emitZsh(
     try appendZshFnName(&out, allocator, ident, "() {\n");
     try out.appendSlice(allocator,
         \\    emulate -L zsh
+        \\    setopt extendedglob
         \\    local level=0 pos=0 literal=0 vflag= vform=bare i tok end
         \\    local -a cands displays seen
         \\    end=$(( CURRENT - 1 ))
@@ -2653,7 +2654,7 @@ fn emitZsh(
                     }
                     try out.appendSlice(allocator, "            return 0\n");
                 } else {
-                    try out.appendSlice(allocator, "            return 1\n");
+                    try out.appendSlice(allocator, "            _files\n            return 0\n");
                 }
                 try out.appendSlice(allocator, "            ;;\n");
             }
@@ -2676,8 +2677,11 @@ fn emitZsh(
         }
         try out.appendSlice(allocator, "        ");
         try appendZshFnName(&out, allocator, ident, "_rows ");
-        try out.print(allocator, "{} $pos\n", .{level.rank});
-        try out.appendSlice(allocator, "        return\n        ;;\n");
+        try out.print(allocator, "{} $pos", .{level.rank});
+        if (comptime levelHasPlainArgument(level)) {
+            try out.appendSlice(allocator, " || _files");
+        }
+        try out.appendSlice(allocator, "\n        return\n        ;;\n");
     }
     try out.appendSlice(allocator,
         \\    esac
@@ -4566,7 +4570,7 @@ test "M19: zsh candidates by level" {
     // The nested command level has an argument with no values, so the slot
     // case falls through to the flag phase.
     const go_level = m19LevelBlock(script, 2);
-    try std.testing.expect(std.mem.indexOf(u8, go_level, "        _tool_rows 2 $pos\n        return\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_level, "        _tool_rows 2 $pos || _files\n        return\n") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         rows,
@@ -4631,16 +4635,16 @@ test "M19: zsh enumeration value positions" {
     try std.testing.expect(std.mem.indexOf(u8, root, want) != null);
 }
 
-test "M19: zsh non-enum value positions return non-zero" {
+test "M19: zsh non-enum value positions fall back to files" {
     const script = try M19Big.completion(std.testing.allocator, "tool", .zsh, &M19Big.default_locale).text();
     defer std.testing.allocator.free(script);
 
     const root = m19LevelBlock(script, 0);
     const arms = [_]String{
-        "        '--config')\n            return 1\n            ;;\n",
-        "        '--host')\n            return 1\n            ;;\n",
-        "        '--port')\n            return 1\n            ;;\n",
-        "        '--optional')\n            return 1\n            ;;\n",
+        "        '--config')\n            _files\n            return 0\n            ;;\n",
+        "        '--host')\n            _files\n            return 0\n            ;;\n",
+        "        '--port')\n            _files\n            return 0\n            ;;\n",
+        "        '--optional')\n            _files\n            return 0\n            ;;\n",
     };
     for (arms) |arm| try std.testing.expect(std.mem.indexOf(u8, root, arm) != null);
     // Boolean flags never enter a value arm.
@@ -4692,7 +4696,7 @@ test "M19: zsh header, locals, and guard" {
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.startsWith(u8, script, "#compdef my-app\n"));
-    try std.testing.expect(std.mem.indexOf(u8, script, "_my_app() {\n    emulate -L zsh\n    local level=0 pos=0 literal=0 vflag= vform=bare i tok end\n    local -a cands displays seen\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "_my_app() {\n    emulate -L zsh\n    setopt extendedglob\n    local level=0 pos=0 literal=0 vflag= vform=bare i tok end\n    local -a cands displays seen\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "_my_app_rows() {\n    emulate -L zsh\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, script, "if [[ $funcstack[1] == '_my_app' ]]; then\n    _my_app \"$@\"\nelse\n    compdef _my_app 'my-app'\nfi\n"));
 }
@@ -5206,7 +5210,7 @@ test "M19: empty enumeration value positions" {
 
     const zsh = try emitZsh(std.testing.allocator, &empty_levels, &.{}, "x", "app", &M19.default_locale);
     defer std.testing.allocator.free(zsh);
-    try std.testing.expect(std.mem.indexOf(u8, zsh, "        '--e')\n            return 1\n            ;;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh, "        '--e')\n            _files\n            return 0\n            ;;\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh, "case \"$vform\"") == null);
 
     const fish = try emitFish(std.testing.allocator, &empty_levels, &.{}, "x", "app", &M19.default_locale);
@@ -5600,6 +5604,7 @@ test "M19: zsh golden" {
         \\
         \\_m19() {
         \\    emulate -L zsh
+        \\    setopt extendedglob
         \\    local level=0 pos=0 literal=0 vflag= vform=bare i tok end
         \\    local -a cands displays seen
         \\    end=$(( CURRENT - 1 ))
@@ -5744,7 +5749,7 @@ test "M19: zsh golden" {
         \\            return
         \\            ;;
         \\        esac
-        \\        _m19_rows 2 $pos
+        \\        _m19_rows 2 $pos || _files
         \\        return
         \\        ;;
         \\    esac
@@ -7045,7 +7050,9 @@ test "M24: native fs arms render shell path completion" {
     const zsh_handle = M24Native.completion(allocator, "m24native", .zsh, &M24Native.default_locale);
     const zsh = try zsh_handle.text();
     defer allocator.free(zsh);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, zsh, "            _files\n"));
+    // One native `.all` arm plus the plain null target, which calls `_files`
+    // explicitly: a zsh compdef function returning non-zero gets no fallback.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, zsh, "            _files\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, zsh, "            _files -/\n"));
 
     const fish_handle = M24Native.completion(allocator, "m24native", .fish, &M24Native.default_locale);
@@ -7432,11 +7439,11 @@ test "M26: zsh explicit predictors never fall back to files" {
         zsh,
         "        '--off')\n            return 0\n            ;;\n",
     ) != null);
-    // Null targets keep the default completer.
+    // Null targets ask zsh for the default file completer explicitly.
     try std.testing.expect(std.mem.indexOf(
         u8,
         zsh,
-        "        '--plain')\n            return 1\n            ;;\n",
+        "        '--plain')\n            _files\n            return 0\n            ;;\n",
     ) != null);
     // Native mappings call `_files` explicitly.
     try std.testing.expect(std.mem.indexOf(u8, zsh, "'--dirs')\n            _files -/\n            return 0\n") != null);

@@ -769,7 +769,7 @@ test "completion integration: zsh predictors" {
     try zshExpectDisplays(work, "zsh callback eq re-attach", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --cb=al", &.{"--cb=alpha  -- Alpha value."});
     try zshExpectDisplays(work, "zsh disabled stays empty", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --off ''", &.{});
     try zshExpectDisplays(work, "zsh explicit empty no fallback", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --cb zzz", &.{});
-    try zshExpectDisplays(work, "zsh null does not call _files", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --plain ''", &.{});
+    try zshExpectDisplays(work, "zsh null path fallback", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --plain ''", &.{"FILES "});
     try zshExpectDisplays(work, "zsh terminator runs no predictor", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test -- --cb ''", &.{});
     try zshExpectDisplays(work, "zsh inline launch", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --launch ''", &.{"launched"});
     try zshExpectDisplays(work, "zsh inline call", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --call c", &.{ "cone", "ctwo" });

@@ -79,6 +79,11 @@ const def = .{
         .help = "Optional flag.",
         .i18n = "option",
     }),
+    .path = dap.Flag([]const u8){
+        .help = "File path.",
+        .default = dap.defaultValue([]const u8, ""),
+        .completion = .{ .fs = .{} },
+    },
     .flag = dap.Flag(bool){
         .short = "f",
         .help = "Flag to show off in the usage header.",
