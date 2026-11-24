@@ -172,8 +172,8 @@ after parsing.
 ## Internationalization
 
 Help and diagnostics can be rendered in a locale chosen at runtime from the environment. A declaration names a
-translation with `.i18n` (field-name-shaped keys, unique across the whole tree); a caller registers translations with
-`CLI.i18n()` and hands the builder to `parse`:
+translation with `.i18n` (field-name-shaped keys, unique across the whole tree, each owning a unique help literal); a
+caller registers translations with `CLI.i18n()` and hands the builder to `parse`:
 
 ```zig
 const def = .{

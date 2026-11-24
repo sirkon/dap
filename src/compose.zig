@@ -70,9 +70,10 @@ pub const Compose = struct {
     ///
     /// The pair is rejected at comptime when the two inputs collide on a field
     /// name, a long or short flag anywhere in their command trees, a command
-    /// wire name or synonym, or a positional argument display name. Structural
-    /// rules (commands mixed with arguments, a defaulted argument that stops
-    /// being last, `Alt` member restrictions) stay `generate`'s business.
+    /// wire name or synonym, a positional argument display name, or an i18n
+    /// key or the literal value it carries. Structural rules (commands mixed
+    /// with arguments, a defaulted argument that stops being last, `Alt`
+    /// member restrictions) stay `generate`'s business.
     ///
     /// ```
     /// const a = .{ .port = dap.Flag(u16){} };
@@ -649,6 +650,30 @@ test "Compose.concat rejects argument display name clashes" {
     if (false) {
         const a = .{ .src = Argument(String){} };
         const b = .{ .other = Argument(String){ .name = "src" } };
+        comptime _ = Compose.concat(a, b);
+    }
+}
+
+test "Compose.concat accepts distinct i18n keys and values" {
+    const a = .{ .user = Flag(String){ .help = "User.", .i18n = "flag_user" } };
+    const b = .{ .host = Flag(String){ .help = "Host.", .i18n = "flag_host" } };
+    const merged = Compose.concat(a, b);
+    try std.testing.expectEqualStrings("flag_user", merged.user.i18n.?);
+    try std.testing.expectEqualStrings("flag_host", merged.host.i18n.?);
+}
+
+test "Compose.concat rejects an i18n key reused across inputs" {
+    if (false) {
+        const a = .{ .port = Flag(u16){ .help = "Port.", .i18n = "key_port" } };
+        const b = .{ .host = Flag(String){ .help = "Host.", .i18n = "key_port" } };
+        comptime _ = Compose.concat(a, b);
+    }
+}
+
+test "Compose.concat rejects an i18n value reused across inputs" {
+    if (false) {
+        const a = .{ .port = Flag(u16){ .help = "Same.", .i18n = "key_port" } };
+        const b = .{ .host = Flag(String){ .help = "Same.", .i18n = "key_host" } };
         comptime _ = Compose.concat(a, b);
     }
 }

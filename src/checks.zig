@@ -364,6 +364,24 @@ pub fn checkI18nKeys(comptime origins: []const I18nOrigin) void {
     }
 }
 
+/// Pairwise uniqueness of the literal values behind the collected keys: each
+/// i18n key carries its own help literal, and two keys mapping to the same
+/// default-locale value would make the generated entries ambiguous. A field
+/// with no key owns no translation value, so it is exempt; a keyed field must
+/// supply a literal no other keyed field repeats.
+pub fn checkI18nValues(comptime origins: []const I18nOrigin) void {
+    comptime {
+        for (origins, 0..) |a, i| {
+            for (origins[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a.literal, b.literal)) {
+                    @compileError("i18n value '" ++ a.literal ++ "' is used by both '" ++ levelPath(a.path) ++ ":" ++ a.field ++
+                        "' and '" ++ levelPath(b.path) ++ ":" ++ b.field ++ "'");
+                }
+            }
+        }
+    }
+}
+
 /// Whether `s` is a well-formed long flag name: non-empty, no whitespace or
 /// control byte, no `=`, and no leading or trailing `-`. Bytes are otherwise
 /// accepted verbatim (non-ASCII included), matching the fact that `dap` does
@@ -466,6 +484,7 @@ pub fn concatPlan(comptime left: anytype, comptime right: anytype) []const Field
         checkLevelArguments(left, right);
         checkConcatFlags(left, right);
         checkConcatCommands(left, right);
+        checkConcatI18n(left, right);
         return plan;
     }
 }
@@ -746,6 +765,97 @@ fn levelCommandSpellings(comptime def: anytype) []const CommandSpelling {
     }
 }
 
+/// One i18n origin of one input, with the dotted declaration field path that
+/// leads to it. Covers what `collectI18n` covers (flags, arguments, command
+/// metadata, enumeration branches) but walks raw declaration fields, so a
+/// clash message can name both sides precisely.
+const ConcatI18n = struct {
+    key: String,
+    literal: String,
+    path: String,
+};
+
+fn collectConcatI18n(comptime def: anytype, comptime prefix: String, comptime acc: []const ConcatI18n) []const ConcatI18n {
+    comptime {
+        var out = acc;
+        for (fieldsOf(@TypeOf(def))) |f| {
+            out = fieldConcatI18n(f, prefix, out);
+        }
+        return out;
+    }
+}
+
+fn specConcatI18n(comptime s: Spec, comptime path: String, comptime acc: []const ConcatI18n) []const ConcatI18n {
+    comptime {
+        var out = acc;
+        if (s.i18n) |key| {
+            out = out ++ &[_]ConcatI18n{.{ .key = key, .literal = s.help, .path = path }};
+        }
+        const T = s.vtype;
+        if (@typeInfo(T) == .@"struct" and
+            @hasDecl(T, "names") and @hasDecl(T, "helps") and @hasDecl(T, "help_i18n"))
+        {
+            for (T.names, T.helps, T.help_i18n) |name, help, key| {
+                const k = key orelse continue;
+                if (k.len == 0) continue;
+                const literal = help orelse continue;
+                out = out ++ &[_]ConcatI18n{.{ .key = k, .literal = literal, .path = path ++ "." ++ name }};
+            }
+        }
+        return out;
+    }
+}
+
+fn fieldConcatI18n(comptime f: Field, comptime prefix: String, comptime acc: []const ConcatI18n) []const ConcatI18n {
+    comptime {
+        const path = childPath(prefix, f.name);
+        if (f.type == type) {
+            const V = typeOfField(f);
+            switch (V.dap_kind) {
+                .group => return collectConcatI18n(V.group_def, path, acc),
+                .command => {
+                    var out = acc;
+                    if (V.cmd_meta.i18n) |key| {
+                        out = out ++ &[_]ConcatI18n{.{ .key = key, .literal = V.cmd_meta.help, .path = path }};
+                    }
+                    return collectConcatI18n(V.cmd_def, path, out);
+                },
+                .alt => {
+                    var out = acc;
+                    for (fieldsOf(@TypeOf(V.alt_def))) |bf| {
+                        const Bv = @field(V.alt_def, bf.name);
+                        const is_variant = @TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_def");
+                        const Bdef = if (is_variant) Bv.dap_variant_def else Bv;
+                        if (@TypeOf(Bdef) == type) continue;
+                        out = collectConcatI18n(Bdef, childPath(path, bf.name), out);
+                    }
+                    return out;
+                },
+                else => @compileError("unknown type-valued declaration field '" ++ f.name ++ "'"),
+            }
+        }
+        return specConcatI18n(specFromField(f), path, acc);
+    }
+}
+
+/// i18n keys, and the literal values they carry, are declaration-wide
+/// identifiers: merging two inputs may repeat neither, or `generate` would
+/// reject the result without saying which input introduced the duplicate. The
+/// pair is compared here instead so the message names both dotted declaration
+/// paths at the `concat` call site.
+fn checkConcatI18n(comptime left: anytype, comptime right: anytype) void {
+    comptime {
+        const ls = collectConcatI18n(left, "", &.{});
+        const rs = collectConcatI18n(right, "", &.{});
+        for (ls) |a| {
+            for (rs) |b| {
+                if (std.mem.eql(u8, a.key, b.key)) clash("i18n key", a.key, a.path, b.path);
+                if (std.mem.eql(u8, a.literal, b.literal)) clash("i18n value", a.literal, a.path, b.path);
+            }
+        }
+    }
+}
+
 test "checks: valid long names and shift prefixes" {
     try std.testing.expect(validLongName("port"));
     try std.testing.expect(validLongName("dry_run"));
@@ -785,16 +895,16 @@ test "checks: validI18nKey table" {
 }
 
 const I18nTestDef = .{
-    .verbose = dap.Flag(bool){ .i18n = "verbose_flag" },
+    .verbose = dap.Flag(bool){ .help = "Verbose.", .i18n = "verbose_flag" },
     .net = dap.Group(.{
-        .host = dap.Flag(dap.String){ .i18n = "group_host" },
+        .host = dap.Flag(dap.String){ .help = "Host.", .i18n = "group_host" },
     }, "network"),
     .speed = dap.Alt(.{
-        .fast = .{ .fast = dap.Flag(u8){ .i18n = "alt_fast" } },
+        .fast = .{ .fast = dap.Flag(u8){ .help = "Fast.", .i18n = "alt_fast" } },
     }),
     .serve = dap.Command(.{ .help = "Serve.", .i18n = "cmd_serve" }, .{
-        .src = dap.Argument(dap.String){ .i18n = "arg_src" },
-        .inner = dap.Flag(u32){ .i18n = "flag_inner" },
+        .src = dap.Argument(dap.String){ .help = "Source.", .i18n = "arg_src" },
+        .inner = dap.Flag(u32){ .help = "Inner.", .i18n = "flag_inner" },
     }),
 };
 
@@ -814,8 +924,31 @@ test "checks: collectI18n walks the tree once per key" {
     for (origins) |o| try std.testing.expect(!std.mem.eql(u8, o.field, builtin_help_field));
 
     // A command's meta key and the child App key derived from it are one
-    // origin, so the tree's keys are all unique.
+    // origin, so the tree's keys are all unique. Each key also owns its own
+    // literal, so no value is reused either.
     comptime checkI18nKeys(origins);
+    comptime checkI18nValues(origins);
+}
+
+test "checks: checkI18nValues rejects a reused literal" {
+    if (false) {
+        const norm = normalize(withBuiltinHelp(.{
+            .a = dap.Flag(u8){ .help = "Same.", .i18n = "key_one" },
+            .b = dap.Flag(u8){ .help = "Same.", .i18n = "key_two" },
+        }));
+        comptime checkI18nValues(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
+    }
+}
+
+test "checks: a keyless field may share a keyed literal" {
+    const norm = comptime normalize(withBuiltinHelp(.{
+        .a = dap.Flag(u8){ .help = "Same.", .i18n = "key_one" },
+        .b = dap.Flag(u8){ .help = "Same." },
+    }));
+    const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
+    try std.testing.expectEqual(@as(usize, 1), origins.len);
+    comptime checkI18nKeys(origins);
+    comptime checkI18nValues(origins);
 }
 
 test "checks: checkI18nKeys rejects an invalid key" {
@@ -885,13 +1018,14 @@ test "checks: a keyless enumeration is reusable in two fields" {
 
 test "checks: the removed shell builtin keys are ordinary user keys" {
     const norm = comptime normalize(withBuiltinHelp(.{
-        .a = dap.Flag(u8){ .i18n = "builtin_bash_shell" },
-        .b = dap.Flag(u8){ .i18n = "builtin_zsh_shell" },
-        .c = dap.Flag(u8){ .i18n = "builtin_fish_shell" },
+        .a = dap.Flag(u8){ .help = "Bash.", .i18n = "builtin_bash_shell" },
+        .b = dap.Flag(u8){ .help = "Zsh.", .i18n = "builtin_zsh_shell" },
+        .c = dap.Flag(u8){ .help = "Fish.", .i18n = "builtin_fish_shell" },
     }));
     const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
     try std.testing.expectEqual(@as(usize, 3), origins.len);
     comptime checkI18nKeys(origins);
+    comptime checkI18nValues(origins);
 }
 
 test "checks: checkI18nKeys rejects duplicate branch keys in one enumeration" {
