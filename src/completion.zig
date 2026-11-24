@@ -1147,7 +1147,8 @@ fn appendQuotedSanitized(
 /// renders 2- or 3-column displays. Aliases folded into a merged row are also
 /// added as hidden matches (`-n`), so the common prefix spans both spellings
 /// (an empty prefix inserts `-`, not `--`) and menu selection can reach the
-/// alias.
+/// alias. A row whose long spelling matches but whose alias does not drops the
+/// alias completely, so a `--` prefix is never shortened to `-`.
 fn appendZshRowsHelper(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1272,6 +1273,7 @@ fn appendZshRowsHelper(
         \\            kk=${ka[i]}
         \\        elif [[ $s == "$cur"* ]]; then
         \\            eff=$s
+        \\            a=
         \\            kk=${kp[i]}
         \\        else
         \\            continue
@@ -5525,6 +5527,7 @@ test "M19: zsh golden" {
         \\            kk=${ka[i]}
         \\        elif [[ $s == "$cur"* ]]; then
         \\            eff=$s
+        \\            a=
         \\            kk=${kp[i]}
         \\        else
         \\            continue

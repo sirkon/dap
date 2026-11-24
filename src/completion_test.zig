@@ -640,6 +640,9 @@ test "completion integration: zsh" {
         "--verbose  -- Verbose.",
         "--version",
     });
+    try zshExpectDisplays(work, "zsh long-only row hides alias", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test --d", &.{
+        "--description  -- Description of context.",
+    });
     try zshExpectDisplays(work, "zsh empty prefix commands", SCRIPT_ZSH, "_dap_completion_test", "dap-completion-test ''", &.{
         "pick  p  -- Pick.",
         "run      -- Run.",
@@ -666,6 +669,10 @@ test "completion integration: zsh" {
     const stays = try zshTabCompletes(work, "zsh dash prefix stays dash", "dap-completion-test pick red -");
     defer std.testing.allocator.free(stays);
     try std.testing.expectEqualStrings("dap-completion-test pick red -", stays);
+
+    const doubles = try zshTabCompletes(work, "zsh double dash prefix stays", "dap-completion-test --");
+    defer std.testing.allocator.free(doubles);
+    try std.testing.expectEqualStrings("dap-completion-test --", doubles);
 
     const alias = try zshTabCompletes(work, "zsh alias completes", "dap-completion-test pick -d");
     defer std.testing.allocator.free(alias);
