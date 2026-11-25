@@ -1048,7 +1048,8 @@ The following are compile errors:
 - A declaration field that is not a `Flag`, `Argument`, optional flag, `Group`, `Alt` or `Command`.
 - A declaration field name beginning with `_`.
 - Duplicate long names, duplicate short names or duplicate field names within a level.
-- Duplicate flag names anywhere in the command tree, including between sibling commands.
+- Duplicate flag names between a level and any of its ancestors. Sibling commands and unrelated subtrees may reuse a
+  spelling; same-level duplicates are rejected separately.
 - Duplicate command names or synonyms within a level; a command field name colliding with a flag or group member.
 - Mixing commands and positional arguments in one declaration.
 - A non-last argument with a default.
@@ -1081,7 +1082,7 @@ The following are compile errors:
 | Defaults            | Only the last argument may have one.                                                                         |
 | Terminator          | `--` makes the rest literal and stops command handoff.                                                       |
 | Commands            | A command token hands the remaining payload to that level. `command(view)` dispatches; tags are field names. |
-| Flags across levels | A flag missing locally is retried on ancestors; names are globally unique.                                   |
+| Flags across levels | A flag missing locally is retried on ancestors; names are unique along a chain; siblings may reuse.        |
 | `Alt`               | At most one branch active; all members of the active branch are required.                                    |
 | Optional flags      | `?T`, `null` when absent, no defaults, validation skipped when null.                                         |
 | Help                | `-h`/`--help` anywhere bypasses checks, renders the deepest merged page and exits 0.                         |

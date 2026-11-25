@@ -164,10 +164,11 @@ $ workspace completion zsh
 $ workspace serve --help
 ```
 
-The `switch` tags are the declaration field names, not the wire names. Flags are addressable anywhere on the command
-line: `workspace serve --verbose --addr :8080` assigns `--verbose` to the root `View`, so long and short names are
-globally unique across the whole tree and the compiler enforces it. Commands nest, and `CLI.command` accepts a `View`
-from any level, so dispatch can go as deep as the declaration does.
+The `switch` tags are the declaration field names, not the wire names. Flags are addressable anywhere on the active
+command chain: `workspace serve --verbose --addr :8080` assigns `--verbose` to the root `View`, so long and short names
+must be unique along a chain and the compiler enforces it. Sibling commands and unrelated subtrees may each reuse a
+spelling. Commands nest, and `CLI.command` accepts a `View` from any level, so dispatch can go as deep as the
+declaration does.
 
 Help follows the entered path: `workspace serve --help` describes `serve` with the root flags merged in, and a failure
 deep in the tree renders that level's page. `CLI.usage(cli)` prints the same page, which is useful when no command was

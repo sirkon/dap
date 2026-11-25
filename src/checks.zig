@@ -163,7 +163,7 @@ pub fn checkArgumentDefaults(comptime specs: []const Spec) void {
 }
 
 /// One flag discovered somewhere in the declaration tree, together with the
-/// level path it lives at. Drives the global uniqueness check (D6).
+/// level path it lives at. Drives the chain uniqueness check (D6).
 pub const FlagOrigin = struct {
     long: String,
     short: ?String,
@@ -183,19 +183,15 @@ fn levelPath(comptime path: []const String) String {
     }
 }
 
-/// Flatten the whole declaration tree into a table of flag origins, walking
-/// levels through `normalize` exactly as `generate` does (groups and `Alt`
-/// branches flatten into `norm.specs` for free). The injected builtin help
-/// flag and positional arguments are excluded (D6): the builtin is present at
-/// every level by design, and arguments only ever render at the deepest level.
-pub fn collectFlagOrigins(
+/// Long/short flags declared at exactly `norm`'s level, builtin help and
+/// positional arguments excluded, tagged with the level path. `norm.specs`
+/// already flattens `Group` and `Alt` members, so no extra walk is needed.
+fn levelFlagOrigins(
     comptime norm: NormResult,
     comptime path: []const String,
-    comptime acc: []const FlagOrigin,
 ) []const FlagOrigin {
     comptime {
-        @setEvalBranchQuota(1_000_000);
-        var out = acc;
+        var out: []const FlagOrigin = &.{};
         for (norm.specs) |s| {
             if (s.kind != .flag) continue;
             if (std.mem.eql(u8, s.name, builtin_help_field)) continue;
@@ -206,39 +202,44 @@ pub fn collectFlagOrigins(
                 .path = path,
             }};
         }
-        for (norm.commands) |c| {
-            const child = normalize(withBuiltinHelp(c.Cmd.cmd_def));
-            out = collectFlagOrigins(child, path ++ &[_]String{c.name}, out);
-        }
         return out;
     }
 }
 
-/// Pairwise long/short uniqueness over the flattened tree, reporting both
-/// level paths in the message. Flags of every ancestor level merge into a
-/// deep help scope, so a name reused anywhere in the command tree would be
-/// ambiguous; sibling commands are covered too (D6).
-pub fn checkGlobalFlagNames(comptime origins: []const FlagOrigin) void {
+/// Reject a long or short spelling reused between a level and any of its
+/// ancestors. Own-level duplicates stay `checkDuplicates`' job. Sibling
+/// commands and unrelated subtrees may reuse a spelling: their levels are
+/// never comparable, so they can never be active together. Each branch gets
+/// its own `ancestors ++ own` slice, so sibling walks stop sharing state.
+pub fn checkChainFlagNames(
+    comptime norm: NormResult,
+    comptime path: []const String,
+    comptime ancestors: []const FlagOrigin,
+) void {
     comptime {
-        for (origins, 0..) |a, i| {
-            for (origins[i + 1 ..]) |b| {
+        @setEvalBranchQuota(1_000_000);
+        const own = levelFlagOrigins(norm, path);
+        for (ancestors) |a| {
+            for (own) |b| {
                 if (std.mem.eql(u8, a.long, b.long)) {
                     @compileError("duplicate long flag '--" ++ a.long ++ "' at '" ++ levelPath(a.path) ++
-                        "' and '" ++ levelPath(b.path) ++ "'; flag names must be globally unique " ++
-                        "across the command tree (fields '" ++ a.field ++ "' / '" ++ b.field ++ "')");
+                        "' and '" ++ levelPath(b.path) ++ "'; flag names must be unique along a " ++
+                        "command chain (fields '" ++ a.field ++ "' / '" ++ b.field ++ "')");
                 }
-            }
-            if (a.short) |sa| {
-                for (origins[i + 1 ..]) |b| {
+                if (a.short) |sa| {
                     if (b.short) |sb| {
                         if (std.mem.eql(u8, sa, sb)) {
                             @compileError("duplicate short flag '-" ++ sa ++ "' at '" ++ levelPath(a.path) ++
-                                "' and '" ++ levelPath(b.path) ++ "'; flag names must be globally unique " ++
-                                "across the command tree (fields '" ++ a.field ++ "' / '" ++ b.field ++ "')");
+                                "' and '" ++ levelPath(b.path) ++ "'; flag names must be unique along a " ++
+                                "command chain (fields '" ++ a.field ++ "' / '" ++ b.field ++ "')");
                         }
                     }
                 }
             }
+        }
+        for (norm.commands) |c| {
+            const child = normalize(withBuiltinHelp(c.Cmd.cmd_def));
+            checkChainFlagNames(child, path ++ &[_]String{c.name}, ancestors ++ own);
         }
     }
 }
@@ -443,7 +444,8 @@ pub const FieldPlan = struct {
 ///
 /// - flat field names (`normalize`'s specs, so group and `Alt` members are
 ///   covered) and positional argument display names;
-/// - long and short flags over the whole command tree;
+/// - long and short flags along a command chain, computed from command level
+///   paths: a spelling reused by sibling subtrees composes;
 /// - top-level command wire names and synonyms;
 /// - `Alt` branch field names and branch tags inside a merged `Alt`.
 ///
@@ -658,18 +660,26 @@ fn checkLevelArguments(comptime left: anytype, comptime right: anytype) void {
 }
 
 /// One flag of one input, with the dotted declaration field path that leads to
-/// it.
+/// it (for the diagnostic only) and the command wire-name level path (for
+/// comparability). Two flags conflict only when their levels are comparable,
+/// so sibling subtrees may reuse a spelling.
 const ConcatFlag = struct {
     long: String,
     short: ?String,
-    path: String,
+    path: String, // dotted declaration path, for the message only
+    level: []const String, // command wire-name path, for comparability
 };
 
-fn collectConcatFlags(comptime def: anytype, comptime prefix: String, comptime acc: []const ConcatFlag) []const ConcatFlag {
+fn collectConcatFlags(
+    comptime def: anytype,
+    comptime prefix: String,
+    comptime level: []const String,
+    comptime acc: []const ConcatFlag,
+) []const ConcatFlag {
     comptime {
         var out = acc;
         for (fieldsOf(@TypeOf(def))) |f| {
-            out = fieldConcatFlags(f, prefix, out);
+            out = fieldConcatFlags(f, prefix, level, out);
         }
         return out;
     }
@@ -679,14 +689,38 @@ fn childPath(comptime prefix: String, comptime name: []const u8) String {
     return if (prefix.len == 0) name else prefix ++ "." ++ name;
 }
 
-fn fieldConcatFlags(comptime f: Field, comptime prefix: String, comptime acc: []const ConcatFlag) []const ConcatFlag {
+/// True when one level path is a segment-prefix of the other, i.e. the two
+/// levels can be active in one invocation. Compared segment-wise, never as a
+/// joined string, so wire names containing `.` or spaces cannot create false
+/// prefixes.
+fn levelComparable(comptime a: []const String, comptime b: []const String) bool {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
+}
+
+fn fieldConcatFlags(
+    comptime f: Field,
+    comptime prefix: String,
+    comptime level: []const String,
+    comptime acc: []const ConcatFlag,
+) []const ConcatFlag {
     comptime {
         const path = childPath(prefix, f.name);
         if (f.type == type) {
             const V = typeOfField(f);
             switch (V.dap_kind) {
-                .group => return collectConcatFlags(V.group_def, path, acc),
-                .command => return collectConcatFlags(V.cmd_def, path, acc),
+                // Group and Alt members live on their enclosing declaration's
+                // level, so only the dotted path grows.
+                .group => return collectConcatFlags(V.group_def, path, level, acc),
+                .command => return collectConcatFlags(
+                    V.cmd_def,
+                    path,
+                    level ++ &[_]String{V.cmd_meta.name orelse f.name},
+                    acc,
+                ),
                 .alt => {
                     var out = acc;
                     for (fieldsOf(@TypeOf(V.alt_def))) |bf| {
@@ -694,7 +728,7 @@ fn fieldConcatFlags(comptime f: Field, comptime prefix: String, comptime acc: []
                         const is_variant = @TypeOf(Bv) == type and @hasDecl(Bv, "dap_variant_def");
                         const Bdef = if (is_variant) Bv.dap_variant_def else Bv;
                         if (@TypeOf(Bdef) == type) continue;
-                        out = collectConcatFlags(Bdef, childPath(path, bf.name), out);
+                        out = collectConcatFlags(Bdef, childPath(path, bf.name), level, out);
                     }
                     return out;
                 },
@@ -703,16 +737,17 @@ fn fieldConcatFlags(comptime f: Field, comptime prefix: String, comptime acc: []
         }
         const s = specFromField(f);
         if (s.kind != .flag) return acc;
-        return acc ++ &[_]ConcatFlag{.{ .long = s.long, .short = s.short, .path = path }};
+        return acc ++ &[_]ConcatFlag{.{ .long = s.long, .short = s.short, .path = path, .level = level }};
     }
 }
 
 fn checkConcatFlags(comptime left: anytype, comptime right: anytype) void {
     comptime {
-        const ls = collectConcatFlags(left, "", &.{});
-        const rs = collectConcatFlags(right, "", &.{});
+        const ls = collectConcatFlags(left, "", &.{}, &.{});
+        const rs = collectConcatFlags(right, "", &.{}, &.{});
         for (ls) |a| {
             for (rs) |b| {
+                if (!levelComparable(a.level, b.level)) continue;
                 if (std.mem.eql(u8, a.long, b.long)) {
                     clash("flag name", "--" ++ a.long, a.path, b.path);
                 }

@@ -632,10 +632,122 @@ test "Compose.concat rejects duplicate tags in a merged Alt" {
 
 test "Compose.concat rejects flag clashes anywhere in the trees" {
     if (false) {
+        // Still a rejection, now for the chain reason: a command level is a
+        // descendant of the root level, and `port` is reused there.
         const a = .{ .serve = Command(.{ .help = "" }, .{ .port = Flag(u16){ .long = "port" } }) };
         const b = .{ .net = Group(.{ .p = Flag(u16){ .long = "port" } }, "net") };
         comptime _ = Compose.concat(a, b);
     }
+}
+
+test "Compose.concat allows sibling subtrees to reuse a flag spelling" {
+    const a = .{ .one = Command(.{ .help = "One." }, .{
+        .same = Flag(u8){ .long = "same", .default = dap.Default(u8){ .direct = 1 } },
+    }) };
+    const b = .{ .two = Command(.{ .help = "Two." }, .{
+        .same = Flag(u8){ .long = "same", .default = dap.Default(u8){ .direct = 2 } },
+    }) };
+    const CLI = dap.generate(App{ .name = "siblings", .help = "" }, Compose.concat(a, b));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var one_diag: dap.Diag = .{};
+    defer one_diag.deinit(al);
+    var one = try CLI.parse(al, std.process.Environ.empty, null, &.{"one"}, &one_diag);
+    defer CLI.deinit(&one, al);
+    try std.testing.expectEqual(@as(u8, 1), one._one.?.same);
+    try std.testing.expect(one._two == null);
+
+    var two_diag: dap.Diag = .{};
+    defer two_diag.deinit(al);
+    var two = try CLI.parse(al, std.process.Environ.empty, null, &.{"two"}, &two_diag);
+    defer CLI.deinit(&two, al);
+    try std.testing.expectEqual(@as(u8, 2), two._two.?.same);
+    try std.testing.expect(two._one == null);
+
+    const help = try CLI.helpText(al);
+    try std.testing.expect(std.mem.indexOf(u8, help, "one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "two") != null);
+}
+
+test "Compose.concat rejects a command flag reused at the root" {
+    if (false) {
+        // The root level is an ancestor of every command, so `x` is reused
+        // along a chain.
+        const a = .{ .c = Command(.{ .help = "" }, .{ .xl = Flag(u8){ .long = "x" } }) };
+        const b = .{ .xr = Flag(u8){ .long = "x" } };
+        comptime _ = Compose.concat(a, b);
+    }
+}
+
+test "Compose.concat rejects a group member reused at the root" {
+    if (false) {
+        // Group members live on the enclosing declaration's level, so both
+        // flags land on the root level and clash on the `flag name` class.
+        const a = .{ .g = Group(.{ .xl = Flag(u8){ .long = "x" } }, "G") };
+        const b = .{ .xr = Flag(u32){ .long = "x" } };
+        comptime _ = Compose.concat(a, b);
+    }
+}
+
+test "Compose.concat rejects an Alt member reused at the root" {
+    if (false) {
+        const a = .{ .a = Alt(.{ .on = .{ .xl = Flag(u8){ .long = "x" } } }) };
+        const b = .{ .xr = Flag(u32){ .long = "x" } };
+        comptime _ = Compose.concat(a, b);
+    }
+}
+
+test "Compose.concat allows flag reuse across sibling commands" {
+    const a = .{ .c = Command(.{ .help = "C." }, .{ .xl = Flag(u8){ .long = "x", .default = dap.Default(u8){ .direct = 5 } } }) };
+    const b = .{ .d = Command(.{ .help = "D." }, .{ .xr = Flag(u8){ .long = "x", .default = dap.Default(u8){ .direct = 6 } } }) };
+    const CLI = dap.generate(App{ .name = "siblings", .help = "" }, Compose.concat(a, b));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var c_diag: dap.Diag = .{};
+    defer c_diag.deinit(al);
+    var c = try CLI.parse(al, std.process.Environ.empty, null, &.{"c"}, &c_diag);
+    defer CLI.deinit(&c, al);
+    try std.testing.expectEqual(@as(u8, 5), c._c.?.xl);
+    try std.testing.expect(c._d == null);
+
+    var d_diag: dap.Diag = .{};
+    defer d_diag.deinit(al);
+    var d = try CLI.parse(al, std.process.Environ.empty, null, &.{"d"}, &d_diag);
+    defer CLI.deinit(&d, al);
+    try std.testing.expectEqual(@as(u8, 6), d._d.?.xr);
+    try std.testing.expect(d._c == null);
+}
+
+test "Compose.concat allows a group member on one sibling and a flag on another" {
+    const a = .{ .c = Command(.{ .help = "C." }, .{
+        .g = Group(.{ .xl = Flag(u8){ .long = "x", .default = dap.Default(u8){ .direct = 7 } } }, "G"),
+    }) };
+    const b = .{ .d = Command(.{ .help = "D." }, .{
+        .xr = Flag(u8){ .long = "x", .default = dap.Default(u8){ .direct = 8 } },
+    }) };
+    const CLI = dap.generate(App{ .name = "siblings", .help = "" }, Compose.concat(a, b));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var c_diag: dap.Diag = .{};
+    defer c_diag.deinit(al);
+    var c = try CLI.parse(al, std.process.Environ.empty, null, &.{"c"}, &c_diag);
+    defer CLI.deinit(&c, al);
+    try std.testing.expectEqual(@as(u8, 7), c._c.?.xl);
+
+    var d_diag: dap.Diag = .{};
+    defer d_diag.deinit(al);
+    var d = try CLI.parse(al, std.process.Environ.empty, null, &.{"d"}, &d_diag);
+    defer CLI.deinit(&d, al);
+    try std.testing.expectEqual(@as(u8, 8), d._d.?.xr);
 }
 
 test "Compose.concat rejects command name clashes" {

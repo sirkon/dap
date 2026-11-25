@@ -2041,8 +2041,10 @@ fn contextHelpText(
 /// command path (`Usage: app svc build ...`), arguments and next-level
 /// subcommands come from that deepest scope, and flags are merged from every
 /// ancestor level (global flags + each command's flags). Because flags merge,
-/// long names and short aliases must be globally unique across the whole
-/// declaration tree; a collision is a compile error. `Group`/`Alt` groups
+/// long names and short aliases must be unique along a command chain; a
+/// collision between a level and one of its ancestors is a compile error,
+/// while sibling commands and unrelated subtrees may reuse a spelling.
+/// `Group`/`Alt` groups
 /// sharing a name across levels merge into one visual block. Any syntax,
 /// decode, required or validation failure prints the diagnostics plus the
 /// help text of the deepest command entered to stderr and exits with code `1`.
@@ -2515,11 +2517,12 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     const cmd_entries = norm.commands;
     const alts = norm.alts;
 
-    // Global flag-name uniqueness (D6): flags of every ancestor level merge
-    // into a deep help scope, so a name reused anywhere in the command tree
-    // would be ambiguous. Runs after `normalize`'s own checks so same-level
-    // collisions keep their better existing messages.
-    comptime checks_mod.checkGlobalFlagNames(checks_mod.collectFlagOrigins(norm, &[_]String{app.name}, &.{}));
+    // Flag-name uniqueness along a command chain (D6): flags of every
+    // ancestor level merge into a deep help scope, so a name reused between a
+    // level and one of its ancestors would be ambiguous. Sibling commands and
+    // unrelated subtrees may reuse a spelling. Runs after `normalize`'s own
+    // checks so same-level collisions keep their better existing messages.
+    comptime checks_mod.checkChainFlagNames(norm, &[_]String{app.name}, &.{});
 
     // i18n keys are declaration-wide identifiers: valid field names, unique
     // within the tree, never shadowing a builtin translation. The literal
@@ -3612,8 +3615,9 @@ fn Sub(comptime Cmd: type, comptime app: App) type {
 /// misses the sub's own specs can be resolved up the command chain. The
 /// ancestor's type is erased behind a context pointer plus the two assign
 /// entry points; `up` links to the next ancestor towards the root. Flags of
-/// every ancestor merge into deep help and are globally unique, so resolving
-/// them here keeps parsing consistent with what help advertises.
+/// every ancestor merge into deep help and are unique along the active command
+/// chain, so resolving them here keeps parsing consistent with what help
+/// advertises.
 const Ancestor = struct {
     ctx: *anyopaque,
     up: ?*const Ancestor,
@@ -7869,6 +7873,9 @@ test "M14: usage on a foreign view is a compile error" {
 
 test "M14: duplicate long flag across levels is a compile error" {
     if (false) {
+        // Enabling this must fail to compile:
+        // duplicate long flag '--dup' at 'm14' and 'm14 svc'; flag names must
+        // be unique along a command chain (fields 'dup' / 'dup')
         const Bad = .{
             .dup = Flag([]const u8){ .long = "dup" },
             .svc = Command(.{ .help = "S." }, .{
@@ -7881,6 +7888,9 @@ test "M14: duplicate long flag across levels is a compile error" {
 
 test "M14: duplicate short flag across levels is a compile error" {
     if (false) {
+        // Enabling this must fail to compile:
+        // duplicate short flag '-d' at 'm14' and 'm14 svc'; flag names must be
+        // unique along a command chain (fields 'dup' / 'dup2')
         const Bad = .{
             .dup = Flag(u8){ .long = "dup", .short = "d" },
             .svc = Command(.{ .help = "S." }, .{
@@ -7891,14 +7901,151 @@ test "M14: duplicate short flag across levels is a compile error" {
     }
 }
 
-test "M14: duplicate flag across sibling commands is a compile error" {
+test "M14: duplicate flag against a grandparent is a compile error" {
     if (false) {
+        // The walk carries ancestors transitively: the leaf collides with the
+        // root through two levels.
         const Bad = .{
-            .one = Command(.{ .help = "One." }, .{ .same = Flag(u8){ .long = "same" } }),
-            .two = Command(.{ .help = "Two." }, .{ .same = Flag(u8){ .long = "same" } }),
+            .dup = Flag(u8){ .long = "dup" },
+            .svc = Command(.{ .help = "S." }, .{
+                .deploy = Command(.{ .help = "D." }, .{
+                    .dup = Flag(u8){ .long = "dup" },
+                }),
+            }),
         };
         comptime _ = generate(App{ .name = "m14", .help = "" }, Bad);
     }
+}
+
+test "M14: Group member reusing an ancestor flag is a compile error" {
+    if (false) {
+        // duplicate long flag '--x' at 'm14' and 'm14 svc'; flag names must be
+        // unique along a command chain (fields 'x' / 'x')
+        const Bad = .{
+            .root = Flag(u8){ .long = "x" },
+            .svc = Command(.{ .help = "S." }, .{
+                .g = Group(.{ .x = Flag(u8){ .long = "x" } }, "G"),
+            }),
+        };
+        comptime _ = generate(App{ .name = "m14", .help = "" }, Bad);
+    }
+}
+
+test "M14: Alt member reusing an ancestor flag is a compile error" {
+    if (false) {
+        const Bad = .{
+            .root = Flag(u8){ .long = "x" },
+            .svc = Command(.{ .help = "S." }, .{
+                .a = Alt(.{ .on = .{ .x = Flag(bool){ .long = "x" } } }),
+            }),
+        };
+        comptime _ = generate(App{ .name = "m14", .help = "" }, Bad);
+    }
+}
+
+test "M14: sibling commands may reuse a flag spelling" {
+    const Siblings = generate(
+        App{ .name = "m14", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } },
+        .{
+            .one = Command(.{ .help = "One." }, .{
+                .same = Flag(u8){
+                    .long = "same",
+                    .short = "s",
+                    .default = Default(u8){ .direct = 11 },
+                    .help = "One flag.",
+                },
+            }),
+            .two = Command(.{ .help = "Two." }, .{
+                .same = Flag(u8){
+                    .long = "same",
+                    .short = "s",
+                    .default = Default(u8){ .direct = 77 },
+                    .help = "Two flag.",
+                },
+            }),
+        },
+    );
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var one_diag: Diag = .{};
+    const one = try Siblings.parseInner(arena.allocator(), std.process.Environ.empty, &.{"one"}, &one_diag);
+    try std.testing.expectEqual(@as(u8, 11), one._one.?.same);
+    try std.testing.expect(one._two == null);
+
+    var two_diag: Diag = .{};
+    const two = try Siblings.parseInner(arena.allocator(), std.process.Environ.empty, &.{"two"}, &two_diag);
+    try std.testing.expectEqual(@as(u8, 77), two._two.?.same);
+    try std.testing.expect(two._one == null);
+
+    const one_help = try contextHelpText(Siblings, arena.allocator(), &one, &Siblings.default_locale, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, one_help, "One flag.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one_help, "--same=11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one_help, "--same=77") == null);
+    try std.testing.expect(std.mem.indexOf(u8, one_help, "Two flag.") == null);
+}
+
+test "M14: unrelated subtrees may reuse a flag spelling" {
+    const Siblings = generate(App{ .name = "m14", .help = "", .help_renderer = .{ .highlight = .{ .flat = {} } } }, .{
+        .one = Command(.{ .help = "One." }, .{
+            .deep = Command(.{ .help = "Deep." }, .{
+                .x = Flag(u8){ .long = "x", .default = Default(u8){ .direct = 3 } },
+            }),
+        }),
+        .two = Command(.{ .help = "Two." }, .{
+            .x = Flag(u8){ .long = "x", .default = Default(u8){ .direct = 4 } },
+        }),
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var deep_diag: Diag = .{};
+    const deep = try Siblings.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "one", "deep" }, &deep_diag);
+    try std.testing.expectEqual(@as(u8, 3), deep._one.?._deep.?.x);
+    try std.testing.expect(deep._two == null);
+
+    var two_diag: Diag = .{};
+    const two = try Siblings.parseInner(arena.allocator(), std.process.Environ.empty, &.{"two"}, &two_diag);
+    try std.testing.expectEqual(@as(u8, 4), two._two.?.x);
+    try std.testing.expect(two._one == null);
+
+    const deep_help = try contextHelpText(Siblings, arena.allocator(), &deep, &Siblings.default_locale, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, deep_help, "--x=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deep_help, "--x=4") == null);
+
+    const two_help = try contextHelpText(Siblings, arena.allocator(), &two, &Siblings.default_locale, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, two_help, "--x=4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, two_help, "--x=3") == null);
+}
+
+test "M14: Group and Alt members may be reused by siblings" {
+    const Siblings = generate(App{ .name = "m14", .help = "" }, .{
+        .one = Command(.{ .help = "One." }, .{
+            .g = Group(.{ .x = Flag(u8){ .long = "x", .default = Default(u8){ .direct = 1 } } }, "G"),
+            .a = Alt(.{ .on = .{ .y = Flag(bool){ .long = "y" } } }),
+        }),
+        .two = Command(.{ .help = "Two." }, .{
+            .g = Group(.{ .x = Flag(u8){ .long = "x", .default = Default(u8){ .direct = 2 } } }, "G"),
+            .a = Alt(.{ .on = .{ .y = Flag(bool){ .long = "y" } } }),
+        }),
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var one_diag: Diag = .{};
+    const one = try Siblings.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "one", "--x", "7", "--y" }, &one_diag);
+    try std.testing.expectEqual(@as(u8, 7), one._one.?.x);
+    try std.testing.expect(one._one.?.a != null);
+    try std.testing.expect(one._two == null);
+
+    var two_diag: Diag = .{};
+    const two = try Siblings.parseInner(arena.allocator(), std.process.Environ.empty, &.{ "two", "--x", "9", "--y" }, &two_diag);
+    try std.testing.expectEqual(@as(u8, 9), two._two.?.x);
+    try std.testing.expect(two._two.?.a != null);
+    try std.testing.expect(two._one == null);
 }
 
 // ---------------------------------------------------------------------------

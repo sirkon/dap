@@ -30,8 +30,8 @@ of record; there is no `PLAN.md`.
   directly; the cycle resolves lazily.
 - `src/checks.zig` owns the declaration checks that used to live in `dap.zig`
   (`checkNoUnderscoreFields`, `commandSpellings`, the command/duplicate/field/
-  argument checks, `FlagOrigin`/`levelPath`/`collectFlagOrigins`/
-  `checkGlobalFlagNames`) plus `I18nOrigin`/`collectI18n`/`checkI18nKeys`/
+  argument checks, `FlagOrigin`/`levelPath`/`levelFlagOrigins`/
+  `checkChainFlagNames`) plus `I18nOrigin`/`collectI18n`/`checkI18nKeys`/
   `validI18nKey`, `validLongName`/`validPrefix`/`checkPrefix` and the
   cross-input planner `concatPlan` used by composition. `dap.zig` imports it
   for `normalize`/`generate`; the cycle resolves lazily.
@@ -262,7 +262,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   `ancestorFns`, nearest-first with an `up` link): a flag token that misses the
   sub's own specs is retried against each ancestor's `assignLongFlag`/
   `assignShortFlag`, so `app sub --root-flag` assigns into the ancestor's
-  `View`, consistent with the merged help and the global uniqueness rule.
+  `View`, consistent with the merged help and the chain uniqueness rule.
   Duplicate command wire names or synonyms at a level and command-field
   names colliding with a spec are compile errors (`checkCommandNames` /
   `checkCommandFieldNames`); `CommandMeta.synonym` is an alternative wire
@@ -273,13 +273,17 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   declaration is also rejected (`checkCommandArgumentMix`), since a command
   token hands off the rest of the wire and a parent positional could never be
   filled; a level with no command fields simply has none. Flag long names and
-  short aliases must be *globally* unique across the whole command tree (not
-  just per level): `collectFlagOrigins` recursively re-`normalize`s each
-  level's subtree (group and Alt members included, the injected builtin and
-  positional arguments excluded) and `checkGlobalFlagNames` rejects any
-  long/long or short/short collision with both level paths in the message;
-  sibling commands are covered too. This runs in `generate` right after
-  `normalize`'s own per-level checks.
+  short aliases must be unique along a command chain (not just per level):
+  `levelFlagOrigins` collects one level's flags (`norm.specs` already flattens
+  group and `Alt` members; the injected builtin and positional arguments are
+  excluded) tagged with the command wire-name level path, and
+  `checkChainFlagNames` compares each level against its ancestors, recursing
+  with `ancestors ++ own` and `path ++ c.name`. Any long/long or short/short
+  collision is rejected with both level paths in the message. Sibling
+  commands and unrelated subtrees may reuse a spelling, since their levels can
+  never be active together; the walk is transitive, so a grandchild collides
+  with a grandparent. This runs in `generate` right after `normalize`'s own
+  per-level checks.
 - Composition is orthogonal to the core: `dap.zig` never imports
   `compose.zig`, `root.zig` republishes `Compose`, and both combinators run
   before `generate` injects `-h, --help`. They return declaration *values*
@@ -308,12 +312,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
     per-field plan (`copy_left`/`copy_right`/`merge_group`/`merge_alt`), so
     the pairing decision exists once: flat field names (normalized specs, so
     group and `Alt` members are covered), positional argument display names,
-    whole-tree long/short flags (group and `Alt` members included),
+    long/short flags along a command chain (group and `Alt` members included;
+    comparability comes from command wire-name level paths, which only
+    `.command` recursion extends, so a sibling subtree's flag is skipped),
     top-level command wire names/synonyms, i18n keys and the literal value
     each key carries (so a duplicate is reported at the `concat` call site
     instead of later in `generate`), and inside a merged `Alt` duplicate
     branch field names and tags. Messages name the class and the
-    dotted declaration-field path on each side, e.g.
+    dotted declaration-field path on each side (paths stay message-only), e.g.
     `field name 'port' clash in declarations (left g.port, right g.port)`;
     classes are `field name`, `flag name` (dash-inclusive), `command name`,
     `argument name`, `i18n key`, `i18n value`, `alt branch name`, plus
@@ -373,7 +379,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   enumeration branch keys participate too, with origins read as
   `app:mode.fast`. `Group` display names have no i18n channel.
   `generate` runs `checks.collectI18n` right after `normalizeRanked`, beside
-  `checkGlobalFlagNames`, then `checkI18nKeys` and `checkI18nValues`; a
+  `checkChainFlagNames`, then `checkI18nKeys` and `checkI18nValues`; a
   violation is a `@compileError` naming the key or value and both paths. A
   command's `CommandMeta.i18n` and the child `App.i18n` derived by `subApp` are
   one origin.
@@ -576,8 +582,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   Each level's `flag_bindings`/`argument_bindings` are aligned with its
   `flags`/`arguments` and hold a `?usize` index into `Model.bindings`.
   Effective flags keep ancestors first, own after, the injected builtin once;
-  an inherited flag reuses the ancestor's binding index (matched by its
-  globally unique long name). Only `.callback` and non-native `.fs` create
+  an inherited flag reuses the ancestor's binding index (matched by its long
+  name, unique along the chain). Only `.callback` and non-native `.fs` create
   bindings; `null`, `.disabled`, native `.fs`, `.launch` and `.call` create
   none. Native means `wildcard == "*"` and `root == null`.
 - Static candidates come from `CompletionEntry` rows: one row per flag

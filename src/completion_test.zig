@@ -23,6 +23,38 @@ const PREDICTOR_SCRIPT_BASH = "../predictor.bash";
 const PREDICTOR_SCRIPT_ZSH = "../predictor.zsh";
 const PREDICTOR_SCRIPT_FISH = "../predictor.fish";
 
+const ChainMode = dap.Enumeration(.{
+    .alpha = dap.Enum{},
+    .beta = dap.Enum{},
+});
+
+const CHAIN_APP_NAME = "dap-chain-test";
+const CHAIN_IDENT = "dap_chain_test";
+const CHAIN_SCRIPT_BASH = "../chain.bash";
+const CHAIN_SCRIPT_ZSH = "../chain.zsh";
+const CHAIN_SCRIPT_FISH = "../chain.fish";
+
+/// Sibling commands reuse `--toggle` with different arity. Each level's
+/// value-flag table classifies it for itself, so completion follows the
+/// branch the user actually entered.
+const ChainCLI = dap.generate(dap.App{
+    .name = "dap chain test",
+    .help = "Chain.",
+}, .{
+    .left = dap.Command(.{ .help = "Left." }, .{
+        .toggle = dap.Flag(bool){
+            .long = "toggle",
+            .default = dap.Default(bool){ .direct = false },
+            .help = "Toggle.",
+        },
+        .kind = dap.Argument(ChainMode){},
+    }),
+    .right = dap.Command(.{ .help = "Right." }, .{
+        .toggle = dap.Flag(dap.String){ .long = "toggle", .help = "Toggle value." },
+        .kind = dap.Argument(ChainMode){},
+    }),
+});
+
 const Mode = dap.Enumeration(.{
     .red = dap.Enum{ .help = .{ .text = "Red." } },
     .green = dap.Enum{ .help = .{ .text = "Green." } },
@@ -55,6 +87,20 @@ fn writeScripts(tmp: *std.testing.TmpDir) !void {
 
     for (scripts) |entry| {
         const script = try CLI.completion(std.testing.allocator, APP_NAME, entry.shell, &CLI.default_locale).text();
+        defer std.testing.allocator.free(script);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
+    }
+}
+
+fn writeChainScripts(tmp: *std.testing.TmpDir) !void {
+    const scripts = [_]struct { shell: dap.Completion.Shell, path: []const u8 }{
+        .{ .shell = .bash, .path = "chain.bash" },
+        .{ .shell = .zsh, .path = "chain.zsh" },
+        .{ .shell = .fish, .path = "chain.fish" },
+    };
+
+    for (scripts) |entry| {
+        const script = try ChainCLI.completion(std.testing.allocator, CHAIN_APP_NAME, entry.shell, &ChainCLI.default_locale).text();
         defer std.testing.allocator.free(script);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.path, .data = script });
     }
@@ -681,6 +727,86 @@ test "completion integration: zsh" {
     const long = try zshTabCompletes(work, "zsh long spelling completes", "dap-completion-test --col");
     defer std.testing.allocator.free(long);
     try std.testing.expectEqualStrings("dap-completion-test --color", long);
+}
+
+test "completion integration: chain bash" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeChainScripts(&tmp);
+
+    const work = try tmp.dir.createDirPathOpen(std.testing.io, "work", .{});
+    defer work.close(std.testing.io);
+
+    const syntax = try runShell(work, &.{ "bash", "-n", CHAIN_SCRIPT_BASH });
+    const res = syntax orelse {
+        std.debug.print("completion-test: bash not found; skipping chain bash checks\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess("bash -n chain", res);
+
+    try bashExpect(work, "left boolean leaves the slot", CHAIN_SCRIPT_BASH, CHAIN_IDENT, "dap-chain-test left --toggle ''", 3, &.{ "alpha", "beta" });
+    try bashExpect(work, "right value takes the word", CHAIN_SCRIPT_BASH, CHAIN_IDENT, "dap-chain-test right --toggle ''", 3, &.{});
+    try bashExpect(work, "right value token then slot", CHAIN_SCRIPT_BASH, CHAIN_IDENT, "dap-chain-test right --toggle v ''", 4, &.{ "alpha", "beta" });
+    try bashExpect(work, "left value token fills the slot", CHAIN_SCRIPT_BASH, CHAIN_IDENT, "dap-chain-test left --toggle v ''", 4, &.{ "--toggle", "--help", "-h" });
+}
+
+test "completion integration: chain fish" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeChainScripts(&tmp);
+
+    const work = try tmp.dir.createDirPathOpen(std.testing.io, "work", .{});
+    defer work.close(std.testing.io);
+
+    const syntax = try runShell(work, &.{ "fish", "--no-config", "-n", CHAIN_SCRIPT_FISH });
+    const res = syntax orelse {
+        std.debug.print("completion-test: fish not found; skipping chain fish checks\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess("fish -n chain", res);
+
+    try fishExpect(work, "left boolean leaves the slot", CHAIN_SCRIPT_FISH, "dap-chain-test left --toggle ", &.{ "alpha", "beta" });
+    try fishExpect(work, "right value takes the word", CHAIN_SCRIPT_FISH, "dap-chain-test right --toggle ", &.{});
+    try fishExpect(work, "right value token then slot", CHAIN_SCRIPT_FISH, "dap-chain-test right --toggle v ", &.{ "alpha", "beta" });
+    try fishExpect(work, "left value token fills the slot", CHAIN_SCRIPT_FISH, "dap-chain-test left --toggle v ", &.{ "--toggle", "--help" });
+}
+
+test "completion integration: chain zsh" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeChainScripts(&tmp);
+
+    const work = try tmp.dir.createDirPathOpen(std.testing.io, "work", .{});
+    defer work.close(std.testing.io);
+
+    const syntax = try runShell(work, &.{ "zsh", "-n", CHAIN_SCRIPT_ZSH });
+    const res = syntax orelse {
+        std.debug.print("completion-test: zsh not found; skipping chain zsh checks\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    try expectSuccess("zsh -n chain", res);
+
+    try zshExpectDisplays(work, "zsh left boolean leaves the slot", CHAIN_SCRIPT_ZSH, "_dap_chain_test", "dap-chain-test left --toggle ''", &.{ "alpha", "beta" });
+    // No predictor keeps zsh's file fallback; the stub records the call and
+    // the empty work directory offers no candidate.
+    try zshExpectDisplays(work, "zsh right value takes the word", CHAIN_SCRIPT_ZSH, "_dap_chain_test", "dap-chain-test right --toggle ''", &.{"FILES "});
+    try zshExpectDisplays(work, "zsh right value token then slot", CHAIN_SCRIPT_ZSH, "_dap_chain_test", "dap-chain-test right --toggle v ''", &.{ "alpha", "beta" });
+    try zshExpectDisplays(work, "zsh left value token fills the slot", CHAIN_SCRIPT_ZSH, "_dap_chain_test", "dap-chain-test left --toggle v ''", &.{
+        "--toggle      -- Toggle.",
+        "--help    -h  -- Show context-sensitive help.",
+    });
 }
 
 test "completion integration: bash predictors" {

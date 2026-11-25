@@ -294,8 +294,8 @@ const ModelWalk = struct {
 
 /// Walk `NS` and every command below it in declaration pre-order and describe
 /// each level. Binding indices are dense and assigned in first-seen order; an
-/// inherited flag keeps the index its ancestor gave it, matched by its
-/// globally unique long name.
+/// inherited flag keeps the index its ancestor gave it, matched by its long
+/// name, which is unique along the command chain.
 fn model(comptime NS: type) Model {
     comptime {
         @setEvalBranchQuota(1_000_000);
@@ -319,6 +319,9 @@ fn modelWalk(
 
         for (NS.specs) |s| {
             if (s.kind != .flag) continue;
+            // Defensive invariant: no two levels of one chain may collide
+            // (same-level duplicates are rejected earlier), so this can only
+            // skip the injected `-h`/`--help` once per level.
             var duplicate = false;
             for (flags) |prev| {
                 if (std.mem.eql(u8, prev.long, s.long)) {
@@ -534,34 +537,34 @@ fn appendLevelMarker(
     try out.append(allocator, '\n');
 }
 
-/// Every value-taking flag spelling of the tree (`--long` and `-short`), in
-/// first-seen order and without duplicates. Boolean flags never consume the
-/// next word, so they are excluded. Long and short names are globally unique,
-/// which makes the table exact.
-fn valueFlagSpellings(comptime levels: []const Level) []const String {
+/// Every value-taking flag spelling of `level` (`--long` and `-short`), in
+/// first-seen order and without duplicates. `level.flags` is the level's
+/// effective set (ancestors first, own after, the injected builtin once), not
+/// a tree-wide union. Boolean flags never consume the next word, so they are
+/// excluded. Spellings are unique along the chain, so the table is exact; a
+/// sibling's spelling means nothing here.
+fn valueFlagSpellings(comptime level: Level) []const String {
     comptime {
         var spellings: []const String = &.{};
-        for (levels) |level| {
-            for (level.flags) |s| {
-                if (s.vtype == bool) continue;
-                const longs: []const String = if (s.long.len == 0)
-                    &.{}
-                else
-                    &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
-                const shorts: []const String = if (s.short) |sh|
-                    if (sh.len == 0) &.{} else &[_]String{std.fmt.comptimePrint("-{s}", .{sh})}
-                else
-                    &.{};
-                for (longs ++ shorts) |spelling| {
-                    var seen = false;
-                    for (spellings) |prev| {
-                        if (std.mem.eql(u8, prev, spelling)) {
-                            seen = true;
-                            break;
-                        }
+        for (level.flags) |s| {
+            if (s.vtype == bool) continue;
+            const longs: []const String = if (s.long.len == 0)
+                &.{}
+            else
+                &[_]String{std.fmt.comptimePrint("--{s}", .{s.long})};
+            const shorts: []const String = if (s.short) |sh|
+                if (sh.len == 0) &.{} else &[_]String{std.fmt.comptimePrint("-{s}", .{sh})}
+            else
+                &.{};
+            for (longs ++ shorts) |spelling| {
+                var seen = false;
+                for (spellings) |prev| {
+                    if (std.mem.eql(u8, prev, spelling)) {
+                        seen = true;
+                        break;
                     }
-                    if (!seen) spellings = spellings ++ &[_]String{spelling};
                 }
+                if (!seen) spellings = spellings ++ &[_]String{spelling};
             }
         }
         return spellings;
@@ -2098,15 +2101,21 @@ fn emitBash(
     );
 
     try appendBashFnName(&out, allocator, ident, "_value_flag() {\n");
-    try out.appendSlice(allocator,
-        \\    case "$1" in
-        \\    *=*) return 1 ;;
-        \\
-    );
-    inline for (comptime valueFlagSpellings(levels)) |spelling| {
-        try out.appendSlice(allocator, "    ");
-        try appendQuoted(&out, allocator, spelling, .posix);
-        try out.appendSlice(allocator, ") return 0 ;;\n");
+    try out.appendSlice(allocator, "    case \"$2\" in\n    *=*) return 1 ;;\n    esac\n    case \"$1\" in\n");
+    inline for (levels) |level| {
+        try out.print(allocator, "    {})", .{level.rank});
+        const spellings = comptime valueFlagSpellings(level);
+        if (spellings.len == 0) {
+            try out.appendSlice(allocator, " ;;\n");
+            continue;
+        }
+        try out.appendSlice(allocator, "\n        case \"$2\" in\n");
+        inline for (spellings) |spelling| {
+            try out.appendSlice(allocator, "        ");
+            try appendQuoted(&out, allocator, spelling, .posix);
+            try out.appendSlice(allocator, ") return 0 ;;\n");
+        }
+        try out.appendSlice(allocator, "        esac\n        ;;\n");
     }
     try out.appendSlice(allocator,
         \\    esac
@@ -2151,7 +2160,7 @@ fn emitBash(
         \\        if
     );
     try out.append(allocator, ' ');
-    try appendBashFnName(&out, allocator, ident, "_value_flag \"$tok\"; then\n");
+    try appendBashFnName(&out, allocator, ident, "_value_flag \"$level\" \"$tok\"; then\n");
     try out.appendSlice(allocator,
         \\            if (( i + 1 <= end )) && [[ ${COMP_WORDS[i+1]} == '=' ]]; then
         \\                i=$((i + 3))
@@ -2194,7 +2203,7 @@ fn emitBash(
         \\    if [[ $cur == '=' ]] &&
     );
     try out.append(allocator, ' ');
-    try appendBashFnName(&out, allocator, ident, "_value_flag \"$prev\"; then\n");
+    try appendBashFnName(&out, allocator, ident, "_value_flag \"$level\" \"$prev\"; then\n");
     try out.appendSlice(allocator,
         \\        vflag=$prev
         \\        vform=eq
@@ -2203,7 +2212,7 @@ fn emitBash(
         \\    elif
     );
     try out.append(allocator, ' ');
-    try appendBashFnName(&out, allocator, ident, "_value_flag \"$prev\"; then\n");
+    try appendBashFnName(&out, allocator, ident, "_value_flag \"$level\" \"$prev\"; then\n");
     try out.appendSlice(allocator,
         \\        vflag=$prev
         \\    elif [[ $cur == -* && $cur == *=* ]]; then
@@ -2481,11 +2490,21 @@ fn emitZsh(
     try out.append(allocator, '\n');
 
     try appendZshFnName(&out, allocator, ident, "_value_flag() {\n");
-    try out.appendSlice(allocator, "    case \"$1\" in\n    *=*) return 1 ;;\n");
-    inline for (comptime valueFlagSpellings(levels)) |spelling| {
-        try out.appendSlice(allocator, "    ");
-        try appendQuoted(&out, allocator, spelling, .posix);
-        try out.appendSlice(allocator, ") return 0 ;;\n");
+    try out.appendSlice(allocator, "    case \"$2\" in\n    *=*) return 1 ;;\n    esac\n    case \"$1\" in\n");
+    inline for (levels) |level| {
+        try out.print(allocator, "    {})", .{level.rank});
+        const spellings = comptime valueFlagSpellings(level);
+        if (spellings.len == 0) {
+            try out.appendSlice(allocator, " ;;\n");
+            continue;
+        }
+        try out.appendSlice(allocator, "\n        case \"$2\" in\n");
+        inline for (spellings) |spelling| {
+            try out.appendSlice(allocator, "        ");
+            try appendQuoted(&out, allocator, spelling, .posix);
+            try out.appendSlice(allocator, ") return 0 ;;\n");
+        }
+        try out.appendSlice(allocator, "        esac\n        ;;\n");
     }
     try out.appendSlice(allocator, "    esac\n    return 1\n}\n\n");
 
@@ -2521,7 +2540,7 @@ fn emitZsh(
         \\        if
     );
     try out.append(allocator, ' ');
-    try appendZshFnName(&out, allocator, ident, "_value_flag \"$tok\"; then\n");
+    try appendZshFnName(&out, allocator, ident, "_value_flag \"$level\" \"$tok\"; then\n");
     try out.appendSlice(allocator,
         \\            if (( i + 1 <= end )) && [[ ${words[i+1]} == '=' ]]; then
         \\                i=$(( i + 3 ))
@@ -2565,7 +2584,7 @@ fn emitZsh(
         \\        if [[ $PREFIX == '=' ]] &&
     );
     try out.append(allocator, ' ');
-    try appendZshFnName(&out, allocator, ident, "_value_flag \"$words[CURRENT-1]\"; then\n");
+    try appendZshFnName(&out, allocator, ident, "_value_flag \"$level\" \"$words[CURRENT-1]\"; then\n");
     try out.appendSlice(allocator,
         \\            vflag=$words[CURRENT-1]
         \\            vform=eq
@@ -2574,7 +2593,7 @@ fn emitZsh(
         \\        elif
     );
     try out.append(allocator, ' ');
-    try appendZshFnName(&out, allocator, ident, "_value_flag \"$words[CURRENT-1]\"; then\n");
+    try appendZshFnName(&out, allocator, ident, "_value_flag \"$level\" \"$words[CURRENT-1]\"; then\n");
     try out.appendSlice(allocator,
         \\            vflag=$words[CURRENT-1]
         \\        fi
@@ -3198,19 +3217,23 @@ fn emitFish(
     try out.appendSlice(allocator, "function ");
     try appendFishFnName(&out, allocator, ident, "_value_flag\n");
     try out.appendSlice(allocator,
-        \\    switch $argv[1]
+        \\    switch $argv[2]
         \\    case '*=*'
         \\        return 1
+        \\    end
+        \\    switch $argv[1]
         \\
     );
-    const spellings = comptime valueFlagSpellings(levels);
-    if (spellings.len != 0) {
-        try out.appendSlice(allocator, "    case");
+    inline for (levels) |level| {
+        try out.print(allocator, "    case {}\n", .{level.rank});
+        const spellings = comptime valueFlagSpellings(level);
+        if (spellings.len == 0) continue;
+        try out.appendSlice(allocator, "        switch $argv[2]\n        case");
         inline for (spellings) |spelling| {
             try out.append(allocator, ' ');
             try appendQuoted(&out, allocator, spelling, .fish);
         }
-        try out.appendSlice(allocator, "\n        return 0\n");
+        try out.appendSlice(allocator, "\n            return 0\n        end\n");
     }
     try out.appendSlice(allocator,
         \\    end
@@ -3259,7 +3282,7 @@ fn emitFish(
         \\        if
     );
     try out.append(allocator, ' ');
-    try appendFishFnName(&out, allocator, ident, "_value_flag $tok\n");
+    try appendFishFnName(&out, allocator, ident, "_value_flag $level $tok\n");
     try out.appendSlice(allocator,
         \\            set i (math $i + 2)
         \\            continue
@@ -3313,7 +3336,7 @@ fn emitFish(
         \\        if
     );
     try out.append(allocator, ' ');
-    try appendFishFnName(&out, allocator, ident, "_value_flag $prev\n");
+    try appendFishFnName(&out, allocator, ident, "_value_flag $level $prev\n");
     try out.appendSlice(allocator,
         \\            set vflag $prev
         \\        end
@@ -3854,6 +3877,24 @@ const M19SynonymDef = .{
 
 const M19Synonym = generate(App{ .name = "m19-synonym", .help = "M19 synonym root." }, M19SynonymDef);
 
+/// Two sibling commands reuse `--mode` with different arity: a boolean on the
+/// left, a value flag on the right. Chain uniqueness allows this, so each
+/// level's helper classifies the spelling for itself.
+const M19SiblingDef = .{
+    .left = Command(.{ .help = "Left." }, .{
+        .mode = Flag(bool){
+            .long = "mode",
+            .default = Default(bool){ .direct = false },
+            .help = "Left mode.",
+        },
+    }),
+    .right = Command(.{ .help = "Right." }, .{
+        .mode = Flag(u8){ .long = "mode", .default = Default(u8){ .direct = 0 }, .help = "Right mode." },
+    }),
+};
+
+const M19Sibling = generate(App{ .name = "m19-sibling", .help = "M19 sibling root." }, M19SiblingDef);
+
 fn m19Expect(comptime ok: bool, comptime msg: []const u8) void {
     if (!ok) @compileError("M19: " ++ msg);
 }
@@ -3900,6 +3941,30 @@ fn m19LevelBlock(script: String, comptime rank: usize) String {
     const body = script[after_marker + line_end + 1 ..];
     const next = std.mem.indexOf(u8, body, "# dap: level ") orelse body.len;
     return body[0..next];
+}
+
+/// One bash/zsh value-flag helper arm: from its `    <rank>)` dispatch label up
+/// to the next level label (or the helper's closing `esac`).
+fn m19ValueArm(script: String, comptime rank: usize) String {
+    const marker = std.fmt.comptimePrint("    {d})", .{rank});
+    const at = std.mem.indexOf(u8, script, marker) orelse return "";
+    const body = script[at + marker.len ..];
+    const next = std.fmt.comptimePrint("    {d})", .{rank + 1});
+    const stop = std.mem.indexOf(u8, body, next) orelse
+        std.mem.indexOf(u8, body, "    esac\n") orelse body.len;
+    return body[0..stop];
+}
+
+/// One fish value-flag helper arm: from its `    case <rank>` label up to the
+/// next level label (or the helper's closing `    end\n    return 1`).
+fn m19FishValueArm(script: String, comptime rank: usize) String {
+    const marker = std.fmt.comptimePrint("    case {d}\n", .{rank});
+    const at = std.mem.indexOf(u8, script, marker) orelse return "";
+    const body = script[at + marker.len ..];
+    const next = std.fmt.comptimePrint("    case {d}\n", .{rank + 1});
+    const stop = std.mem.indexOf(u8, body, next) orelse
+        std.mem.indexOf(u8, body, "    end\n    return 1\n") orelse body.len;
+    return body[0..stop];
 }
 
 test "M19: completion public types" {
@@ -4333,14 +4398,32 @@ test "M19: description sanitization" {
 
 test "M19: value flag spellings" {
     comptime {
-        const small = valueFlagSpellings(model(M19).levels);
-        m19Expect(small.len == 1, "minimal value spelling count");
-        m19Expect(std.mem.eql(u8, small[0], "--mode"), "minimal value spelling");
+        const small = model(M19).levels;
+        m19Expect(valueFlagSpellings(small[0]).len == 1, "minimal root value spelling count");
+        m19Expect(std.mem.eql(u8, valueFlagSpellings(small[0])[0], "--mode"), "minimal root value spelling");
+        for (small[1..]) |level| {
+            m19Expect(valueFlagSpellings(level).len == 1, "inherited value spelling count");
+            m19Expect(std.mem.eql(u8, valueFlagSpellings(level)[0], "--mode"), "inherited value spelling");
+        }
 
-        const big = valueFlagSpellings(model(M19Big).levels);
-        const want = [_]String{ "--config", "--host", "--port", "--optional", "--serve_port" };
-        m19Expect(big.len == want.len, "value spelling count");
-        for (want, big) |w, g| m19Expect(std.mem.eql(u8, w, g), "value spelling order");
+        const big = model(M19Big).levels;
+        const root = valueFlagSpellings(big[0]);
+        const root_want = [_]String{ "--config", "--host", "--port", "--optional" };
+        m19Expect(root.len == root_want.len, "big root value spelling count");
+        for (root_want, 0..) |w, i| m19Expect(std.mem.eql(u8, w, root[i]), "big root value spelling order");
+
+        const build = valueFlagSpellings(big[1]);
+        m19Expect(build.len == root_want.len, "build inherits the root table");
+        for (root_want, 0..) |w, i| m19Expect(std.mem.eql(u8, w, build[i]), "build value spelling order");
+
+        const serve_want = [_]String{ "--config", "--host", "--port", "--optional", "--serve_port" };
+        const serve = valueFlagSpellings(big[2]);
+        m19Expect(serve.len == serve_want.len, "serve table adds its own flag");
+        for (serve_want, 0..) |w, i| m19Expect(std.mem.eql(u8, w, serve[i]), "serve value spelling order");
+
+        const nested = valueFlagSpellings(big[3]);
+        m19Expect(nested.len == serve_want.len, "nested inherits the serve table");
+        for (serve_want, 0..) |w, i| m19Expect(std.mem.eql(u8, w, nested[i]), "nested value spelling order");
     }
 }
 
@@ -4464,18 +4547,35 @@ test "M19: bash value flag table" {
     const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.TestUnexpectedResult;
     const helper = rest[0..end];
 
-    const guard = std.mem.indexOf(u8, helper, "    *=*) return 1 ;;\n") orelse return error.TestUnexpectedResult;
-    const arms = [_]String{
-        "    '--config') return 0 ;;\n",
-        "    '--host') return 0 ;;\n",
-        "    '--port') return 0 ;;\n",
-        "    '--optional') return 0 ;;\n",
-        "    '--serve_port') return 0 ;;\n",
-    };
-    for (arms) |arm| {
-        const at = std.mem.indexOf(u8, helper, arm) orelse return error.TestUnexpectedResult;
-        try std.testing.expect(at > guard);
-    }
+    // The `*=*` guard matches the spelling (`$2`), then `$1` dispatches per
+    // level: there is no flat tree-wide spelling table.
+    try std.testing.expect(std.mem.indexOf(u8, helper,
+        \\    case "$2" in
+        \\    *=*) return 1 ;;
+        \\    esac
+        \\    case "$1" in
+        \\
+    ) != null);
+
+    const root = m19ValueArm(helper, 0);
+    for ([_]String{
+        "'--config') return 0 ;;",
+        "'--host') return 0 ;;",
+        "'--port') return 0 ;;",
+        "'--optional') return 0 ;;",
+    }) |arm| try std.testing.expect(std.mem.indexOf(u8, root, arm) != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "'--serve_port')") == null);
+
+    const build = m19ValueArm(helper, 1);
+    try std.testing.expect(std.mem.indexOf(u8, build, "'--config') return 0 ;;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build, "'--serve_port')") == null);
+
+    const serve = m19ValueArm(helper, 2);
+    try std.testing.expect(std.mem.indexOf(u8, serve, "'--serve_port') return 0 ;;") != null);
+
+    const nested = m19ValueArm(helper, 3);
+    try std.testing.expect(std.mem.indexOf(u8, nested, "'--serve_port') return 0 ;;") != null);
+
     for ([_]String{ "    '--verbose')", "    '-v')", "    '--fast')", "    '--slow')", "    '--help')" }) |arm| {
         try std.testing.expect(std.mem.indexOf(u8, helper, arm) == null);
     }
@@ -4664,18 +4764,33 @@ test "M19: zsh value flag table" {
     const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.TestUnexpectedResult;
     const helper = rest[0..end];
 
-    const guard = std.mem.indexOf(u8, helper, "    *=*) return 1 ;;\n") orelse return error.TestUnexpectedResult;
-    const arms = [_]String{
-        "    '--config') return 0 ;;\n",
-        "    '--host') return 0 ;;\n",
-        "    '--port') return 0 ;;\n",
-        "    '--optional') return 0 ;;\n",
-        "    '--serve_port') return 0 ;;\n",
-    };
-    for (arms) |arm| {
-        const at = std.mem.indexOf(u8, helper, arm) orelse return error.TestUnexpectedResult;
-        try std.testing.expect(at > guard);
-    }
+    try std.testing.expect(std.mem.indexOf(u8, helper,
+        \\    case "$2" in
+        \\    *=*) return 1 ;;
+        \\    esac
+        \\    case "$1" in
+        \\
+    ) != null);
+
+    const root = m19ValueArm(helper, 0);
+    for ([_]String{
+        "'--config') return 0 ;;",
+        "'--host') return 0 ;;",
+        "'--port') return 0 ;;",
+        "'--optional') return 0 ;;",
+    }) |arm| try std.testing.expect(std.mem.indexOf(u8, root, arm) != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "'--serve_port')") == null);
+
+    const build = m19ValueArm(helper, 1);
+    try std.testing.expect(std.mem.indexOf(u8, build, "'--config') return 0 ;;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build, "'--serve_port')") == null);
+
+    const serve = m19ValueArm(helper, 2);
+    try std.testing.expect(std.mem.indexOf(u8, serve, "'--serve_port') return 0 ;;") != null);
+
+    const nested = m19ValueArm(helper, 3);
+    try std.testing.expect(std.mem.indexOf(u8, nested, "'--serve_port') return 0 ;;") != null);
+
     for ([_]String{ "    '--verbose')", "    '-v')", "    '--fast')", "    '--slow')", "    '--help')" }) |arm| {
         try std.testing.expect(std.mem.indexOf(u8, helper, arm) == null);
     }
@@ -4965,14 +5080,73 @@ test "M19: fish value flag table" {
     const end = std.mem.indexOf(u8, rest, "\nend\n") orelse return error.TestUnexpectedResult;
     const helper = rest[0..end];
 
-    const guard = std.mem.indexOf(u8, helper, "    case '*=*'\n        return 1\n") orelse
-        return error.TestUnexpectedResult;
-    const arm = std.mem.indexOf(u8, helper, "    case '--config' '--host' '--port' '--optional' '--serve_port'\n        return 0\n") orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expect(arm > guard);
+    try std.testing.expect(std.mem.indexOf(u8, helper,
+        \\    switch $argv[2]
+        \\    case '*=*'
+        \\        return 1
+        \\    end
+        \\    switch $argv[1]
+        \\
+    ) != null);
+
+    const root = m19FishValueArm(helper, 0);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        root,
+        "        case '--config' '--host' '--port' '--optional'\n            return 0\n        end\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "'--serve_port'") == null);
+
+    const build = m19FishValueArm(helper, 1);
+    try std.testing.expect(std.mem.indexOf(u8, build, "'--config'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build, "'--serve_port'") == null);
+
+    const serve = m19FishValueArm(helper, 2);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        serve,
+        "        case '--config' '--host' '--port' '--optional' '--serve_port'\n            return 0\n        end\n",
+    ) != null);
+
+    const nested = m19FishValueArm(helper, 3);
+    try std.testing.expect(std.mem.indexOf(u8, nested, "'--serve_port'") != null);
+
     for ([_]String{ "'--verbose'", "'-v'", "'--fast'", "'--slow'", "'--help'" }) |absent| {
         try std.testing.expect(std.mem.indexOf(u8, helper, absent) == null);
     }
+}
+
+test "M19: sibling arity may differ" {
+    comptime {
+        const levels = model(M19Sibling).levels;
+        m19Expect(levels.len == 3, "sibling level count");
+        m19Expect(valueFlagSpellings(levels[0]).len == 0, "root has no value flags");
+        m19Expect(valueFlagSpellings(levels[1]).len == 0, "left boolean never consumes a word");
+        m19Expect(valueFlagSpellings(levels[2]).len == 1, "right value flag count");
+        m19Expect(std.mem.eql(u8, valueFlagSpellings(levels[2])[0], "--mode"), "right value spelling");
+    }
+
+    const script = try M19Sibling.completion(std.testing.allocator, "tool", .bash, &M19Sibling.default_locale).text();
+    defer std.testing.allocator.free(script);
+    const start = std.mem.indexOf(u8, script, "_dap_tool_value_flag() {\n") orelse return error.TestUnexpectedResult;
+    const rest = script[start..];
+    const end = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.TestUnexpectedResult;
+    const helper = rest[0..end];
+
+    // Level dispatch after the `*=*` guard: no flat spelling table.
+    const dispatch = std.mem.indexOf(u8, helper,
+        \\    case "$2" in
+        \\    *=*) return 1 ;;
+        \\    esac
+        \\    case "$1" in
+        \\
+    ) orelse return error.TestUnexpectedResult;
+    const flat = std.mem.indexOf(u8, helper, "'--mode') return 0 ;;") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(flat > dispatch);
+
+    try std.testing.expect(std.mem.indexOf(u8, m19ValueArm(helper, 0), "'--mode'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, m19ValueArm(helper, 1), "'--mode'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, m19ValueArm(helper, 2), "'--mode') return 0 ;;") != null);
 }
 
 test "M19: fish literal terminator and file fallback" {
@@ -5092,7 +5266,15 @@ test "M19: short enum spelling" {
     const bash_helper_at = std.mem.indexOf(u8, bash, "_dap_tool_value_flag() {\n") orelse
         return error.TestUnexpectedResult;
     const bash_helper = bash[bash_helper_at..];
-    try std.testing.expect(std.mem.indexOf(u8, bash_helper, "    '--level') return 0 ;;\n    '-l') return 0 ;;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_helper,
+        \\    0)
+        \\        case "$2" in
+        \\        '--level') return 0 ;;
+        \\        '-l') return 0 ;;
+        \\        esac
+        \\        ;;
+        \\
+    ) != null);
 
     const zsh = try M19Short.completion(std.testing.allocator, "tool", .zsh, &M19Short.default_locale).text();
     defer std.testing.allocator.free(zsh);
@@ -5178,7 +5360,14 @@ test "M19: short enum spelling" {
         \\
     ;
     try std.testing.expect(std.mem.indexOf(u8, fish_root, fish_want) != null);
-    try std.testing.expect(std.mem.indexOf(u8, fish, "    case '--level' '-l'\n        return 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish,
+        \\    case 0
+        \\        switch $argv[2]
+        \\        case '--level' '-l'
+        \\            return 0
+        \\        end
+        \\
+    ) != null);
 }
 
 test "M19: empty enumeration value positions" {
@@ -5286,9 +5475,25 @@ test "M19: bash golden" {
         \\}
         \\
         \\_dap_m19_value_flag() {
-        \\    case "$1" in
+        \\    case "$2" in
         \\    *=*) return 1 ;;
-        \\    '--mode') return 0 ;;
+        \\    esac
+        \\    case "$1" in
+        \\    0)
+        \\        case "$2" in
+        \\        '--mode') return 0 ;;
+        \\        esac
+        \\        ;;
+        \\    1)
+        \\        case "$2" in
+        \\        '--mode') return 0 ;;
+        \\        esac
+        \\        ;;
+        \\    2)
+        \\        case "$2" in
+        \\        '--mode') return 0 ;;
+        \\        esac
+        \\        ;;
         \\    esac
         \\    return 1
         \\}
@@ -5320,7 +5525,7 @@ test "M19: bash golden" {
         \\            i=$((i + 1))
         \\            continue
         \\        fi
-        \\        if _dap_m19_value_flag "$tok"; then
+        \\        if _dap_m19_value_flag "$level" "$tok"; then
         \\            if (( i + 1 <= end )) && [[ ${COMP_WORDS[i+1]} == '=' ]]; then
         \\                i=$((i + 3))
         \\            else
@@ -5352,12 +5557,12 @@ test "M19: bash golden" {
         \\    if (( literal )); then
         \\        return
         \\    fi
-        \\    if [[ $cur == '=' ]] && _dap_m19_value_flag "$prev"; then
+        \\    if [[ $cur == '=' ]] && _dap_m19_value_flag "$level" "$prev"; then
         \\        vflag=$prev
         \\        vform=eq
         \\    elif [[ $prev == '=' ]] && (( COMP_CWORD >= 2 )); then
         \\        vflag=${COMP_WORDS[COMP_CWORD-2]}
-        \\    elif _dap_m19_value_flag "$prev"; then
+        \\    elif _dap_m19_value_flag "$level" "$prev"; then
         \\        vflag=$prev
         \\    elif [[ $cur == -* && $cur == *=* ]]; then
         \\        vflag=${cur%%=*}
@@ -5439,9 +5644,25 @@ test "M19: zsh golden" {
     const want =
         \\#compdef m19
         \\_m19_value_flag() {
-        \\    case "$1" in
+        \\    case "$2" in
         \\    *=*) return 1 ;;
-        \\    '--mode') return 0 ;;
+        \\    esac
+        \\    case "$1" in
+        \\    0)
+        \\        case "$2" in
+        \\        '--mode') return 0 ;;
+        \\        esac
+        \\        ;;
+        \\    1)
+        \\        case "$2" in
+        \\        '--mode') return 0 ;;
+        \\        esac
+        \\        ;;
+        \\    2)
+        \\        case "$2" in
+        \\        '--mode') return 0 ;;
+        \\        esac
+        \\        ;;
         \\    esac
         \\    return 1
         \\}
@@ -5627,7 +5848,7 @@ test "M19: zsh golden" {
         \\            i=$(( i + 1 ))
         \\            continue
         \\        fi
-        \\        if _m19_value_flag "$tok"; then
+        \\        if _m19_value_flag "$level" "$tok"; then
         \\            if (( i + 1 <= end )) && [[ ${words[i+1]} == '=' ]]; then
         \\                i=$(( i + 3 ))
         \\            else
@@ -5660,12 +5881,12 @@ test "M19: zsh golden" {
         \\        return 1
         \\    fi
         \\    if (( CURRENT >= 2 )); then
-        \\        if [[ $PREFIX == '=' ]] && _m19_value_flag "$words[CURRENT-1]"; then
+        \\        if [[ $PREFIX == '=' ]] && _m19_value_flag "$level" "$words[CURRENT-1]"; then
         \\            vflag=$words[CURRENT-1]
         \\            vform=eq
         \\        elif [[ $words[CURRENT-1] == '=' ]] && (( CURRENT >= 3 )); then
         \\            vflag=$words[CURRENT-2]
-        \\        elif _m19_value_flag "$words[CURRENT-1]"; then
+        \\        elif _m19_value_flag "$level" "$words[CURRENT-1]"; then
         \\            vflag=$words[CURRENT-1]
         \\        fi
         \\    fi
@@ -5773,11 +5994,26 @@ test "M19: fish golden" {
     defer std.testing.allocator.free(script);
     const want =
         \\function __dap_m19_value_flag
-        \\    switch $argv[1]
+        \\    switch $argv[2]
         \\    case '*=*'
         \\        return 1
-        \\    case '--mode'
-        \\        return 0
+        \\    end
+        \\    switch $argv[1]
+        \\    case 0
+        \\        switch $argv[2]
+        \\        case '--mode'
+        \\            return 0
+        \\        end
+        \\    case 1
+        \\        switch $argv[2]
+        \\        case '--mode'
+        \\            return 0
+        \\        end
+        \\    case 2
+        \\        switch $argv[2]
+        \\        case '--mode'
+        \\            return 0
+        \\        end
         \\    end
         \\    return 1
         \\end
@@ -5957,7 +6193,7 @@ test "M19: fish golden" {
         \\            set i (math $i + 1)
         \\            continue
         \\        end
-        \\        if __dap_m19_value_flag $tok
+        \\        if __dap_m19_value_flag $level $tok
         \\            set i (math $i + 2)
         \\            continue
         \\        end
@@ -5991,7 +6227,7 @@ test "M19: fish golden" {
         \\        set vflag (string split -m 1 '=' -- $cur)[1]
         \\        set vform full
         \\    else if test -n "$prev"
-        \\        if __dap_m19_value_flag $prev
+        \\        if __dap_m19_value_flag $level $prev
         \\            set vflag $prev
         \\        end
         \\    end
@@ -6547,6 +6783,28 @@ const M22ArgsDef = .{
 
 const M22Args = generate(App{ .name = "m22-args", .help = "M22 args." }, M22ArgsDef);
 
+/// Sibling commands reuse both a bool and a value spelling. Each level's
+/// model must see only its ancestors' flags plus its own, never a sibling's.
+const M22SiblingsDef = .{
+    .root = Flag(u8){ .long = "root" },
+    .one = Command(.{ .help = "One." }, .{
+        .one_only = Flag([]const u8){
+            .long = "one-only",
+            .completion = Completion.custom(m21Callback),
+        },
+        .same = Flag(bool){ .long = "same" },
+    }),
+    .two = Command(.{ .help = "Two." }, .{
+        .two_only = Flag([]const u8){
+            .long = "two-only",
+            .completion = Completion.custom(m21Callback),
+        },
+        .same = Flag([]const u8){ .long = "same" },
+    }),
+};
+
+const M22Siblings = generate(App{ .name = "m22-siblings", .help = "M22 siblings." }, M22SiblingsDef);
+
 fn m22Expect(comptime ok: bool, comptime msg: []const u8) void {
     if (!ok) @compileError("M22 failed: " ++ msg);
 }
@@ -6682,6 +6940,41 @@ test "M22: model keeps the existing level layout" {
         m22Expect(m.levels[0].flags.len == 3, "root effective flags");
         m22Expect(m.levels[2].arguments.len == 1, "leaf argument");
         m22Expect(m.levels[0].commands.len == 1, "root command");
+    }
+}
+
+test "M22: sibling reuse stays out of the other branch" {
+    comptime {
+        const m = model(M22Siblings);
+        m22Expect(m.levels.len == 3, "sibling level count");
+        m22Expect(m.bindings.len == 2, "one binding per predictor");
+
+        const root = m.levels[0];
+        const one = m.levels[1];
+        const two = m.levels[2];
+        m22Expect(root.flags.len == 2, "root effective flags");
+        m22Expect(std.mem.eql(u8, one.path, "m22-siblings one"), "left path");
+        m22Expect(std.mem.eql(u8, two.path, "m22-siblings two"), "right path");
+
+        m22Expect(one.flags.len == 4, "left effective flags");
+        m22Expect(two.flags.len == 4, "right effective flags");
+        _ = m22FlagIndex(one, "help");
+        _ = m22FlagIndex(one, "root");
+        _ = m22FlagIndex(one, "one-only");
+        _ = m22FlagIndex(one, "same");
+        _ = m22FlagIndex(two, "help");
+        _ = m22FlagIndex(two, "root");
+        _ = m22FlagIndex(two, "two-only");
+        _ = m22FlagIndex(two, "same");
+
+        m22Expect(m19IndexOfLong(one.flags, "two-only") == null, "left never sees the right flag");
+        m22Expect(m19IndexOfLong(two.flags, "one-only") == null, "right never sees the left flag");
+
+        m22Expect(m22FlagBinding(one, "one-only").? == 0, "left binding index");
+        m22Expect(m22FlagBinding(two, "two-only").? == 1, "right binding index");
+        m22Expect(m22FlagBinding(one, "same") == null, "left bool is unbound");
+        m22Expect(m22FlagBinding(two, "same") == null, "right plain value is unbound");
+        m22Expect(m22FlagBinding(one, "root") == null, "plain inherited flag is unbound");
     }
 }
 
