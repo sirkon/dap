@@ -3045,15 +3045,19 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// Render a spec's default value into an owned string: the direct
         /// value when declared (a custom type renders through `encode`),
         /// otherwise `$NAME` for an environment-only default, otherwise
-        /// `null`.
+        /// `null`. An empty value renders as `""` so it stays visible.
         fn renderDefault(allocator: std.mem.Allocator, comptime s: Spec) std.mem.Allocator.Error!?String {
             if (s.default) |d| {
-                if (s.vtype == String) return try allocator.dupe(u8, d.get([]const u8));
-                if (@typeInfo(s.vtype) == .@"struct") {
+                const rendered: String = if (s.vtype == String)
+                    try allocator.dupe(u8, d.get([]const u8))
+                else if (@typeInfo(s.vtype) == .@"struct") blk: {
                     var tmp: s.vtype = d.get(s.vtype);
-                    return try tmp.encode(allocator);
-                }
-                return try std.fmt.allocPrint(allocator, "{}", .{d.get(s.vtype)});
+                    break :blk try tmp.encode(allocator);
+                } else
+                    try std.fmt.allocPrint(allocator, "{}", .{d.get(s.vtype)});
+                if (rendered.len != 0) return rendered;
+                allocator.free(rendered);
+                return try allocator.dupe(u8, "\"\"");
             }
             if (s.default_env) |name| {
                 return try std.fmt.allocPrint(allocator, "${s}", .{name});
@@ -6643,7 +6647,7 @@ test "M9: helpData.renderCompact matches the reference layout" {
         \\Manual test of the dap module.
         \\
         \\Arguments:
-        \\  [<target>]    Target directory. Default value: .
+        \\  [<target>]    Target directory. Default value: "".
         \\
         \\Flags:
         \\  -h, --help        Show context-sensitive help.
@@ -8880,6 +8884,17 @@ const M27ArgPlain = generate(M27Flat, .{
     .target = Argument([]const u8){ .help = "Target dir." },
 });
 
+const M27EmptyDefaults = generate(M27Flat, .{
+    .path = Flag([]const u8){
+        .default = Default([]const u8){ .direct = "" },
+        .help = "File path.",
+    },
+    .target = Argument([]const u8){
+        .default = Default([]const u8){ .direct = "" },
+        .help = "Target dir.",
+    },
+});
+
 const M27ArgEmptyHelp = generate(M27Flat, .{
     .mode = Argument(M27Two){
         .default = Default(M27Two){ .direct = .{} },
@@ -9179,6 +9194,18 @@ test "M27: non-enumeration arguments keep their row layout" {
         \\
     ;
     try expectM27Help(M27ArgValuesOnly, values_only);
+}
+
+test "M27: an empty default is quoted" {
+    const text = try M27EmptyDefaults.helpTextDeclared(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "--path=\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Default value: \"\".") != null);
+
+    var data = try M27EmptyDefaults.helpData(std.testing.allocator);
+    defer data.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("\"\"", data.flag_groups[0].flags[1].default.?);
+    try std.testing.expectEqualStrings("\"\"", data.arg_groups[0].args[0].default.?);
 }
 
 test "M27: environment-only defaults render as $NAME" {

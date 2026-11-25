@@ -582,6 +582,7 @@ Group
 
 - Short and long names occupy aligned sub-columns. A value placeholder is `=DEFAULT` when a direct default exists,
   `=$NAME` when only an environment default exists, and `=NAME` in upper case otherwise.
+- A default that renders empty is quoted as `""`, both in the `=DEFAULT` placeholder and in the default clause.
 - Flag groups are ordered by name, with the ungrouped bucket first.
 - Required flags render as `--name` or `--name=VALUE`; optional booleans render as `[--flag]`; positional arguments
   render as `<arg>` or `[<arg>]` when they have any default, including an environment-only one.

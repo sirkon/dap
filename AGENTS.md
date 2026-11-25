@@ -413,7 +413,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   `values: []HelpData.Value` slice (wire name, nullable literal, nullable
   key) on its `Flag` or `Argument`; non-enumerations and the empty
   `Enumeration` get `&.{}`. `renderDefault` renders the direct default,
-  `$NAME` for an environment-only default, and `null` otherwise, so usage
+  `$NAME` for an environment-only default, and `null` otherwise, quoting an
+  empty rendered value as `""`, so usage
   lines bracket such arguments and omit defaulted flags. Keys, value
   strings and the slices are duplicated, so `deinit` frees them and
   `absorbScope` moves `info_i18n` beside `info`; `usage_alts` never frees
