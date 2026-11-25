@@ -2,7 +2,15 @@
 
 Declarative command-line parser for Zig (0.17.0).
 
-![example help output](./resources/help-example.svg)
+![example help output](./resources/help-example-default.svg)
+<details>
+<summary>With localizations</summary>
+
+![example help output in Russian](./resources/help-example-ru.svg)
+
+![example help output in Simplified Chinese](./resources/help-example-zh.svg)
+
+</details>
 
 You declare the command line once, as a struct literal. `dap.generate` turns that declaration into a parser and a typed
 `View` at compile time, so names, types, defaults and validation are checked by the compiler rather than at runtime.
@@ -88,8 +96,8 @@ already decoded and validated. A bad value prints a diagnostic plus the relevant
 go.
 
 Help texts read as sentences, so each `.help` literal ends with a period. Leave the existing punctuation alone when the
-text already ends with `!`, `?`, `...`, a Unicode ellipsis (`…`), or a Unicode/full-width period (`。`, `．`). Simplified
-Chinese should use `。` rather than an ASCII `.`.
+text already ends with `!`, `?`, `...`, a Unicode ellipsis (`…`), or a Unicode/full-width period (`。`, `．`).
+Simplified Chinese should use `。` rather than an ASCII `.`.
 
 ## A commanded CLI
 
@@ -165,9 +173,9 @@ Help follows the entered path: `workspace serve --help` describes `serve` with t
 deep in the tree renders that level's page. `CLI.usage(cli)` prints the same page, which is useful when no command was
 given. Completion is generated from the declaration; `CLI.completion(allocator, app_name, shell, locale)` is lazy,
 `app_name` is the name the script registers, not `App.name`, and `locale` selects the language of the static
-descriptions (`i18n.locale(environ)` for the machine's locale, `&CLI.default_locale` for the declaration default).
-The route it serves for dynamic values runs at the very start of `CLI.parse`, so do file, socket or network work only
-after parsing.
+descriptions (`i18n.locale(environ)` for the machine's locale, `&CLI.default_locale` for the declaration default). The
+route it serves for dynamic values runs at the very start of `CLI.parse`, so do file, socket or network work only after
+parsing.
 
 ## Internationalization
 
@@ -205,35 +213,35 @@ var cli = try CLI.parse(arena, init.minimal.environ, &i18n, argv[1..], &diag);
 command handoff, so `-h`/`--help`, the failure page and `CLI.usage(view)` all render with it, while `CLI.helpText` keeps
 the declaration default. The configured highlight is a recommendation: it is used only when the destination (stdout for
 help and `usage`, stderr for the failure page) is a terminal that supports ANSI escape codes and `NO_COLOR` is unset and
-non-empty; otherwise the page renders `.flat`. Passing `null` as the builder selects that same generated default, whose text is the `.help`
-literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`, `ko` and `ja`;
-`withUser` replaces the user map and seeds the `builtin_help` string. A key the selected locale lacks is
-`error.UnknownTranslationKey`, never an English fallback. Shell completion is localized at generation time: the
-static descriptions of keyed flags, commands, and enumeration values render in the locale handed to `CLI.completion`.
+non-empty; otherwise the page renders `.flat`. Passing `null` as the builder selects that same generated default, whose
+text is the `.help` literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`,
+`ko` and `ja`; `withUser` replaces the user map and seeds the `builtin_help` string. A key the selected locale lacks is
+`error.UnknownTranslationKey`, never an English fallback. Shell completion is localized at generation time: the static
+descriptions of keyed flags, commands, and enumeration values render in the locale handed to `CLI.completion`.
 
 ## Capabilities
 
 Everything below is specified in detail in [AGENTS-SDK.md](./AGENTS-SDK.md).
 
-| Capability          | What you get                                                                                              | Reference                                                  |
-| ------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| Flags and arguments | `Flag(T)` and `Argument(T)`, verbatim wire names, short aliases, requiredness derived from defaults       | [§3.1–3.3](./AGENTS-SDK.md#31-names-and-requirements)      |
-| Defaults            | environment fallback, direct defaults, `dap.defaultValue`; precedence `argv > env > direct > zero`        | [§3.4](./AGENTS-SDK.md#34-defaultt-and-defaultvalue)       |
-| Optional flags      | `?T` view fields so "absent" differs from zero; no defaults, no optional arguments                        | [§3.5](./AGENTS-SDK.md#35-optional-flags)                  |
-| Help grouping       | `Group` sections and headings, flat view fields                                                           | [§3.6](./AGENTS-SDK.md#36-groupdef-name)                   |
-| Alternatives        | `Alt` branches with typed nullable unions, `VariantNamed` tags, conflict detection                        | [§3.7](./AGENTS-SDK.md#37-alt-and-variantnamed)            |
-| Subcommands         | nested `Command`, synonyms, typed dispatch via `CLI.command`, global flag names, `--` terminator          | [§3.8](./AGENTS-SDK.md#38-commandmeta-def-and-commandmeta) |
-| Composition         | `Compose.shift` prefixing and short-name stripping, `Compose.concat` merging, compile-time clashes        | [§3.9](./AGENTS-SDK.md#39-composition)                     |
-| Value types         | builtin integers, floats and strings, plus any type with `decode`/`encode`/`deinit`                       | [§4](./AGENTS-SDK.md#4-value-types)                        |
-| Enumerations        | fixed wire-name sets via `Enumeration`, per-value help, completion candidates                             | [§4.3](./AGENTS-SDK.md#43-enumerationt-and-enum)           |
-| Validation          | `Validate.stringNotEmpty`, `Validate.intNotZero`, custom validators over wire, env and default values     | [§11](./AGENTS-SDK.md#11-validation)                       |
-| Diagnostics         | `Diag` messages, offending token and field, Levenshtein typo suggestions, failure exit behavior           | [§7](./AGENTS-SDK.md#7-errors-and-diagnostics)             |
+| Capability          | What you get                                                                                                             | Reference                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- |
+| Flags and arguments | `Flag(T)` and `Argument(T)`, verbatim wire names, short aliases, requiredness derived from defaults                      | [§3.1–3.3](./AGENTS-SDK.md#31-names-and-requirements)      |
+| Defaults            | environment fallback, direct defaults, `dap.defaultValue`; precedence `argv > env > direct > zero`                       | [§3.4](./AGENTS-SDK.md#34-defaultt-and-defaultvalue)       |
+| Optional flags      | `?T` view fields so "absent" differs from zero; no defaults, no optional arguments                                       | [§3.5](./AGENTS-SDK.md#35-optional-flags)                  |
+| Help grouping       | `Group` sections and headings, flat view fields                                                                          | [§3.6](./AGENTS-SDK.md#36-groupdef-name)                   |
+| Alternatives        | `Alt` branches with typed nullable unions, `VariantNamed` tags, conflict detection                                       | [§3.7](./AGENTS-SDK.md#37-alt-and-variantnamed)            |
+| Subcommands         | nested `Command`, synonyms, typed dispatch via `CLI.command`, global flag names, `--` terminator                         | [§3.8](./AGENTS-SDK.md#38-commandmeta-def-and-commandmeta) |
+| Composition         | `Compose.shift` prefixing and short-name stripping, `Compose.concat` merging, compile-time clashes                       | [§3.9](./AGENTS-SDK.md#39-composition)                     |
+| Value types         | builtin integers, floats and strings, plus any type with `decode`/`encode`/`deinit`                                      | [§4](./AGENTS-SDK.md#4-value-types)                        |
+| Enumerations        | fixed wire-name sets via `Enumeration`, per-value help, completion candidates                                            | [§4.3](./AGENTS-SDK.md#43-enumerationt-and-enum)           |
+| Validation          | `Validate.stringNotEmpty`, `Validate.intNotZero`, custom validators over wire, env and default values                    | [§11](./AGENTS-SDK.md#11-validation)                       |
+| Diagnostics         | `Diag` messages, offending token and field, Levenshtein typo suggestions, failure exit behavior                          | [§7](./AGENTS-SDK.md#7-errors-and-diagnostics)             |
 | Help rendering      | compact two-column page, `HelpData` model, custom renderers, terminal-aware highlight schemes, context-sensitive `usage` | [§8](./AGENTS-SDK.md#8-help)                               |
-| Localization        | `.i18n` keys on the app, flags, arguments and commands, environment-selected locales, prefilled templates | [§9](./AGENTS-SDK.md#9-internationalization)               |
-| Shell completion    | bash/zsh/fish scripts, install targets, static candidates, argument values                                | [§10](./AGENTS-SDK.md#10-completion)                       |
-| Predictors          | native file fallback, `fs`, `disabled`, `launch`, `call`, `custom` callbacks through the hidden route     | [§10.2](./AGENTS-SDK.md#102-predictors)                    |
-| Ownership           | `CLI.deinit` releases strings, custom values, the active `Alt` branch and nested views                    | [§12](./AGENTS-SDK.md#12-ownership)                        |
-| Compile-time checks | declaration errors, duplicate names, global flag uniqueness, structural constraints                       | [§13](./AGENTS-SDK.md#13-compile-time-constraints)         |
+| Localization        | `.i18n` keys on the app, flags, arguments and commands, environment-selected locales, prefilled templates                | [§9](./AGENTS-SDK.md#9-internationalization)               |
+| Shell completion    | bash/zsh/fish scripts, install targets, static candidates, argument values                                               | [§10](./AGENTS-SDK.md#10-completion)                       |
+| Predictors          | native file fallback, `fs`, `disabled`, `launch`, `call`, `custom` callbacks through the hidden route                    | [§10.2](./AGENTS-SDK.md#102-predictors)                    |
+| Ownership           | `CLI.deinit` releases strings, custom values, the active `Alt` branch and nested views                                   | [§12](./AGENTS-SDK.md#12-ownership)                        |
+| Compile-time checks | declaration errors, duplicate names, global flag uniqueness, structural constraints                                      | [§13](./AGENTS-SDK.md#13-compile-time-constraints)         |
 
 ## Building and testing
 
