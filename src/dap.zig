@@ -2525,12 +2525,11 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
     comptime checks_mod.checkChainFlagNames(norm, &[_]String{app.name}, &.{});
 
     // i18n keys are declaration-wide identifiers: valid field names, unique
-    // within the tree, never shadowing a builtin translation. The literal
-    // each key carries is unique too, so no translation value is reused.
-    // Nothing resolves through a locale yet.
+    // within the tree, never shadowing a builtin translation. Help literals
+    // are not identifiers and may repeat freely. Nothing resolves through a
+    // locale yet.
     const i18n_origins = checks_mod.collectI18n(norm, app.help, app.i18n, &[_]String{app.name}, &.{});
     comptime checks_mod.checkI18nKeys(i18n_origins);
-    comptime checks_mod.checkI18nValues(i18n_origins);
 
     // The complete English locale every declaration carries; rendering still
     // reads the raw literals until stage 5 teaches it to take a locale.

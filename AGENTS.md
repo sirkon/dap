@@ -142,8 +142,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   `merge_group`, `merge_alt`). `I18nOrigin`/`collectI18n` walk the declaration
   tree once per key (builtin help skipped, a command meta key and its derived
   child app key counted once); `checkI18nKeys` validates spelling, builtin
-  collisions and key uniqueness, and `checkI18nValues` rejects a literal
-  reused by two keys; `validI18nKey` is the shared predicate. Also
+  collisions and key uniqueness; `validI18nKey` is the shared predicate. Also
   defines `validLongName`/`validPrefix` (used by `shift`) and exposes
   `Field`/`fieldsOf`/`typeOfField` to compose.
 - `src/compose.zig` — `pub const Compose` with `shift` and `concat`. Private
@@ -315,16 +314,17 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
     long/short flags along a command chain (group and `Alt` members included;
     comparability comes from command wire-name level paths, which only
     `.command` recursion extends, so a sibling subtree's flag is skipped),
-    top-level command wire names/synonyms, i18n keys and the literal value
-    each key carries (so a duplicate is reported at the `concat` call site
-    instead of later in `generate`), and inside a merged `Alt` duplicate
+    top-level command wire names/synonyms, i18n keys (so a duplicate is
+    reported at the `concat` call site instead of later in `generate`), and
+    inside a merged `Alt` duplicate
     branch field names and tags. Messages name the class and the
     dotted declaration-field path on each side (paths stay message-only), e.g.
     `field name 'port' clash in declarations (left g.port, right g.port)`;
     classes are `field name`, `flag name` (dash-inclusive), `command name`,
-    `argument name`, `i18n key`, `i18n value`, `alt branch name`, plus
+    `argument name`, `i18n key`, `alt branch name`, plus
     `group 'g' name conflict: left 'a' != right 'b'`. Duplicate group names
-    are not compared (help merges them). Structural rules stay with
+    are not compared (help merges them). Help literals are not compared and
+    may repeat. Structural rules stay with
     `generate`, so a pair it rejects fails at the `generate` call site.
 
 - A level that declares commands additionally exposes a switch-shaped accessor
@@ -372,15 +372,15 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   locale maps `builtin_help` to the injected flag's own help literal.
 - i18n keys are field-name-shaped (`[_A-Za-z][_0-9A-Za-z]*`, ASCII,
   non-empty), unique across the whole declaration tree, and must not equal
-  `builtin_help`. The literal each key carries must also be unique: two keys
-  may not map to the same default-locale value, so a keyed field always owns
-  its own help text while a keyless field may repeat any literal. `App.i18n`
+  `builtin_help`. Help literals are not identifiers: two keys may map to the
+  same default-locale value, and a keyless field may repeat any literal.
+  `App.i18n`
   participates, so the app description key cannot double as a flag key;
   enumeration branch keys participate too, with origins read as
   `app:mode.fast`. `Group` display names have no i18n channel.
   `generate` runs `checks.collectI18n` right after `normalizeRanked`, beside
-  `checkChainFlagNames`, then `checkI18nKeys` and `checkI18nValues`; a
-  violation is a `@compileError` naming the key or value and both paths. A
+  `checkChainFlagNames`, then `checkI18nKeys`; a
+  violation is a `@compileError` naming the key and both paths. A
   command's `CommandMeta.i18n` and the child `App.i18n` derived by `subApp` are
   one origin.
 - The default locale is generated per declaration, never exported: `generate`

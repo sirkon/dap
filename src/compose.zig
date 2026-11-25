@@ -766,7 +766,7 @@ test "Compose.concat rejects argument display name clashes" {
     }
 }
 
-test "Compose.concat accepts distinct i18n keys and values" {
+test "Compose.concat accepts distinct i18n keys" {
     const a = .{ .user = Flag(String){ .help = "User.", .i18n = "flag_user" } };
     const b = .{ .host = Flag(String){ .help = "Host.", .i18n = "flag_host" } };
     const merged = Compose.concat(a, b);
@@ -782,12 +782,14 @@ test "Compose.concat rejects an i18n key reused across inputs" {
     }
 }
 
-test "Compose.concat rejects an i18n value reused across inputs" {
-    if (false) {
-        const a = .{ .port = Flag(u16){ .help = "Same.", .i18n = "key_port" } };
-        const b = .{ .host = Flag(String){ .help = "Same.", .i18n = "key_host" } };
-        comptime _ = Compose.concat(a, b);
-    }
+test "Compose.concat accepts an i18n value reused across inputs" {
+    const a = .{ .port = Flag(u16){ .help = "Same.", .i18n = "key_port" } };
+    const b = .{ .host = Flag(String){ .help = "Same.", .i18n = "key_host" } };
+    const merged = Compose.concat(a, b);
+    try std.testing.expectEqualStrings("key_port", merged.port.i18n.?);
+    try std.testing.expectEqualStrings("key_host", merged.host.i18n.?);
+    try std.testing.expectEqualStrings("Same.", merged.port.help);
+    try std.testing.expectEqualStrings("Same.", merged.host.help);
 }
 
 test "Compose.shift rejects an empty or malformed prefix" {

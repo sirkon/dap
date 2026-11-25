@@ -365,24 +365,6 @@ pub fn checkI18nKeys(comptime origins: []const I18nOrigin) void {
     }
 }
 
-/// Pairwise uniqueness of the literal values behind the collected keys: each
-/// i18n key carries its own help literal, and two keys mapping to the same
-/// default-locale value would make the generated entries ambiguous. A field
-/// with no key owns no translation value, so it is exempt; a keyed field must
-/// supply a literal no other keyed field repeats.
-pub fn checkI18nValues(comptime origins: []const I18nOrigin) void {
-    comptime {
-        for (origins, 0..) |a, i| {
-            for (origins[i + 1 ..]) |b| {
-                if (std.mem.eql(u8, a.literal, b.literal)) {
-                    @compileError("i18n value '" ++ a.literal ++ "' is used by both '" ++ levelPath(a.path) ++ ":" ++ a.field ++
-                        "' and '" ++ levelPath(b.path) ++ ":" ++ b.field ++ "'");
-                }
-            }
-        }
-    }
-}
-
 /// Whether `s` is a well-formed long flag name: non-empty, no whitespace or
 /// control byte, no `=`, and no leading or trailing `-`. Bytes are otherwise
 /// accepted verbatim (non-ASCII included), matching the fact that `dap` does
@@ -806,7 +788,6 @@ fn levelCommandSpellings(comptime def: anytype) []const CommandSpelling {
 /// clash message can name both sides precisely.
 const ConcatI18n = struct {
     key: String,
-    literal: String,
     path: String,
 };
 
@@ -824,7 +805,7 @@ fn specConcatI18n(comptime s: Spec, comptime path: String, comptime acc: []const
     comptime {
         var out = acc;
         if (s.i18n) |key| {
-            out = out ++ &[_]ConcatI18n{.{ .key = key, .literal = s.help, .path = path }};
+            out = out ++ &[_]ConcatI18n{.{ .key = key, .path = path }};
         }
         const T = s.vtype;
         if (@typeInfo(T) == .@"struct" and
@@ -833,8 +814,8 @@ fn specConcatI18n(comptime s: Spec, comptime path: String, comptime acc: []const
             for (T.names, T.helps, T.help_i18n) |name, help, key| {
                 const k = key orelse continue;
                 if (k.len == 0) continue;
-                const literal = help orelse continue;
-                out = out ++ &[_]ConcatI18n{.{ .key = k, .literal = literal, .path = path ++ "." ++ name }};
+                if (help == null) continue;
+                out = out ++ &[_]ConcatI18n{.{ .key = k, .path = path ++ "." ++ name }};
             }
         }
         return out;
@@ -851,7 +832,7 @@ fn fieldConcatI18n(comptime f: Field, comptime prefix: String, comptime acc: []c
                 .command => {
                     var out = acc;
                     if (V.cmd_meta.i18n) |key| {
-                        out = out ++ &[_]ConcatI18n{.{ .key = key, .literal = V.cmd_meta.help, .path = path }};
+                        out = out ++ &[_]ConcatI18n{.{ .key = key, .path = path }};
                     }
                     return collectConcatI18n(V.cmd_def, path, out);
                 },
@@ -873,11 +854,11 @@ fn fieldConcatI18n(comptime f: Field, comptime prefix: String, comptime acc: []c
     }
 }
 
-/// i18n keys, and the literal values they carry, are declaration-wide
-/// identifiers: merging two inputs may repeat neither, or `generate` would
-/// reject the result without saying which input introduced the duplicate. The
-/// pair is compared here instead so the message names both dotted declaration
-/// paths at the `concat` call site.
+/// i18n keys are declaration-wide identifiers: merging two inputs may not
+/// repeat one, or `generate` would reject the result without saying which
+/// input introduced the duplicate. Keys are compared here instead so the
+/// message names both dotted declaration paths at the `concat` call site.
+/// Help literals are not identifiers and may repeat freely.
 fn checkConcatI18n(comptime left: anytype, comptime right: anytype) void {
     comptime {
         const ls = collectConcatI18n(left, "", &.{});
@@ -885,7 +866,6 @@ fn checkConcatI18n(comptime left: anytype, comptime right: anytype) void {
         for (ls) |a| {
             for (rs) |b| {
                 if (std.mem.eql(u8, a.key, b.key)) clash("i18n key", a.key, a.path, b.path);
-                if (std.mem.eql(u8, a.literal, b.literal)) clash("i18n value", a.literal, a.path, b.path);
             }
         }
     }
@@ -959,20 +939,18 @@ test "checks: collectI18n walks the tree once per key" {
     for (origins) |o| try std.testing.expect(!std.mem.eql(u8, o.field, builtin_help_field));
 
     // A command's meta key and the child App key derived from it are one
-    // origin, so the tree's keys are all unique. Each key also owns its own
-    // literal, so no value is reused either.
+    // origin, so the tree's keys are all unique.
     comptime checkI18nKeys(origins);
-    comptime checkI18nValues(origins);
 }
 
-test "checks: checkI18nValues rejects a reused literal" {
-    if (false) {
-        const norm = normalize(withBuiltinHelp(.{
-            .a = dap.Flag(u8){ .help = "Same.", .i18n = "key_one" },
-            .b = dap.Flag(u8){ .help = "Same.", .i18n = "key_two" },
-        }));
-        comptime checkI18nValues(collectI18n(norm, "", null, &[_]String{"app"}, &.{}));
-    }
+test "checks: two keyed fields may share a help literal" {
+    const norm = comptime normalize(withBuiltinHelp(.{
+        .a = dap.Flag(u8){ .help = "Same.", .i18n = "key_one" },
+        .b = dap.Flag(u8){ .help = "Same.", .i18n = "key_two" },
+    }));
+    const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
+    try std.testing.expectEqual(@as(usize, 2), origins.len);
+    comptime checkI18nKeys(origins);
 }
 
 test "checks: a keyless field may share a keyed literal" {
@@ -983,7 +961,6 @@ test "checks: a keyless field may share a keyed literal" {
     const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
     try std.testing.expectEqual(@as(usize, 1), origins.len);
     comptime checkI18nKeys(origins);
-    comptime checkI18nValues(origins);
 }
 
 test "checks: checkI18nKeys rejects an invalid key" {
@@ -1060,7 +1037,6 @@ test "checks: the removed shell builtin keys are ordinary user keys" {
     const origins = comptime collectI18n(norm, "", null, &[_]String{"app"}, &.{});
     try std.testing.expectEqual(@as(usize, 3), origins.len);
     comptime checkI18nKeys(origins);
-    comptime checkI18nValues(origins);
 }
 
 test "checks: checkI18nKeys rejects duplicate branch keys in one enumeration" {

@@ -299,11 +299,11 @@ has no leading or trailing `-`. The outer call's prefix appears first: `shift(sh
 
 Cross-input collisions are compile errors for: a flat field name (group and `Alt` members included), a positional
 argument display name, a long or short flag anywhere in either command tree, a top-level command name or synonym, and
-an i18n key or the literal value it carries (so a duplicate surfaces at the `concat` call site instead of later in
-`generate`). Inside a merged `Alt`, duplicate branch field names and duplicate branch tags are also errors. Diagnostics
-name the class and the dotted declaration-field path on each side, for example
+an i18n key (so a duplicate surfaces at the `concat` call site instead of later in `generate`). Help literals are not
+compared and may repeat. Inside a merged `Alt`, duplicate branch field names and duplicate branch tags are also errors.
+Diagnostics name the class and the dotted declaration-field path on each side, for example
 `flag name '--port' clash in declarations (left serve.port, right net.p)` or
-`i18n value 'Same.' clash in declarations (left port, right host)`.
+`i18n key 'key_port' clash in declarations (left port, right host)`.
 
 `concat(.{}, decl)` and `concat(decl, .{})` are identities. Nested `concat` is associative in declaration order.
 Structural validity (commands mixed with arguments, a defaulted argument that stops being last, `Alt` restrictions)
@@ -1062,12 +1062,12 @@ The following are compile errors:
 - An enumeration branch that is not `dap.Enum`-shaped (missing `name`/`help`, or a non-null `help` without `text`), or a
   duplicate enumeration wire name.
 - An i18n key that is not `[_A-Za-z][_0-9A-Za-z]*`, repeats anywhere in the declaration tree (enumeration branch keys
-  included), or equals `builtin_help`; an i18n value (the `.help` literal a key carries) that another key already uses.
+  included), or equals `builtin_help`. Help literals are not identifiers and may repeat freely.
 - A `Locale` or `withUser` map with an invalid key or a builtin collision; a malformed `Diag` template.
 - `Builder.append` with an empty or duplicate locale tag, an invalid locale, or a missing required key.
 - `Compose.shift` with an empty or malformed prefix.
-- `Compose.concat` with a non-mergeable same-named pair, a cross-input name collision (i18n keys and their literal
-  values included), or duplicate branch names or tags inside a merged `Alt`.
+- `Compose.concat` with a non-mergeable same-named pair, a cross-input name collision (i18n keys included), or
+  duplicate branch names or tags inside a merged `Alt`.
 
 ---
 
