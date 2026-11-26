@@ -10,12 +10,12 @@ declaration.
 ## Status: implemented
 
 The core pipeline is implemented and green. `zig build test` (both test roots),
-`zig test src/dap.zig` (388 tests), `zig test src/compose.zig` (413 tests,
+`zig test src/dap.zig` (397 tests), `zig test src/compose.zig` (428 tests,
 including the imported `dap.zig`/`checks.zig`/`completion.zig` blocks) and
 `zig test src/i18n.zig` (8 tests) pass. Runtime help and diagnostics are
 localizable: a declaration names translations by i18n key, `parse` selects a
-locale from the environment through a comptime builder, and the selected
-locale travels in the `View`. The milestone-tagged M1–M28 blocks are the plan
+locale from `init.minimal.environ` through a comptime builder, and the selected
+locale travels in the `View`. The milestone-tagged M1–M29 blocks are the plan
 of record; there is no `PLAN.md`.
 
 - `src/dap.zig` holds the DSL, spec normalization, `generate`,
@@ -47,13 +47,19 @@ of record; there is no `PLAN.md`.
 - `src/stdcompare.zig` holds the private `levenshtein` helper the suggester
   ranks with; it is imported directly by `dap.zig` (not re-exported).
 - `src/completion_fixture.zig` is the predictor fixture application: it
-  declares a callback, native and binary filesystem targets, `disabled`,
+  declares two callbacks (the plain pair and the mixed helped/bare/wide/spaced
+  set behind `--shape`), native and binary filesystem targets, `disabled`,
   `launch`, `call`, and positional predictors, and its `main` calls `parse` so
   the shell route works. `completion-test` builds it as
   `dap-completion-fixture`.
 - `src/completion_test.zig` is the opt-in shell integration suite; it imports
   the public module and the fixture, and is compiled only by the
   `completion-test` step.
+- `src/test_init.zig` is the test-only `std.process.Init` builder (`TestInit`):
+  it owns the arena and the environment map its `value` points at, so it is
+  initialized in place with `setup` and never copied. It is imported only by the
+  test blocks of `dap.zig`, `compose.zig` and `completion.zig`; no production
+  file and not `root.zig` reaches it.
 - `src/root.zig` re-exports the public surface from `dap.zig` (no
   `usingnamespace`; exports are explicit), including `HelpError`, plus
   `I18n` from `i18n.zig`.
@@ -131,11 +137,21 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   M19–M26 tests and the M28 localization block. All completion code lives
   here.
 - `src/completion_fixture.zig` — predictor fixture application and its
-  declaration; built as an executable by `completion-test`.
+  declaration (two callbacks, including the `--shape` set that exercises the
+  zsh table's width, escaping and help-less fallback); built as an executable
+  by `completion-test`.
 - `src/completion_test.zig` — opt-in shell integration tests (syntax checks,
   the static command matrix, and the predictor matrix through the fixture
   executable); imports the public `dap` module and never runs under
   `zig build test`.
+- `src/test_init.zig` — the test-only `Init` builder. `TestInit.setup(environ)`
+  creates an arena and an `Environ.Map` with `std.testing.allocator` and fills
+  `value` with `minimal.environ = environ`, empty args, `arena`/`environ_map`
+  pointing at its own fields, `gpa = std.testing.allocator`, `io =
+  std.testing.io` and `std.process.Preopens.empty`. `deinit` frees the map then
+  the arena and never the borrowed environment. Callers use the in-place
+  pattern (`var t: TestInit = undefined; t.setup(...); defer t.deinit();`)
+  because a by-value factory would leave the pointers dangling.
 - `src/checks.zig` — shared checks and the composition planner. Moved checks
   keep their `dap.zig` message shapes. `concatPlan(left, right)` validates a
   pair and returns the per-result-field plan (`copy_left`, `copy_right`,
@@ -475,10 +491,14 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   `__command<rank>` tag and before the `Alt` and command fields; Phase 0 of
   `parseInnerHelp` sets both and every handoff passes them down, so the whole
   active chain shares them. The locale is a static pointer and `deinit` never
-  frees either. `parse(allocator, environ, i18n, args, diag)` takes `?*const
+  frees either. `parse(allocator, init, i18n, args, diag)` takes `std.process.Init`
+  by value: the environment is derived once as `init.minimal.environ`, and only
+  that field is ever read (`init.environ_map` is never consulted). `?*const
   I18n.Builder`: `null` selects `Base.default_locale`, a builder selects
-  `i18n.locale(environ)`; `NO_COLOR` comes from the same `environ`
-  (`containsUnemptyConstant`). Selection runs after the completion route and
+  `i18n.locale(init.minimal.environ)`; `NO_COLOR` comes from the same derived
+  `environ` (`containsUnemptyConstant`). The same `init` is forwarded to the
+  completion route, which owns `init.io` for its own output. Selection runs
+  after the completion route and
   before scanning, so the `-h`/`--help` intercept, the failure page and
   automatic output are localized and downgraded. `parseInner` keeps its old
   signature and supplies `default_locale` plus `NO_COLOR`; localized tests
@@ -499,7 +519,8 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   path decides for its own destination: the help intercept and `usage` use
   stdout, the failure page and the standalone diagnostics use stderr, and
   `helpText` uses stdout because it has no destination. `NO_COLOR` (set and
-  non-empty in `parse`'s `environ`) downgrades unconditionally and travels in
+  non-empty in `init.minimal.environ`, the only environment `parse` reads)
+  downgrades unconditionally and travels in
   `View.__no_color`; `FORCE_COLOR`, `CLICOLOR_FORCE` and `CLICOLOR` are
   ignored. `.custom` schemes downgrade like the builtin ones; a custom
   *renderer* receives the downgraded `HelpData` but may emit its own escapes.
@@ -542,7 +563,7 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   and branches whose key is `""`, keep their declared literal. Bash prints no
   descriptions, so its bytes never change; zsh/fish render the resolved text in
   their row tables and candidate lists. The caller passes
-  `i18n.locale(environ)` or `&CLI.default_locale`; the handle stores the
+  `i18n.locale(init.minimal.environ)` or `&CLI.default_locale`; the handle stores the
   pointer, so construction still does no work and repeated renders match. A
   keyed entry whose key is missing from the locale cannot occur (the
   `I18n.Builder` rejects incomplete locales at comptime), so
@@ -644,27 +665,40 @@ Checks: `zig build test`, `zig test src/dap.zig`, `zig test src/compose.zig`,
   empty result stays empty. `launch` renders a shell-quoted literal command
   (`$cur` expands the current word); `call` inserts its string verbatim.
   Inline and dynamic stdout is parsed as `value` or `value<TAB>help`: bash
-  drops the suffix, zsh renders it as `value  -- help` through `compadd`,
-  fish prints `candidate<TAB>description`. Dynamic values combine with the
+  drops the suffix, fish prints `candidate<TAB>description`, and zsh renders
+  an aligned table through `-l -d displays`. The zsh dynamic helper escapes
+  its display spelling (space as `\ `, TAB/LF/CR as `\t`/`\n`/`\r`, after the
+  prefix is re-attached) while `cands` keeps the raw value, measures one
+  column over every surviving candidate, help or not, pads only rows that
+  carry help, and falls back to plain `compadd -U -o nosort -V ''` candidates
+  when no survivor carries help. Width is per `compadd` call, so the static
+  rows and a non-empty-prefix dynamic call may differ inside one menu.
+  Dynamic values combine with the
   static rows per target: they replace the slot's static values, append after
   static flag rows on a non-empty prefix with deduplication, and run
   immediately on an empty positional word. `--flag=value` strips
   `--flag=` and re-attaches it; after `--` no predictor runs.
 - Route. The root `parse` checks `args[0] == Completion.route_marker` before
   any parsing and, only at `_command_rank == 0`, calls
-  `completion_mod.route(@This(), std.Options.debug_io, allocator, environ,
-  args)`. Child levels never recognize the marker. `routeSuggestions(NS, io,
-  allocator, args)` is the pure split: it requires the marker, a numeric
+  `completion_mod.route(@This(), allocator, init, args)`. Child levels never
+  recognize the marker. `routeSuggestions(NS, allocator, init, args)` is the
+  pure split: it requires the marker, a numeric
   index (into `Model.bindings`), `cur`, and at least one line word; misuse is
-  `error.RouteMisuse`. `route` renders the complete payload, writes and
-  flushes it, frees suggestions and the buffer, then exits `0`; a predictor
+  `error.RouteMisuse`. `route` derives `io = init.io` and `environ =
+  init.minimal.environ` once, renders the complete payload, writes and
+  flushes it through `init.io`, frees suggestions and the buffer, then exits
+  `0`; a predictor
   failure exits `1` and misuse exits `2`, with stdout empty in both cases.
   Diagnostics go to stderr only when `_DAP_DIAGNOSTICS` is exactly `1`.
-  A callback receives the allocator, the stripped `cur`, and the line
-  including the program; it owns the returned slice, every `value` and every
-  non-null `help`, and static literals are invalid. `freeSuggestions` frees a
+  A callback receives the allocator, the same `init`, the stripped `cur`, and
+  the line including the program; it owns the returned slice, every `value` and
+  every non-null `help`, and static literals are invalid. `init` is call-scoped:
+  a callback must not retain it or pointers derived from it. A non-native `fs`
+  binding uses `init.io` (`fsSuggestions`). `freeSuggestions` frees a
   successful result. Because the route runs at the very start of `parse`, an
-  application must do no file, socket, or network work before `parse`.
+  application must do no file, socket, or network work before `parse`. Help,
+  failure and `usage` keep `std.Options.debug_io`; only the route uses
+  `init.io`.
 - The example tree declares a `completion` command whose `main` calls
   `Completion.show` and returns before any other output, so
   `zig build run -- --required 0 completion <shell>` pipes cleanly. Two test

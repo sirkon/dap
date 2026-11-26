@@ -9,7 +9,7 @@ turns it into a namespace containing a parser, a typed result struct, and render
 
 ```zig
 const CLI = dap.generate(app, def);                                  // app: dap.App, def: declaration struct
-const cli = try CLI.parse(allocator, environ, null, args, &diag);    // returns CLI.View
+const cli = try CLI.parse(allocator, init, null, args, &diag);       // returns CLI.View
 ```
 
 All names, types, defaults and constraints are resolved by the compiler. There is no runtime schema and no reflection.
@@ -47,7 +47,7 @@ of the public contract:
 | Member           | Type                                                          | Description                                                                       |
 | ---------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | `View`           | type                                                          | Result struct for one successful parse.                                           |
-| `parse`          | `fn (alloc, environ, i18n, args, diag) ParseError!View`       | Parse the payload. Exits on help and usage failure (§6).                          |
+| `parse`          | `fn (alloc, init, i18n, args, diag) ParseError!View`          | Parse the payload. Exits on help and usage failure (§6).                          |
 | `deinit`         | `fn (*View, alloc) void`                                      | Release every owned field. Namespace function, not a method.                      |
 | `helpText`       | `fn (alloc) HelpError!String`                                 | Render help with `app.help_renderer.style`, the declaration default locale, and a highlight the destination supports. |
 | `helpData`       | `fn (alloc) Allocator.Error!HelpData`                         | Build the plain-data help model. Caller releases it.                              |
@@ -403,7 +403,7 @@ Use it like any other value type:
 2. one field per declared flag or argument, in declaration order, with group members flattened; optional flags are `?T`;
 3. a zero-sized `__command<rank>` tag that makes every level's `View` nominally distinct;
 4. a hidden `__i18n: *const dap.I18n.Locale`, the locale `parse` selected;
-5. a hidden `__no_color: bool`, whether `NO_COLOR` was set in the parse environment (§8.1);
+5. a hidden `__no_color: bool`, whether `NO_COLOR` was set and non-empty in `init.minimal.environ` (§8.1);
 6. one `?Union` field per `Alt`, in declaration order (tags are branch tags per §3.7);
 7. one `?Sub.View` field per command, in declaration order, named `_<field>`.
 
@@ -420,19 +420,23 @@ successful parse. It is not idempotent.
 
 ```zig
 pub fn parse(
-    allocator: std.mem.Allocator,
-    environ: std.process.Environ,       // by value
+    allocator: std.mem.Allocator,      // caller-owned working allocator
+    init: std.process.Init,            // by value, borrowed for the call
     i18n: ?*const dap.I18n.Builder,    // null selects the declaration default
-    args: []const []const u8,           // payload, without the binary name
-    diag: ?*dap.Diag,                   // may be null
+    args: []const []const u8,          // payload, without the binary name
+    diag: ?*dap.Diag,                  // may be null
 ) ParseError!View
 ```
 
 - `args` is pure payload. Parsing starts at index 0 and no token is skipped, at any command level. Pass the argument
   list with the binary name removed.
+- `init` supplies the process handles. Locale selection and `NO_COLOR` read only `init.minimal.environ`;
+  `init.environ_map` is never consulted. The same `init` is forwarded to the hidden completion route, which renders and
+  exits before it expires (§10.4).
 - `i18n` selects the locale before scanning: `null` uses the generated default locale, a builder uses
-  `i18n.locale(environ)`. The selection reads `LC_ALL`, `LC_MESSAGES`, `LANG` in that order and is installed into the
-  root `View` and every active sub-`View`, so help and failure output are localized automatically.
+  `i18n.locale(init.minimal.environ)`. The selection reads `LC_ALL`, `LC_MESSAGES`, `LANG` from that environment in that
+  order and is installed into the root `View` and every active sub-`View`, so help and failure output are localized
+  automatically.
 - On success, `parse` returns a fully decoded and validated `View`.
 - On a usage, decode or validation failure, `parse` prints diagnostics and the context-sensitive help page to stderr and
   calls `std.process.exit(1)`.
@@ -531,7 +535,8 @@ can be seen. The decision is per destination and capability-only:
 A destination that is not a terminal, a terminal without ANSI support (`TERM=dumb` included), or an environment with a
 set, non-empty `NO_COLOR` downgrades every scheme, custom ones included, to `.flat`; `NO_COLOR=` (empty) does nothing. The
 fallback is byte-identical to a declaration configured `.flat`: column widths are measured before escapes are added, so
-only the codes disappear. `NO_COLOR` is read from the `Environ` passed to `parse` and stored in the `View`
+only the codes disappear. `NO_COLOR` is read from `init.minimal.environ`, the only environment `parse` consults, and
+stored in the `View`
 (`__no_color`), so `usage` and the help intercept agree with it after the parse; the force-color variables
 (`FORCE_COLOR`, `CLICOLOR_FORCE`) and `CLICOLOR` are ignored. dap never calls `enableAnsiEscapeCodes`, so it never mutates
 console mode; an old Windows console without virtual terminal processing therefore stays plain. A custom *renderer*
@@ -829,7 +834,7 @@ const i18n = CLI.i18n()
         .greeting = "Привет",
     }));
 
-var cli = try CLI.parse(allocator, environ, &i18n, args, &diag);
+var cli = try CLI.parse(allocator, init, &i18n, args, &diag);
 ```
 
 ---
@@ -845,13 +850,14 @@ untouched because their text arrives at runtime.
 ### 10.1 Handle
 
 `CLI.completion(allocator, app_name, shell, locale)` builds a `CLI.Completion` handle for the whole command tree.
-`locale` is `*const dap.I18n.Locale`, normally `i18n.locale(environ)` from the same builder handed to `parse`, or
+`locale` is `*const dap.I18n.Locale`, normally `i18n.locale(init.minimal.environ)` from the same builder handed to
+`parse`, or
 `&CLI.default_locale`. Construction is infallible and does no work: it takes no `View`, does not parse, does not read
 the environment, performs no I/O and performs no validation. The pointer is stored, so every render uses the same
 locale.
 
 ```zig
-var completion = CLI.completion(allocator, "my-app", .zsh, i18n.locale(environ));
+var completion = CLI.completion(allocator, "my-app", .zsh, i18n.locale(init.minimal.environ));
 const script = try completion.text();
 defer allocator.free(script);
 ```
@@ -923,10 +929,15 @@ current word is not appended otherwise. `call` takes one dialect-specific string
 ```zig
 *const fn (
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const dap.Completion.Suggestion
 ```
+
+`init` is the `Init` the application handed to `parse`, passed through unchanged. It is valid only for the duration of
+the callback: the callback must not retain it or any process-scoped pointers derived from it. An unused parameter is
+legal.
 
 The callback owns its result: it allocates the slice, each `value` and each non-null `help` with the given allocator.
 Static literals are invalid. The route frees a successful result; a failing callback must release its own partial
@@ -955,14 +966,18 @@ one row; the inserted spelling is the one that matched. bash keeps one plain can
 
 Ordering is: normal entries, then version-family entries, then help-family entries; inside a family entries with help
 come before entries without help; ties are sorted by ASCII spelling. zsh renders an aligned table with descriptions,
-fish emits `candidate<TAB>description` and registers with `-k`, and bash uses `COMPREPLY` with the default file
-fallback.
+both for static rows and for predictor results; the candidate column escapes a space as `\ ` and the control bytes as
+`\t`, `\n` and `\r`, and a result with no descriptions at all degrades to plain candidates. fish emits
+`candidate<TAB>description` and registers with `-k`, and bash uses `COMPREPLY` with the default file fallback.
 
 ### 10.4 Route contract
 
 Predictors that run in the binary use a hidden route. The shell invokes the program with a reserved first argument,
 followed by a binding index, the current value and the preceding words. `parse` recognizes this call before processing
-any other argument.
+any other argument and forwards its own `init` to the route; the route hands that same `init` to every predictor,
+callback or non-native `fs` alike. The route renders its payload and exits before the `Init` expires, so a predictor
+never sees it after the process would otherwise continue past `parse`. The route reads stdin/stdout through `init.io`;
+help and diagnostics keep using `std.Options.debug_io`.
 
 The application writes one candidate per line to stdout, either `value` or `value<TAB>help`, and exits:
 

@@ -437,8 +437,12 @@ test "Compose.shift end to end: generate, parse, help" {
     const a = arena.allocator();
     var diag: dap.Diag = .{};
     defer diag.deinit(a);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
-    var view = try CLI.parse(a, std.process.Environ.empty, null, &.{ "--db-port", "80", "--db-host", "h", "--db-n", "2" }, &diag);
+    var view = try CLI.parse(a, t.value, null, &.{ "--db-port", "80", "--db-host", "h", "--db-n", "2" }, &diag);
     defer CLI.deinit(&view, a);
     try std.testing.expectEqual(@as(u16, 80), view.port);
     try std.testing.expectEqualStrings("h", view.host);
@@ -548,8 +552,12 @@ test "Compose.concat end to end: generate, parse, merged help" {
     const al = arena.allocator();
     var diag: dap.Diag = .{};
     defer diag.deinit(al);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
-    var view = try CLI.parse(al, std.process.Environ.empty, null, &.{
+    var view = try CLI.parse(al, t.value, null, &.{
         "--port",    "80",    "--host", "h", "--retries", "3",
         "--verbose", "--dry",
     }, &diag);
@@ -652,17 +660,21 @@ test "Compose.concat allows sibling subtrees to reuse a flag spelling" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
     var one_diag: dap.Diag = .{};
     defer one_diag.deinit(al);
-    var one = try CLI.parse(al, std.process.Environ.empty, null, &.{"one"}, &one_diag);
+    var one = try CLI.parse(al, t.value, null, &.{"one"}, &one_diag);
     defer CLI.deinit(&one, al);
     try std.testing.expectEqual(@as(u8, 1), one._one.?.same);
     try std.testing.expect(one._two == null);
 
     var two_diag: dap.Diag = .{};
     defer two_diag.deinit(al);
-    var two = try CLI.parse(al, std.process.Environ.empty, null, &.{"two"}, &two_diag);
+    var two = try CLI.parse(al, t.value, null, &.{"two"}, &two_diag);
     defer CLI.deinit(&two, al);
     try std.testing.expectEqual(@as(u8, 2), two._two.?.same);
     try std.testing.expect(two._one == null);
@@ -708,17 +720,21 @@ test "Compose.concat allows flag reuse across sibling commands" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
     var c_diag: dap.Diag = .{};
     defer c_diag.deinit(al);
-    var c = try CLI.parse(al, std.process.Environ.empty, null, &.{"c"}, &c_diag);
+    var c = try CLI.parse(al, t.value, null, &.{"c"}, &c_diag);
     defer CLI.deinit(&c, al);
     try std.testing.expectEqual(@as(u8, 5), c._c.?.xl);
     try std.testing.expect(c._d == null);
 
     var d_diag: dap.Diag = .{};
     defer d_diag.deinit(al);
-    var d = try CLI.parse(al, std.process.Environ.empty, null, &.{"d"}, &d_diag);
+    var d = try CLI.parse(al, t.value, null, &.{"d"}, &d_diag);
     defer CLI.deinit(&d, al);
     try std.testing.expectEqual(@as(u8, 6), d._d.?.xr);
     try std.testing.expect(d._c == null);
@@ -736,16 +752,20 @@ test "Compose.concat allows a group member on one sibling and a flag on another"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
     var c_diag: dap.Diag = .{};
     defer c_diag.deinit(al);
-    var c = try CLI.parse(al, std.process.Environ.empty, null, &.{"c"}, &c_diag);
+    var c = try CLI.parse(al, t.value, null, &.{"c"}, &c_diag);
     defer CLI.deinit(&c, al);
     try std.testing.expectEqual(@as(u8, 7), c._c.?.xl);
 
     var d_diag: dap.Diag = .{};
     defer d_diag.deinit(al);
-    var d = try CLI.parse(al, std.process.Environ.empty, null, &.{"d"}, &d_diag);
+    var d = try CLI.parse(al, t.value, null, &.{"d"}, &d_diag);
     defer CLI.deinit(&d, al);
     try std.testing.expectEqual(@as(u8, 8), d._d.?.xr);
 }

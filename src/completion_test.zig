@@ -250,27 +250,71 @@ fn zshExpectDisplays(
     words: []const u8,
     want: []const []const u8,
 ) !void {
+    try zshCompaddShim(cwd, label, script, fn_name, words, want, false);
+}
+
+/// Like `zshExpectDisplays`, but also prints every raw match handed to
+/// `compadd` as `MATCH <name>` before the display rows, proving that the
+/// candidate list never carries padding or escapes.
+fn zshExpectDisplaysAndMatches(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    script: []const u8,
+    fn_name: []const u8,
+    words: []const u8,
+    want: []const []const u8,
+) !void {
+    try zshCompaddShim(cwd, label, script, fn_name, words, want, true);
+}
+
+/// Runs `fn_name` under a stubbed `compadd` that mimics zsh: it prints the
+/// `displays` array when `-d` was passed, and otherwise prints the match
+/// names after `--`. With `dump_cands` it prints both.
+fn zshCompaddShim(
+    cwd: std.Io.Dir,
+    comptime label: []const u8,
+    script: []const u8,
+    fn_name: []const u8,
+    words: []const u8,
+    want: []const []const u8,
+    dump_cands: bool,
+) !void {
     const code = try std.fmt.allocPrint(
         std.testing.allocator,
         \\compdef() {{ :; }}
         \\compadd() {{
-        \\    local opt
-        \\    for opt in "$@"; do
-        \\        [[ $opt == -n ]] && return 0
-        \\        [[ $opt == -- ]] && break
+        \\    local have_d=0 dump=0
+        \\    local -a matches
+        \\    [[ $DUMP_CANDS == 1 ]] && dump=1
+        \\    while (( $# )); do
+        \\        case $1 in
+        \\            (-n) return 0 ;;
+        \\            (-d) have_d=1 ;;
+        \\            (--) shift; matches=("$@"); break ;;
+        \\        esac
+        \\        shift
         \\    done
+        \\    if (( dump )); then
+        \\        local m
+        \\        for m in "${{matches[@]}}"; do print -r -- "MATCH $m"; done
+        \\    fi
         \\    local d
-        \\    for d in "${{displays[@]}}"; do print -r -- "$d"; done
+        \\    if (( have_d )); then
+        \\        for d in "${{displays[@]}}"; do print -r -- "$d"; done
+        \\    else
+        \\        for d in "${{matches[@]}}"; do print -r -- "$d"; done
+        \\    fi
         \\}}
         \\_files() {{ print -r -- "FILES $*"; }}
         \\export PATH="$PWD/../bin:$PATH"
+        \\DUMP_CANDS={s}
         \\source {s}
         \\words=({s})
         \\CURRENT=${{#words}}
         \\PREFIX=${{words[CURRENT]}}
         \\{s} || true
     ,
-        .{ script, words, fn_name },
+        .{ if (dump_cands) "1" else "0", script, words, fn_name },
     );
     defer std.testing.allocator.free(code);
 
@@ -920,6 +964,35 @@ test "completion integration: zsh predictors" {
         "native-dir/",
         "native-file.txt",
         "plain.txt",
+    });
+
+    try zshExpectDisplays(work, "zsh dynamic width and escape", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --shape ''", &.{
+        "alpha                 -- Alpha value.",
+        "beta",
+        "gamma-long-long-long",
+        "delta\\ one\\ two       -- Spaced value.",
+        "zeta\\ one",
+    });
+    try zshExpectDisplays(work, "zsh dynamic single row", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --shape al", &.{
+        "alpha  -- Alpha value.",
+    });
+    try zshExpectDisplays(work, "zsh dynamic no help fallback", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --shape gamma", &.{
+        "gamma-long-long-long",
+    });
+    try zshExpectDisplays(work, "zsh dynamic raw match in fallback", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --shape zeta", &.{
+        "zeta one",
+    });
+    try zshExpectDisplaysAndMatches(work, "zsh dynamic raw candidates", PREDICTOR_SCRIPT_ZSH, "_dap_predictor_test", "dap-predictor-test --shape ''", &.{
+        "MATCH alpha",
+        "MATCH beta",
+        "MATCH gamma-long-long-long",
+        "MATCH delta one two",
+        "MATCH zeta one",
+        "alpha                 -- Alpha value.",
+        "beta",
+        "gamma-long-long-long",
+        "delta\\ one\\ two       -- Spaced value.",
+        "zeta\\ one",
     });
 }
 

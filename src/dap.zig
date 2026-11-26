@@ -1979,7 +1979,7 @@ fn contextHelpText(
 ///   hidden `__no_color: bool` recording that `NO_COLOR` was set, one
 ///   `?Union` per `Alt` field, and one `?View` per command field under a
 ///   `_`-prefixed name (`_stop`);
-/// - `pub fn parse(allocator, environ, i18n, args, diag) ParseError!View`,
+/// - `pub fn parse(allocator, init, i18n, args, diag) ParseError!View`,
 ///   where `i18n` is an optional [`I18n.Builder`]; `null` selects the
 ///   declaration default locale;
 /// - `app_meta`, `specs`, `commands` metadata;
@@ -2090,7 +2090,7 @@ fn contextHelpText(
 ///     def,
 /// );
 ///
-/// var cli = try CLI.parse(allocator, environ, null, args, &diag);
+/// var cli = try CLI.parse(allocator, init, null, args, &diag);
 /// std.debug.print("{} {}", .{ cli.login, cli.path }); // Both are strings.
 /// defer diag.deinit(allocator);
 /// ```
@@ -2127,7 +2127,7 @@ fn contextHelpText(
 /// };
 ///
 /// const CLI = dap.generate(dap.App{ .name = "svc", .help = "Service." }, def);
-/// var cli = try CLI.parse(allocator, environ, null, args, &diag);
+/// var cli = try CLI.parse(allocator, init, null, args, &diag);
 /// if (CLI.command(cli)) |cmd| switch (cmd) {
 ///     .start => |s| try serve(s.name),
 ///     .stop => try shutdown(),
@@ -2153,7 +2153,7 @@ fn contextHelpText(
 /// };
 ///
 /// const CLI = dap.generate(dap.App{ .name = "m", .help = "Mode." }, def);
-/// var cli = try CLI.parse(allocator, environ, null, args, &diag);
+/// var cli = try CLI.parse(allocator, init, null, args, &diag);
 /// switch (cli.mode orelse return) {
 ///     .alt1 => |p| try run(p.opt1),
 ///     .@"fancy-alt2" => |p| try fancy(p.opt2),
@@ -2178,7 +2178,7 @@ fn contextHelpText(
 /// };
 ///
 /// const CLI = dap.generate(dap.App{ .name = "build", .help = "Build." }, def);
-/// var cli = try CLI.parse(allocator, environ, null, args, &diag);
+/// var cli = try CLI.parse(allocator, init, null, args, &diag);
 /// const jobs = cli.jobs orelse 1;
 /// ```
 ///
@@ -2902,7 +2902,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// Fails with [`HelpError`] when rendering does.
         ///
         /// ```
-        /// const cli = try CLI.parse(allocator, environ, null, args, &diag);
+        /// const cli = try CLI.parse(allocator, init, null, args, &diag);
         /// if (CLI.command(cli)) |cmd| switch (cmd) {
         ///     .config => |c| try CLI.usage(c),
         ///     else => try CLI.usage(cli),
@@ -2933,7 +2933,7 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
         /// static descriptions: every declared `i18n` key, on a flag, a
         /// command, or an enumeration branch, renders through it, while
         /// entries without a key keep their declared literal. Pass the result
-        /// of `i18n.locale(environ)` to follow the machine's locale, or
+        /// of `i18n.locale(init.minimal.environ)` to follow the machine's locale, or
         /// `&CLI.default_locale` for the declaration default. Nothing is
         /// rendered or validated until `text`, `show`, or `install` is called;
         /// the script is a snapshot of the declaration and the locale, so
@@ -3242,21 +3242,25 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
 
         /// Parse `args` into a `View`, or exit through the builtin help and
         /// failure flows. `args` is pure payload: no binary name and no
-        /// skipped token. `i18n_builder` is an optional comptime-built
-        /// [`I18n.Builder`]; `null` selects the declaration's
-        /// `default_locale`, while a builder selects
-        /// `builder.locale(environ)` (`LC_ALL`, `LC_MESSAGES`, `LANG`). The
-        /// selected locale is installed in `View.__i18n` at every active
-        /// level, so the `-h`/`--help` intercept, the failure page and
-        /// `usage` render in it. `NO_COLOR` (set and non-empty in `environ`)
-        /// is recorded in `View.__no_color` and downgrades the configured
-        /// highlight to `.flat`; without it the highlight is honored only when
-        /// the destination is a terminal that supports ANSI escape codes. The
+        /// skipped token. `init` is the process `Init` the caller received:
+        /// the environment comes from `init.minimal.environ`, and the same
+        /// `Init` is forwarded to the hidden completion route, which hands it
+        /// to predictor callbacks for the duration of the call.
+        /// `i18n_builder` is an optional comptime-built [`I18n.Builder`];
+        /// `null` selects the declaration's `default_locale`, while a builder
+        /// selects `builder.locale(init.minimal.environ)` (`LC_ALL`,
+        /// `LC_MESSAGES`, `LANG`). The selected locale is installed in
+        /// `View.__i18n` at every active level, so the `-h`/`--help`
+        /// intercept, the failure page and `usage` render in it. `NO_COLOR`
+        /// (set and non-empty in `init.minimal.environ`) is recorded in
+        /// `View.__no_color` and downgrades the configured highlight to
+        /// `.flat`; without it the highlight is honored only when the
+        /// destination is a terminal that supports ANSI escape codes. The
         /// completion route hook runs first, before locale selection and
         /// parsing.
         pub fn parse(
             allocator: std.mem.Allocator,
-            environ: std.process.Environ,
+            init: std.process.Init,
             i18n_builder: ?*const I18n.Builder,
             args: []const []const u8,
             diag: ?*Diag,
@@ -3267,9 +3271,11 @@ pub fn generate(comptime app: App, comptime def: anytype) type {
             // returns.
             if (comptime app._command_rank == 0) {
                 if (args.len != 0 and std.mem.eql(u8, args[0], completion_mod.Completion.route_marker)) {
-                    completion_mod.route(@This(), std.Options.debug_io, allocator, environ, args);
+                    completion_mod.route(@This(), allocator, init, args);
                 }
             }
+
+            const environ = init.minimal.environ;
 
             // Locale selection reads the environment and cannot fail: the
             // builder always seeds the default locale under the empty tag.
@@ -5754,14 +5760,18 @@ test "M8: enumeration works as an flag value type" {
     defer arena.deinit();
     var diag: Diag = .{};
     const allocator = arena.allocator();
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
-    const a = try CLI.parse(allocator, std.process.Environ.empty, null, &.{ "--mode", "glacial", "f" }, &diag);
+    const a = try CLI.parse(allocator, t.value, null, &.{ "--mode", "glacial", "f" }, &diag);
     var amode = a.mode;
     const encoded = try amode.encode(allocator);
     try std.testing.expectEqualStrings("glacial", encoded);
     try std.testing.expectEqualStrings("f", a.file);
 
-    const b = try CLI.parse(allocator, std.process.Environ.empty, null, &.{"f"}, &diag);
+    const b = try CLI.parse(allocator, t.value, null, &.{"f"}, &diag);
     try std.testing.expectEqual(Mode.EnumView.fast, b.mode.view);
 
     try std.testing.expectError(error.InvalidWire, CLI.parseInner(allocator, std.process.Environ.empty, &.{ "--mode", "bad", "f" }, &diag));
@@ -5778,8 +5788,12 @@ test "M8: enumeration works as an argument value type" {
     defer arena.deinit();
     var diag: Diag = .{};
     const allocator = arena.allocator();
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
 
-    const a = try CLI.parse(allocator, std.process.Environ.empty, null, &.{"glacial"}, &diag);
+    const a = try CLI.parse(allocator, t.value, null, &.{"glacial"}, &diag);
     var amode = a.mode;
     const encoded = try amode.encode(allocator);
     try std.testing.expectEqualStrings("glacial", encoded);
@@ -6058,9 +6072,14 @@ test "i18n: parse selects the locale from LC_ALL, LC_MESSAGES and LANG" {
     const a = arena.allocator();
     var diag: Diag = .{};
 
+    const TestInit = @import("test_init.zig").TestInit;
+
     const lc_all = [_][*:0]const u8{ "LC_ALL=ru_RU.UTF-8", "LANG=ja_JP.UTF-8" };
     const env_all = makeEnviron(&lc_all);
-    const v = try I18nResolve.parse(a, env_all, &S6Builder, &.{ "serve", "x" }, &diag);
+    var t_all: TestInit = undefined;
+    t_all.setup(env_all);
+    defer t_all.deinit();
+    const v = try I18nResolve.parse(a, t_all.value, &S6Builder, &.{ "serve", "x" }, &diag);
     try std.testing.expect(v.__i18n == S6Builder.locale(env_all));
     try std.testing.expectEqualStrings(I18n.ru.meta.usage, v.__i18n.meta.usage);
     try std.testing.expectEqualStrings(I18n.ru.meta.flags, v.__i18n.meta.flags);
@@ -6069,14 +6088,20 @@ test "i18n: parse selects the locale from LC_ALL, LC_MESSAGES and LANG" {
 
     const lc_messages = [_][*:0]const u8{ "LC_MESSAGES=ja_JP.UTF-8", "LANG=ru_RU.UTF-8" };
     const env_messages = makeEnviron(&lc_messages);
-    const vm = try I18nResolve.parse(a, env_messages, &S6Builder, &.{ "serve", "x" }, &diag);
+    var t_messages: TestInit = undefined;
+    t_messages.setup(env_messages);
+    defer t_messages.deinit();
+    const vm = try I18nResolve.parse(a, t_messages.value, &S6Builder, &.{ "serve", "x" }, &diag);
     try std.testing.expect(vm.__i18n == S6Builder.locale(env_messages));
     try std.testing.expectEqualStrings(I18n.ja.meta.usage, vm.__i18n.meta.usage);
     try std.testing.expectEqualStrings("アプリ。", try vm.__i18n.require("res_app"));
 
     const lang = [_][*:0]const u8{"LANG=ru_RU.UTF-8"};
     const env_lang = makeEnviron(&lang);
-    const vl = try I18nResolve.parse(a, env_lang, &S6Builder, &.{ "serve", "x" }, &diag);
+    var t_lang: TestInit = undefined;
+    t_lang.setup(env_lang);
+    defer t_lang.deinit();
+    const vl = try I18nResolve.parse(a, t_lang.value, &S6Builder, &.{ "serve", "x" }, &diag);
     try std.testing.expect(vl.__i18n == S6Builder.locale(env_lang));
     try std.testing.expectEqualStrings(I18n.ru.meta.usage, vl.__i18n.meta.usage);
 }
@@ -6088,24 +6113,35 @@ test "i18n: exact tag, language fallback and default fallback" {
     const a = arena.allocator();
     var diag: Diag = .{};
 
+    const TestInit = @import("test_init.zig").TestInit;
+
     // Exact tag.
     const exact_envp = [_][*:0]const u8{"LC_ALL=ru"};
     const exact_env = makeEnviron(&exact_envp);
-    const exact = try I18nResolve.parse(a, exact_env, &S6Builder, &.{ "serve", "x" }, &diag);
+    var t_exact: TestInit = undefined;
+    t_exact.setup(exact_env);
+    defer t_exact.deinit();
+    const exact = try I18nResolve.parse(a, t_exact.value, &S6Builder, &.{ "serve", "x" }, &diag);
     try std.testing.expect(exact.__i18n == S6Builder.locale(exact_env));
     try std.testing.expectEqualStrings(I18n.ru.meta.usage, exact.__i18n.meta.usage);
 
     // Language part before the first `_`.
     const language_envp = [_][*:0]const u8{"LC_ALL=ru_RU.UTF-8"};
     const language_env = makeEnviron(&language_envp);
-    const language = try I18nResolve.parse(a, language_env, &S6Builder, &.{ "serve", "x" }, &diag);
+    var t_language: TestInit = undefined;
+    t_language.setup(language_env);
+    defer t_language.deinit();
+    const language = try I18nResolve.parse(a, t_language.value, &S6Builder, &.{ "serve", "x" }, &diag);
     try std.testing.expect(language.__i18n == S6Builder.locale(language_env));
     try std.testing.expectEqualStrings(I18n.ru.meta.usage, language.__i18n.meta.usage);
 
     // Unknown language falls back to the declaration default.
     const default_envp = [_][*:0]const u8{"LC_ALL=xx_YY.UTF-8"};
     const default_env = makeEnviron(&default_envp);
-    const fallback = try I18nResolve.parse(a, default_env, &S6Builder, &.{ "serve", "x" }, &diag);
+    var t_default: TestInit = undefined;
+    t_default.setup(default_env);
+    defer t_default.deinit();
+    const fallback = try I18nResolve.parse(a, t_default.value, &S6Builder, &.{ "serve", "x" }, &diag);
     try std.testing.expectEqualStrings(I18nResolve.default_locale.meta.usage, fallback.__i18n.meta.usage);
     try std.testing.expectEqualStrings("Res app.", try fallback.__i18n.require("res_app"));
     try std.testing.expect(fallback._serve.?.__i18n == fallback.__i18n);
@@ -6117,7 +6153,11 @@ test "i18n: a null builder selects the declaration default at every level" {
     const a = arena.allocator();
     var diag: Diag = .{};
 
-    const v = try I18nResolve.parse(a, std.process.Environ.empty, null, &.{ "serve", "x" }, &diag);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
+    const v = try I18nResolve.parse(a, t.value, null, &.{ "serve", "x" }, &diag);
     try std.testing.expect(v.__i18n == v._serve.?.__i18n);
     try std.testing.expectEqualStrings(I18nResolve.default_locale.meta.usage, v.__i18n.meta.usage);
     try std.testing.expectEqualStrings("Res app.", try v.__i18n.require("res_app"));
@@ -6155,7 +6195,11 @@ test "i18n: usage renders with the locale carried by the view" {
     defer arena.deinit();
     const a = arena.allocator();
     var diag: Diag = .{};
-    var v = try CLI.parse(a, env, &builder, &.{ "serve", "x" }, &diag);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(env);
+    defer t.deinit();
+    var v = try CLI.parse(a, t.value, &builder, &.{ "serve", "x" }, &diag);
     defer CLI.deinit(&v, a);
 
     const sub = v._serve.?;
@@ -6300,7 +6344,11 @@ test "i18n: end-to-end keyed declaration, builder and renderer" {
     const a = arena.allocator();
     var diag: Diag = .{};
 
-    var v = try E2ECLI.parse(a, env, &E2EBuilder, &.{ "serve", "x" }, &diag);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(env);
+    defer t.deinit();
+    var v = try E2ECLI.parse(a, t.value, &E2EBuilder, &.{ "serve", "x" }, &diag);
     defer E2ECLI.deinit(&v, a);
     try std.testing.expect(v.__i18n == locale);
     try std.testing.expect(v._serve.?.__i18n == locale);
@@ -6321,7 +6369,7 @@ test "i18n: end-to-end keyed declaration, builder and renderer" {
     try std.testing.expect(std.mem.indexOf(u8, sub_page, "Item.") == null);
 
     // The root page lists the translated command row.
-    var root = try E2ECLI.parse(a, env, &E2EBuilder, &.{}, &diag);
+    var root = try E2ECLI.parse(a, t.value, &E2EBuilder, &.{}, &diag);
     defer E2ECLI.deinit(&root, a);
     e2eSnapshotLen = 0;
     try std.testing.expectError(error.UnknownTranslationKey, E2ECLI.usage(root));
@@ -9481,6 +9529,38 @@ test "M29: an empty NO_COLOR does not downgrade" {
     var diag: Diag = .{};
     const v = try M29.parseInner(arena.allocator(), env, &.{"run"}, &diag);
     try std.testing.expect(!v.__no_color);
+}
+
+test "M29: parse reads NO_COLOR from init.minimal.environ only" {
+    if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const TestInit = @import("test_init.zig").TestInit;
+
+    // The owned map is not the environment `parse` reads.
+    var map_only: TestInit = undefined;
+    map_only.setup(std.process.Environ.empty);
+    defer map_only.deinit();
+    try map_only.value.environ_map.put("NO_COLOR", "1");
+    var map_only_diag: Diag = .{};
+    defer map_only_diag.deinit(arena.allocator());
+    var map_only_view = try M29.parse(arena.allocator(), map_only.value, null, &.{}, &map_only_diag);
+    defer M29.deinit(&map_only_view, arena.allocator());
+    try std.testing.expect(!map_only_view.__no_color);
+
+    // The minimal environment is, even when the owned map is empty.
+    const envp = [_][*:0]const u8{"NO_COLOR=1"};
+    const env = makeEnviron(&envp);
+    var env_only: TestInit = undefined;
+    env_only.setup(env);
+    defer env_only.deinit();
+    env_only.value.environ_map.deinit();
+    env_only.value.environ_map.* = std.process.Environ.Map.init(std.testing.allocator);
+    var env_only_diag: Diag = .{};
+    defer env_only_diag.deinit(arena.allocator());
+    var env_only_view = try M29.parse(arena.allocator(), env_only.value, null, &.{}, &env_only_diag);
+    defer M29.deinit(&env_only_view, arena.allocator());
+    try std.testing.expect(env_only_view.__no_color);
 }
 
 test "M29: a non-ANSI destination renders the merged page plain" {

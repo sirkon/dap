@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init) !void {
     // Parse errors and --help/-h requests are handled inside parse: help is
     // rendered to stdout with a clean exit, failures print the diagnostics
     // plus help to stderr and exit with code 1.
-    var cli = try CLI.parse(arena, init.minimal.environ, &translations, args, &diag);
+    var cli = try CLI.parse(arena, init, &translations, args, &diag);
     defer CLI.deinit(&cli, arena);
 
     if (CLI.command(cli)) |cmd| switch (cmd) {

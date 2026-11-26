@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     defer diag.deinit(arena);
 
     // `argv[1..]` is pure payload: no binary name, no skipped token.
-    const cli = try CLI.parse(arena, init.minimal.environ, null, argv[1..], &diag);
+    const cli = try CLI.parse(arena, init, null, argv[1..], &diag);
 
     std.debug.print("{s} level={d} {s}\n", .{ cli.login, cli.level, cli.path });
 }
@@ -135,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
     var diag: dap.Diag = .{};
     defer diag.deinit(arena);
 
-    var cli = try CLI.parse(arena, init.minimal.environ, null, argv[1..], &diag);
+    var cli = try CLI.parse(arena, init, null, argv[1..], &diag);
     defer CLI.deinit(&cli, arena);
 
     if (CLI.command(cli)) |cmd| switch (cmd) {
@@ -174,7 +174,8 @@ Help follows the entered path: `workspace serve --help` describes `serve` with t
 deep in the tree renders that level's page. `CLI.usage(cli)` prints the same page, which is useful when no command was
 given. Completion is generated from the declaration; `CLI.completion(allocator, app_name, shell, locale)` is lazy,
 `app_name` is the name the script registers, not `App.name`, and `locale` selects the language of the static
-descriptions (`i18n.locale(environ)` for the machine's locale, `&CLI.default_locale` for the declaration default). The
+descriptions (`i18n.locale(init.minimal.environ)` for the machine's locale, `&CLI.default_locale` for the declaration
+default). The
 route it serves for dynamic values runs at the very start of `CLI.parse`, so do file, socket or network work only after
 parsing.
 
@@ -206,15 +207,16 @@ const i18n = CLI.i18n()
     }));
 
 // In main:
-var cli = try CLI.parse(arena, init.minimal.environ, &i18n, argv[1..], &diag);
+var cli = try CLI.parse(arena, init, &i18n, argv[1..], &diag);
 ```
 
-`parse` reads `LC_ALL`, `LC_MESSAGES` and `LANG` in that order and matches the full tag (`ru_RU`), then the language
+`parse` reads `LC_ALL`, `LC_MESSAGES` and `LANG` from `init.minimal.environ` in that order and matches the full tag
+(`ru_RU`), then the language
 (`ru`), then the declaration default for anything else. The selection is stored in the `View` and threaded through the
 command handoff, so `-h`/`--help`, the failure page and `CLI.usage(view)` all render with it, while `CLI.helpText` keeps
 the declaration default. The configured highlight is a recommendation: it is used only when the destination (stdout for
-help and `usage`, stderr for the failure page) is a terminal that supports ANSI escape codes and `NO_COLOR` is unset and
-non-empty; otherwise the page renders `.flat`. Passing `null` as the builder selects that same generated default, whose
+help and `usage`, stderr for the failure page) is a terminal that supports ANSI escape codes and `NO_COLOR` (read from
+`init.minimal.environ`) is unset and non-empty; otherwise the page renders `.flat`. Passing `null` as the builder selects that same generated default, whose
 text is the `.help` literals byte for byte. The prefilled templates are `dap.I18n.ru`, `zh`, `es`, `it`, `fr`, `de`,
 `ko` and `ja`; `withUser` replaces the user map and seeds the `builtin_help` string. A key the selected locale lacks is
 `error.UnknownTranslationKey`, never an English fallback. Shell completion is localized at generation time: the static

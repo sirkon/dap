@@ -11,9 +11,11 @@ const dap = @import("dap");
 /// argument. It returns two values, one carrying help.
 fn callback(
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const dap.Completion.Suggestion {
+    _ = init;
     _ = cur;
     _ = line;
     const items = try allocator.alloc(dap.Completion.Suggestion, 2);
@@ -24,6 +26,40 @@ fn callback(
     errdefer allocator.free(items[0].help.?);
     items[1] = .{ .value = try allocator.dupe(u8, "beta") };
     errdefer allocator.free(items[1].value);
+    return items;
+}
+
+/// Callback predictor used by the `--shape` flag. It mixes helped and bare
+/// values, a long bare value that drives the zsh column width, and values
+/// containing spaces that the display printer must escape.
+fn shapes(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    cur: []const u8,
+    line: []const []const u8,
+) anyerror![]const dap.Completion.Suggestion {
+    _ = init;
+    _ = cur;
+    _ = line;
+    const values = [_]struct { value: []const u8, help: ?[]const u8 }{
+        .{ .value = "alpha", .help = "Alpha value." },
+        .{ .value = "beta", .help = null },
+        .{ .value = "gamma-long-long-long", .help = null },
+        .{ .value = "delta one two", .help = "Spaced value." },
+        .{ .value = "zeta one", .help = null },
+    };
+    const items = try allocator.alloc(dap.Completion.Suggestion, values.len);
+    errdefer allocator.free(items);
+    var built: usize = 0;
+    errdefer for (items[0..built]) |item| {
+        allocator.free(item.value);
+        if (item.help) |help| allocator.free(help);
+    };
+    for (values, 0..) |item, i| {
+        items[i] = .{ .value = try allocator.dupe(u8, item.value), .help = null };
+        built = i + 1;
+        if (item.help) |help| items[i].help = try allocator.dupe(u8, help);
+    }
     return items;
 }
 
@@ -70,6 +106,11 @@ pub const CLI = dap.generate(dap.App{
         .long = "plain",
         .help = "No predictor.",
     },
+    .shape = dap.Flag(dap.String){
+        .long = "shape",
+        .help = "Mixed shapes.",
+        .completion = dap.Completion.custom(shapes),
+    },
     .pick = dap.Command(.{ .help = "Pick." }, .{
         .item = dap.Argument(dap.String){
             .help = "Item.",
@@ -89,6 +130,6 @@ pub fn main(init: std.process.Init) !void {
     var diag: dap.Diag = .{};
     defer diag.deinit(arena);
 
-    var cli = try CLI.parse(arena, init.minimal.environ, null, argv[1..], &diag);
+    var cli = try CLI.parse(arena, init, null, argv[1..], &diag);
     defer CLI.deinit(&cli, arena);
 }

@@ -83,6 +83,7 @@ pub const Completion = struct {
         call: []const u8,
         callback: *const fn (
             allocator: std.mem.Allocator,
+            init: std.process.Init,
             cur: []const u8,
             line: []const []const u8,
         ) anyerror![]const Suggestion,
@@ -118,6 +119,11 @@ pub const Completion = struct {
     /// the returned slice and every non-null string in it with `allocator`.
     /// On error it cleans up its own partial result; the route frees only a
     /// successful list, and static literals are not valid results.
+    ///
+    /// The `init` parameter carries the application's handles (I/O, the
+    /// allocator, the environment) and is valid only for the duration of the
+    /// callback. The callback must not retain it or any process-scoped
+    /// pointers derived from it. An unused parameter is legal.
     pub fn custom(cb: @FieldType(Predictor, "callback")) Predictor {
         return .{ .callback = cb };
     }
@@ -1783,6 +1789,14 @@ fn appendBashDynamicHelper(
 /// splits every line at its first tab into candidate and description, filters
 /// by the value part `cur`, re-attaches `prefix`, skips spellings the static
 /// rows already selected (the caller's `seen` array), and adds the rest.
+///
+/// Rendering is two passes, like the static table: collect the escaped
+/// spelling and the width, then compose. The display escapes space as `\ `
+/// and the control bytes as `\t`/`\n`/`\r`; `cands` and `seen` keep the raw
+/// value, so insertion and dedupe are unaffected. The column is measured over
+/// every surviving candidate, help or not, and a row without help stays bare.
+/// When no survivor carries help the helper emits plain candidates instead of
+/// building a one-column table.
 fn appendZshDynamicHelper(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1798,8 +1812,8 @@ fn appendZshDynamicHelper(
     try appendQuoted(out, allocator, Completion.route_marker, .posix);
     try out.appendSlice(allocator, " \"$idx\" \"$cur\" \"${words[@]:0:$((CURRENT - 1))}\"); then\n");
     try out.appendSlice(allocator,
-        \\        local -a cands displays
-        \\        local cand help val
+        \\        local -a cands vals helps displays
+        \\        local cand help val esc width=0 any=0
         \\        for cand in ${(f)out}; do
         \\            help=
         \\            if [[ $cand == *$'\t'* ]]; then
@@ -1814,15 +1828,34 @@ fn appendZshDynamicHelper(
         \\                continue
         \\            fi
         \\            seen+=("$val")
+        \\            esc=${val//$'\t'/\\t}
+        \\            esc=${esc//$'\n'/\\n}
+        \\            esc=${esc//$'\r'/\\r}
+        \\            esc=${esc// /\\ }
         \\            cands+=("$val")
-        \\            if [[ -n $help ]]; then
-        \\                displays+=("$val  -- $help")
-        \\            else
-        \\                displays+=("$val")
-        \\            fi
+        \\            vals+=("$esc")
+        \\            helps+=("$help")
+        \\            (( ${#esc} > width )) && width=${#esc}
+        \\            [[ -n $help ]] && any=1
         \\        done
         \\        if (( ${#cands} )); then
-        \\            compadd -U -o nosort -V '' -l -d displays -- "${cands[@]}"
+        \\            if (( any )); then
+        \\                local i row
+        \\                for (( i = 1; i <= ${#cands}; i++ )); do
+        \\                    if [[ -n ${helps[i]} ]]; then
+        \\                        row="${(r:$width:)vals[i]}  -- ${helps[i]}"
+        \\                    else
+        \\                        row=${vals[i]}
+        \\                    fi
+        \\                    while [[ $row == *' ' ]]; do
+        \\                        row=${row% }
+        \\                    done
+        \\                    displays+=("$row")
+        \\                done
+        \\                compadd -U -o nosort -V '' -l -d displays -- "${cands[@]}"
+        \\            else
+        \\                compadd -U -o nosort -V '' -- "${cands[@]}"
+        \\            fi
         \\        fi
         \\    fi
         \\}
@@ -3701,8 +3734,8 @@ fn fsSuggestions(
 /// does not address a route-backed binding.
 pub fn routeSuggestions(
     comptime NS: type,
-    io: std.Io,
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     args: []const []const u8,
 ) anyerror![]const Completion.Suggestion {
     if (args.len < 4) return error.RouteMisuse;
@@ -3713,8 +3746,8 @@ pub fn routeSuggestions(
     const bindings = comptime model(NS).bindings;
     if (index >= bindings.len) return error.RouteMisuse;
     return switch (bindings[index]) {
-        .callback => |cb| cb(allocator, cur, line),
-        .fs => |opts| fsSuggestions(io, allocator, opts, cur),
+        .callback => |cb| cb(allocator, init, cur, line),
+        .fs => |opts| fsSuggestions(init.io, allocator, opts, cur),
     };
 }
 
@@ -3725,12 +3758,13 @@ pub fn routeSuggestions(
 /// only when `_DAP_DIAGNOSTICS` is exactly `1`.
 pub fn route(
     comptime NS: type,
-    io: std.Io,
     allocator: std.mem.Allocator,
-    environ: std.process.Environ,
+    init: std.process.Init,
     args: []const []const u8,
 ) noreturn {
-    const suggestions = routeSuggestions(NS, io, allocator, args) catch |err| {
+    const io = init.io;
+    const environ = init.minimal.environ;
+    const suggestions = routeSuggestions(NS, allocator, init, args) catch |err| {
         routeDiagnose(io, allocator, environ, err);
         std.process.exit(if (err == error.RouteMisuse) 2 else 1);
     };
@@ -6572,10 +6606,12 @@ test "M20: family classification uses the primary spelling" {
 
 fn m21Callback(
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const Completion.Suggestion {
     _ = allocator;
+    _ = init;
     _ = cur;
     _ = line;
     return &.{};
@@ -6985,9 +7021,11 @@ test "M22: sibling reuse stays out of the other branch" {
 var m23_calls: usize = 0;
 var m23_cur: []const u8 = "";
 var m23_line: []const []const u8 = &.{};
+var m23_init: ?std.process.Init = null;
 
 fn m23Capture(
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const Completion.Suggestion {
@@ -6995,14 +7033,17 @@ fn m23Capture(
     m23_calls += 1;
     m23_cur = cur;
     m23_line = line;
+    m23_init = init;
     return &.{};
 }
 
 fn m23Owned(
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const Completion.Suggestion {
+    _ = init;
     _ = cur;
     _ = line;
     const items = try allocator.alloc(Completion.Suggestion, 2);
@@ -7019,10 +7060,12 @@ fn m23Owned(
 
 fn m23Fail(
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const Completion.Suggestion {
     _ = allocator;
+    _ = init;
     _ = cur;
     _ = line;
     return error.PredictorFailed;
@@ -7048,27 +7091,30 @@ test "M23: route marker matches the design" {
 }
 
 test "M23: route rejects misuse" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
     const marker = Completion.route_marker;
-    try std.testing.expectError(error.RouteMisuse, routeSuggestions(M23, io, allocator, &.{}));
-    try std.testing.expectError(error.RouteMisuse, routeSuggestions(M23, io, allocator, &.{marker}));
-    try std.testing.expectError(error.RouteMisuse, routeSuggestions(M23, io, allocator, &.{ marker, "0", "" }));
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
+    try std.testing.expectError(error.RouteMisuse, routeSuggestions(M23, allocator, t.value, &.{}));
+    try std.testing.expectError(error.RouteMisuse, routeSuggestions(M23, allocator, t.value, &.{marker}));
+    try std.testing.expectError(error.RouteMisuse, routeSuggestions(M23, allocator, t.value, &.{ marker, "0", "" }));
     try std.testing.expectError(
         error.RouteMisuse,
-        routeSuggestions(M23, io, allocator, &.{ "not-the-marker", "0", "", "app" }),
+        routeSuggestions(M23, allocator, t.value, &.{ "not-the-marker", "0", "", "app" }),
     );
     try std.testing.expectError(
         error.RouteMisuse,
-        routeSuggestions(M23, io, allocator, &.{ marker, "zero", "", "app" }),
+        routeSuggestions(M23, allocator, t.value, &.{ marker, "zero", "", "app" }),
     );
     try std.testing.expectError(
         error.RouteMisuse,
-        routeSuggestions(M23, io, allocator, &.{ marker, "-1", "", "app" }),
+        routeSuggestions(M23, allocator, t.value, &.{ marker, "-1", "", "app" }),
     );
     try std.testing.expectError(
         error.RouteMisuse,
-        routeSuggestions(M23, io, allocator, &.{ marker, "4", "", "app" }),
+        routeSuggestions(M23, allocator, t.value, &.{ marker, "4", "", "app" }),
     );
 }
 
@@ -7076,8 +7122,13 @@ test "M23: callback receives cur and the parsed line" {
     m23_calls = 0;
     m23_cur = "";
     m23_line = &.{};
+    m23_init = null;
     const args = [_][]const u8{ Completion.route_marker, "0", "pre", "app", "sub" };
-    const result = try routeSuggestions(M23, std.testing.io, std.testing.allocator, &args);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
+    const result = try routeSuggestions(M23, std.testing.allocator, t.value, &args);
     defer freeSuggestions(std.testing.allocator, result);
     try std.testing.expectEqual(@as(usize, 1), m23_calls);
     try std.testing.expectEqualStrings("pre", m23_cur);
@@ -7085,28 +7136,43 @@ test "M23: callback receives cur and the parsed line" {
     try std.testing.expectEqualStrings("app", m23_line[0]);
     try std.testing.expectEqualStrings("sub", m23_line[1]);
     try std.testing.expectEqual(@as(usize, 0), result.len);
+    try std.testing.expect(m23_init.?.io.userdata == t.value.io.userdata);
+    try std.testing.expect(m23_init.?.io.vtable == t.value.io.vtable);
+    try std.testing.expect(m23_init.?.gpa.ptr == t.value.gpa.ptr);
 }
 
 test "M23: child bindings resolve at the shared index" {
     m23_calls = 0;
     const args = [_][]const u8{ Completion.route_marker, "3", "", "app", "sub" };
-    const result = try routeSuggestions(M23, std.testing.io, std.testing.allocator, &args);
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
+    const result = try routeSuggestions(M23, std.testing.allocator, t.value, &args);
     freeSuggestions(std.testing.allocator, result);
     try std.testing.expectEqual(@as(usize, 1), m23_calls);
 }
 
 test "M23: callback errors propagate" {
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
     try std.testing.expectError(
         error.PredictorFailed,
-        routeSuggestions(M23, std.testing.io, std.testing.allocator, &.{ Completion.route_marker, "2", "", "app" }),
+        routeSuggestions(M23, std.testing.allocator, t.value, &.{ Completion.route_marker, "2", "", "app" }),
     );
 }
 
 test "M23: callback results are owned by the route" {
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
     const result = try routeSuggestions(
         M23,
-        std.testing.io,
         std.testing.allocator,
+        t.value,
         &.{ Completion.route_marker, "1", "", "app" },
     );
     defer freeSuggestions(std.testing.allocator, result);
@@ -7323,10 +7389,14 @@ test "M24: results are byte-sorted and unique" {
 }
 
 test "M24: route resolves a non-native fs binding" {
+    const TestInit = @import("test_init.zig").TestInit;
+    var t: TestInit = undefined;
+    t.setup(std.process.Environ.empty);
+    defer t.deinit();
     const result = try routeSuggestions(
         M24Fs,
-        std.testing.io,
         std.testing.allocator,
+        t.value,
         &.{ Completion.route_marker, "0", "", "app" },
     );
     defer freeSuggestions(std.testing.allocator, result);
@@ -7603,9 +7673,11 @@ test "M25: only launch and call render inline" {
 
 fn m26Callback(
     allocator: std.mem.Allocator,
+    init: std.process.Init,
     cur: []const u8,
     line: []const []const u8,
 ) anyerror![]const Completion.Suggestion {
+    _ = init;
     _ = cur;
     _ = line;
     const items = try allocator.alloc(Completion.Suggestion, 2);
